@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EmbyHub — Emby 反代管理面板</title>
+<meta name="description" content="EmbyHub 轻量级 Emby 反向代理管理面板">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<!-- Login Page -->
+<div id="page-login">
+  <div class="login-card">
+    <div class="login-brand">
+      <h1>EmbyHub</h1>
+      <p>Emby 反代管理面板</p>
+    </div>
+    <form id="loginForm">
+      <div class="form-group">
+        <label>用户名</label>
+        <input type="text" class="form-input" id="inp-username" placeholder="admin" autocomplete="username" required>
+      </div>
+      <div class="form-group">
+        <label>密码</label>
+        <input type="password" class="form-input" id="inp-password" placeholder="••••••••" autocomplete="current-password" required>
+      </div>
+      <button type="submit" class="btn-login" id="btn-login">登 录</button>
+    </form>
+    <div class="login-footer" id="login-footer">首次使用？<a href="#" id="link-register">创建管理员账号</a></div>
+  </div>
+</div>
+
+<!-- App Shell -->
+<div id="app-shell">
+
+  <!-- Top Navigation -->
+  <nav class="topnav">
+    <div class="topnav-brand">EmbyHub</div>
+    <div class="topnav-links">
+      <a href="#dashboard" class="topnav-link active" data-page="dashboard">仪表盘</a>
+      <a href="#sites" class="topnav-link" data-page="sites">站点管理</a>
+      <a href="#traffic" class="topnav-link" data-page="traffic">流量统计</a>
+      <a href="#diagnostics" class="topnav-link" data-page="diagnostics">故障诊断</a>
+    </div>
+    <div class="topnav-right">
+      <button class="avatar-btn" id="avatar-btn">A</button>
+    </div>
+  </nav>
+
+  <!-- Main Area -->
+  <div class="main">
+    <div id="page-dashboard" class="page active"></div>
+    <div id="page-sites" class="page"></div>
+    <div id="page-traffic" class="page"></div>
+    <div id="page-diagnostics" class="page"></div>
+  </div>
+
+  <!-- Mobile Bottom Bar -->
+  <nav class="mobile-bar">
+    <div class="mobile-bar-inner">
+      <a href="#dashboard" class="mobile-tab active" data-page="dashboard">
+        <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+        仪表盘
+      </a>
+      <a href="#sites" class="mobile-tab" data-page="sites">
+        <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+        站点
+      </a>
+      <a href="#traffic" class="mobile-tab" data-page="traffic">
+        <svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        流量
+      </a>
+      <a href="#diagnostics" class="mobile-tab" data-page="diagnostics">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        诊断
+      </a>
+    </div>
+  </nav>
+
+  <!-- Modal -->
+  <div class="modal-overlay" id="modal-overlay">
+    <div class="modal" id="modal">
+      <div class="modal-header">
+        <h3 id="modal-title"></h3>
+        <button class="modal-close" id="modal-close">✕</button>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+      <div class="modal-footer" id="modal-footer"></div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast-container"></div>
+
+</div>
+
+<script src="/js/api.js"></script>
+<script src="/js/toast.js"></script>
+<script src="/js/router.js"></script>
+<script src="/js/pages/dashboard.js"></script>
+<script src="/js/pages/sites.js"></script>
+<script src="/js/pages/traffic.js"></script>
+<script src="/js/pages/diag.js"></script>
+<script src="/js/app.js"></script>
+</body>
+</html>

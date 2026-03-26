@@ -1,0 +1,20 @@
+# Binary
+emby-panel
+emby-panel.exe
+*.exe
+
+# Database
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
