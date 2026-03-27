@@ -1,4 +1,4 @@
-module emby-panel
+module meridian
 
 go 1.26.1
 

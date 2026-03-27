@@ -36,12 +36,12 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
-        run: go build -ldflags="-s -w" -o emby-panel-${{ matrix.suffix }} .
+        run: go build -ldflags="-s -w" -o meridian-${{ matrix.suffix }} .
 
       - uses: actions/upload-artifact@v4
         with:
-          name: emby-panel-${{ matrix.suffix }}
-          path: emby-panel-${{ matrix.suffix }}
+          name: meridian-${{ matrix.suffix }}
+          path: meridian-${{ matrix.suffix }}
 
   release:
     needs: build
@@ -58,7 +58,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: emby-panel-*
+          files: meridian-*
           generate_release_notes: true
 
   docker:

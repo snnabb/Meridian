@@ -1,6 +1,6 @@
 <div align="center">
 
-# EmbyHub
+# Meridian
 
 轻量级 Emby 反向代理管理面板
 单文件 Go 后端 + 嵌入式 SPA 前端，开箱即用
@@ -20,9 +20,9 @@
 
 ## 这是什么
 
-EmbyHub 是一个专为 Emby 媒体服务器设计的反向代理管理面板。它解决的核心问题是：**当你需要在一台机器上管理多个 Emby 反代站点时，不想手写 Nginx 配置，不想逐个维护 UA 伪装规则，也不想自己实现流量计量和限速。**
+Meridian 是一个专为 Emby 媒体服务器设计的反向代理管理面板（Emby reverse proxy management panel）。它解决的核心问题是：**当你需要在一台机器上管理多个 Emby 反代站点时，不想手写 Nginx 配置，不想逐个维护 UA 伪装规则，也不想自己实现流量计量和限速。**
 
-EmbyHub 把这些事情打包成一个单二进制程序，带管理界面，带实时监控，开箱可用。
+Meridian 把这些事情打包成一个单二进制程序，带管理界面，带实时监控，开箱可用。
 
 ## 核心特性
 
@@ -45,9 +45,9 @@ EmbyHub 把这些事情打包成一个单二进制程序，带管理界面，带
 ### Docker（推荐）
 
 ```bash
-docker run -d --name embyhub \
+docker run -d --name meridian \
   -p 9090:9090 -p 8001-8010:8001-8010 \
-  -v embyhub-data:/app/data \
+  -v meridian-data:/app/data \
   -e JWT_SECRET=$(openssl rand -hex 32) \
   ghcr.io/snnabb/emby-panel:latest
 ```
@@ -62,30 +62,30 @@ docker run -d --name embyhub \
 
 ```bash
 # 下载（以 linux-amd64 为例，按需替换平台）
-curl -Lo emby-panel https://github.com/snnabb/emby-panel/releases/latest/download/emby-panel-linux-amd64
-chmod +x emby-panel
+curl -Lo meridian https://github.com/snnabb/emby-panel/releases/latest/download/meridian-linux-amd64
+chmod +x meridian
 
 # 启动
-JWT_SECRET=$(openssl rand -hex 32) ./emby-panel
+JWT_SECRET=$(openssl rand -hex 32) ./meridian
 ```
 
 **Windows (PowerShell)：**
 
 ```powershell
 # 下载
-Invoke-WebRequest -Uri "https://github.com/snnabb/emby-panel/releases/latest/download/emby-panel-windows-amd64.exe" -OutFile "emby-panel.exe"
+Invoke-WebRequest -Uri "https://github.com/snnabb/emby-panel/releases/latest/download/meridian-windows-amd64.exe" -OutFile "meridian.exe"
 
 # 启动
 $env:JWT_SECRET = -join ((1..32) | ForEach-Object { '{0:x2}' -f (Get-Random -Max 256) })
-.\emby-panel.exe
+.\meridian.exe
 ```
 
 ### 从源码构建
 
 ```bash
 git clone https://github.com/snnabb/emby-panel.git && cd emby-panel
-go build -o emby-panel .
-JWT_SECRET=$(openssl rand -hex 32) ./emby-panel
+go build -o meridian .
+JWT_SECRET=$(openssl rand -hex 32) ./meridian
 ```
 
 默认监听 `http://localhost:9090`。
@@ -97,9 +97,9 @@ JWT_SECRET=$(openssl rand -hex 32) ./emby-panel
 ### 命令行参数
 
 ```bash
-./emby-panel                          # 默认 :9090，数据库在当前目录
-./emby-panel --port 8080              # 自定义端口
-./emby-panel --db /data/emby-panel.db # 自定义数据库路径
+./meridian                          # 默认 :9090，数据库在当前目录
+./meridian --port 8080              # 自定义端口
+./meridian --db /data/meridian.db   # 自定义数据库路径
 ```
 
 ### 环境变量
@@ -107,26 +107,26 @@ JWT_SECRET=$(openssl rand -hex 32) ./emby-panel
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `PORT` | `9090` | 管理面板监听端口 |
-| `DB_PATH` | `emby-panel.db` | SQLite 数据库路径 |
+| `DB_PATH` | `meridian.db` | SQLite 数据库路径 |
 | `JWT_SECRET` | 进程启动时随机生成 | JWT 签名密钥。**生产环境必须显式设置**，否则每次重启后会话全部失效 |
 
 ### Docker Compose
 
 ```yaml
 services:
-  embyhub:
+  meridian:
     image: ghcr.io/snnabb/emby-panel:latest
     restart: unless-stopped
     ports:
       - "9090:9090"
       - "8001-8010:8001-8010"
     volumes:
-      - embyhub-data:/app/data
+      - meridian-data:/app/data
     environment:
       - JWT_SECRET=your-secret-here  # 替换为一个固定随机字符串
 
 volumes:
-  embyhub-data:
+  meridian-data:
 ```
 
 ---
@@ -135,7 +135,7 @@ volumes:
 
 ```
 ┌─────────────────────────────────────────────┐
-│                  EmbyHub                     │
+│                 Meridian                      │
 │                                              │
 │  ┌──────────┐   ┌──────────────────────────┐ │
 │  │ 管理面板  │   │     反代引擎 (per-site)   │ │
@@ -162,7 +162,7 @@ volumes:
 ### 项目结构
 
 ```
-emby-panel/
+meridian/
 ├── main.go              # 全部后端逻辑（API、反代引擎、诊断、认证）
 ├── main_test.go
 ├── web/
@@ -220,8 +220,8 @@ emby-panel/
 ## 验证 & CI/CD
 
 ```bash
-go test ./...             # 运行测试
-go build -o emby-panel .  # 编译
+go test ./...           # 运行测试
+go build -o meridian .  # 编译
 ```
 
 推送 `v*` 标签时自动触发：

@@ -1,9 +1,9 @@
-// EmbyHub API Client
+// Meridian API Client
 const API = {
-  get token() { return localStorage.getItem('embyhub_token'); },
-  set token(v) { v ? localStorage.setItem('embyhub_token', v) : localStorage.removeItem('embyhub_token'); },
-  get username() { return localStorage.getItem('embyhub_user') || ''; },
-  set username(v) { v ? localStorage.setItem('embyhub_user', v) : localStorage.removeItem('embyhub_user'); },
+  get token() { return localStorage.getItem('meridian_token'); },
+  set token(v) { v ? localStorage.setItem('meridian_token', v) : localStorage.removeItem('meridian_token'); },
+  get username() { return localStorage.getItem('meridian_user') || ''; },
+  set username(v) { v ? localStorage.setItem('meridian_user', v) : localStorage.removeItem('meridian_user'); },
 
   async request(method, path, body) {
     const opts = {

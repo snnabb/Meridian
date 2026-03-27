@@ -1,6 +1,6 @@
 # 贡献指南
 
-感谢你对 EmbyHub 的关注。本文档说明如何参与项目开发。
+感谢你对 Meridian 的关注。本文档说明如何参与项目开发。
 
 ## 开发环境
 
@@ -8,9 +8,9 @@
 - 无 CGO 依赖（SQLite 使用纯 Go 实现 `modernc.org/sqlite`）
 
 ```bash
-git clone https://github.com/EmbyHub/emby-panel.git
+git clone https://github.com/snnabb/emby-panel.git
 cd emby-panel
-go build -o emby-panel .
+go build -o meridian .
 go test ./...
 ```
 

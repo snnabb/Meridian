@@ -26,7 +26,7 @@ assignees: ''
 
 ## 环境信息
 
-- EmbyHub 版本：（`v0.x.x` 或 commit hash）
+- Meridian 版本：（`v0.x.x` 或 commit hash）
 - 操作系统：
 - 部署方式：（Docker / 二进制直接运行）
 - Go 版本（如从源码构建）：
