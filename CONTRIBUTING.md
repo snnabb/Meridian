@@ -8,8 +8,8 @@
 - 无 CGO 依赖（SQLite 使用纯 Go 实现 `modernc.org/sqlite`）
 
 ```bash
-git clone https://github.com/snnabb/emby-panel.git
-cd emby-panel
+git clone https://github.com/snnabb/meridian.git
+cd meridian
 go build -o meridian .
 go test ./...
 ```

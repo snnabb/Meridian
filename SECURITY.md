@@ -6,7 +6,7 @@
 
 请通过以下方式私下报告：
 
-- 使用 GitHub 的 [Security Advisory](https://github.com/snnabb/emby-panel/security/advisories/new) 功能
+- 使用 GitHub 的 [Security Advisory](https://github.com/snnabb/meridian/security/advisories/new) 功能
 - 或发送邮件至仓库维护者（见仓库 Profile）
 
 我们会在收到报告后尽快确认并处理。
