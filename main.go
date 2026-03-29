@@ -1884,7 +1884,7 @@ func main() {
 	}
 
 	log.Println("============================================================")
-	log.Println("  Meridian - Emby reverse proxy management panel v1.1")
+	log.Println("  Meridian - Emby reverse proxy management panel v1.2")
 	log.Printf("  Listening on: http://0.0.0.0%s", addr)
 	log.Printf("  Sites loaded: %d (%d running)", func() int { s, _ := db.ListSites(); return len(s) }(), pm.GetRunningCount())
 	log.Println("  Features: WebSocket proxy, TLS diagnostics, traffic limits")
