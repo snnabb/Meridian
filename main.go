@@ -951,11 +951,19 @@ type DiagUpstream struct {
 	TLS           DiagTLS    `json:"tls"`
 }
 
+type DiagProbe struct {
+	Kind       string `json:"kind"`
+	Method     string `json:"method"`
+	URL        string `json:"url"`
+	HTTPStatus int    `json:"http_status,omitempty"`
+}
+
 type DiagHealth struct {
-	Status    string `json:"status"` // online, offline, error
-	EmbyVer   string `json:"emby_version"`
-	LatencyMs int64  `json:"latency_ms"`
-	Error     string `json:"error,omitempty"`
+	Status    string    `json:"status"` // online, offline, error
+	EmbyVer   string    `json:"emby_version"`
+	LatencyMs int64     `json:"latency_ms"`
+	Probe     DiagProbe `json:"probe"`
+	Error     string    `json:"error,omitempty"`
 }
 
 type DiagTLS struct {
@@ -1014,15 +1022,8 @@ func canonicalTargetKey(target *url.URL) string {
 	return normalized.String()
 }
 
-func healthProbeURLs(target *url.URL) []string {
+func buildProbeURLs(target *url.URL, suffixes []string) []string {
 	basePath := strings.TrimSpace(target.Path)
-	var suffixes []string
-	if basePath == "" || basePath == "/" {
-		suffixes = []string{"System/Info/Public", "emby/System/Info/Public", ""}
-	} else {
-		suffixes = []string{"System/Info/Public", ""}
-	}
-
 	seen := map[string]struct{}{}
 	urls := make([]string, 0, len(suffixes))
 	for _, suffix := range suffixes {
@@ -1047,59 +1048,194 @@ func healthProbeURLs(target *url.URL) []string {
 	return urls
 }
 
-func probeSiteHealth(targetURL string) DiagHealth {
-	target, err := normalizeTargetURL(targetURL)
-	if err != nil {
-		return DiagHealth{Status: "offline", Error: err.Error()}
+func healthProbeURLs(target *url.URL) []string {
+	if strings.TrimSpace(target.Path) == "" || strings.TrimSpace(target.Path) == "/" {
+		return buildProbeURLs(target, []string{"System/Info/Public", "emby/System/Info/Public", ""})
+	}
+	return buildProbeURLs(target, []string{"System/Info/Public", ""})
+}
+
+func playbackProbeURLs(target *url.URL) []string {
+	return buildProbeURLs(target, []string{"Videos", "emby/Videos", "Audio", "emby/Audio", "LiveTV", "emby/LiveTV"})
+}
+
+type diagProbePlan struct {
+	BaseURL       string
+	Kind          string
+	Method        string
+	CandidateURLs []string
+	ParseVersion  bool
+}
+
+func resolveProbeKind(plan diagProbePlan, probeURL string) string {
+	if plan.Kind != "metadata_api" {
+		return plan.Kind
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	reachable := false
-	var reachableLatency int64
-	var serverError string
-	var serverErrorLatency int64
+	baseTarget, baseErr := normalizeTargetURL(plan.BaseURL)
+	probeTarget, probeErr := normalizeTargetURL(probeURL)
+	if baseErr != nil || probeErr != nil {
+		return plan.Kind
+	}
 
-	for _, probeURL := range healthProbeURLs(target) {
-		start := time.Now()
-		resp, err := client.Get(probeURL)
-		latency := time.Since(start).Milliseconds()
+	basePath := strings.TrimSpace(baseTarget.Path)
+	if basePath == "" {
+		basePath = "/"
+	}
+	probePath := strings.TrimSpace(probeTarget.Path)
+	if probePath == "" {
+		probePath = "/"
+	}
+	if strings.TrimRight(probePath, "/") == strings.TrimRight(basePath, "/") {
+		return "reachability_fallback"
+	}
+
+	return plan.Kind
+}
+
+func probeStatusRank(status int) int {
+	switch {
+	case status >= 200 && status < 300:
+		return 4
+	case status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusMethodNotAllowed:
+		return 3
+	case status == http.StatusNotFound:
+		return 2
+	case status > 0 && status < 500:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func probeTargetHealth(plan diagProbePlan) DiagHealth {
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	var bestReachable DiagHealth
+	bestReachableRank := 0
+	var serverError DiagHealth
+
+	for _, probeURL := range plan.CandidateURLs {
+		health := DiagHealth{
+			Probe: DiagProbe{
+				Kind:   resolveProbeKind(plan, probeURL),
+				Method: plan.Method,
+				URL:    probeURL,
+			},
+		}
+		req, err := http.NewRequest(plan.Method, probeURL, nil)
 		if err != nil {
-			return DiagHealth{Status: "offline", LatencyMs: latency, Error: err.Error()}
+			health.Status = "offline"
+			health.Error = err.Error()
+			return health
+		}
+
+		start := time.Now()
+		resp, err := client.Do(req)
+		latency := time.Since(start).Milliseconds()
+		health.LatencyMs = latency
+		if err != nil {
+			health.Status = "offline"
+			health.Error = err.Error()
+			return health
 		}
 
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
+		health.Probe.HTTPStatus = resp.StatusCode
 
 		if resp.StatusCode >= 500 {
-			serverError = fmt.Sprintf("probe returned HTTP %d", resp.StatusCode)
-			serverErrorLatency = latency
+			if serverError.Error == "" {
+				health.Status = "error"
+				health.Error = fmt.Sprintf("probe returned HTTP %d", resp.StatusCode)
+				serverError = health
+			}
 			continue
 		}
 
-		health := DiagHealth{Status: "online", LatencyMs: latency}
+		health.Status = "online"
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			var info map[string]interface{}
-			if json.Unmarshal(body, &info) == nil {
-				if v, ok := info["Version"]; ok {
-					health.EmbyVer = fmt.Sprintf("%v", v)
+			if plan.ParseVersion {
+				var info map[string]interface{}
+				if json.Unmarshal(body, &info) == nil {
+					if v, ok := info["Version"]; ok {
+						health.EmbyVer = fmt.Sprintf("%v", v)
+					}
 				}
 			}
 			return health
 		}
 
-		if !reachable {
-			reachable = true
-			reachableLatency = latency
+		rank := probeStatusRank(resp.StatusCode)
+		if rank > bestReachableRank {
+			bestReachable = health
+			bestReachableRank = rank
+		}
+		if plan.Kind == "playback_path" && rank >= 3 {
+			return health
 		}
 	}
 
-	if reachable {
-		return DiagHealth{Status: "online", LatencyMs: reachableLatency}
+	if bestReachableRank > 0 {
+		return bestReachable
 	}
-	if serverError != "" {
-		return DiagHealth{Status: "error", LatencyMs: serverErrorLatency, Error: serverError}
+	if serverError.Error != "" {
+		return serverError
 	}
-	return DiagHealth{Status: "offline", Error: "health probe failed"}
+	return DiagHealth{
+		Status: "offline",
+		Probe: DiagProbe{
+			Kind:   plan.Kind,
+			Method: plan.Method,
+			URL:    plan.BaseURL,
+		},
+		Error: "health probe failed",
+	}
+}
+
+func probeSiteHealth(targetURL string) DiagHealth {
+	target, err := normalizeTargetURL(targetURL)
+	if err != nil {
+		return DiagHealth{
+			Status: "offline",
+			Probe: DiagProbe{
+				Kind:   "metadata_api",
+				Method: http.MethodGet,
+			},
+			Error: err.Error(),
+		}
+	}
+	return probeTargetHealth(diagProbePlan{
+		BaseURL:       target.String(),
+		Kind:          "metadata_api",
+		Method:        http.MethodGet,
+		CandidateURLs: healthProbeURLs(target),
+		ParseVersion:  true,
+	})
+}
+
+func probePlaybackHealth(targetURL string) DiagHealth {
+	target, err := normalizeTargetURL(targetURL)
+	if err != nil {
+		return DiagHealth{
+			Status: "offline",
+			Probe: DiagProbe{
+				Kind:   "playback_path",
+				Method: http.MethodHead,
+			},
+			Error: err.Error(),
+		}
+	}
+	return probeTargetHealth(diagProbePlan{
+		BaseURL:       target.String(),
+		Kind:          "playback_path",
+		Method:        http.MethodHead,
+		CandidateURLs: playbackProbeURLs(target),
+	})
 }
 
 func probeSiteTLS(target *url.URL) DiagTLS {
@@ -1136,7 +1272,7 @@ func probeSiteTLS(target *url.URL) DiagTLS {
 	return result
 }
 
-func diagnoseUpstreamTarget(targetURL string) (DiagUpstream, string) {
+func diagnoseUpstreamTarget(targetURL, probeKind string) (DiagUpstream, string) {
 	trimmed := strings.TrimSpace(targetURL)
 	result := DiagUpstream{
 		Configured:    trimmed != "",
@@ -1153,7 +1289,12 @@ func diagnoseUpstreamTarget(targetURL string) (DiagUpstream, string) {
 
 	result.ConfiguredURL = parsed.String()
 	result.EffectiveURL = parsed.String()
-	result.Health = probeSiteHealth(parsed.String())
+	switch probeKind {
+	case "playback_path":
+		result.Health = probePlaybackHealth(parsed.String())
+	default:
+		result.Health = probeSiteHealth(parsed.String())
+	}
 	result.TLS = probeSiteTLS(parsed)
 	result.ShowTLS = result.TLS.Enabled
 
@@ -1162,7 +1303,7 @@ func diagnoseUpstreamTarget(targetURL string) (DiagUpstream, string) {
 
 func diagnoseSite(site *Site, pm *ProxyManager) DiagResult {
 	profile := getUAProfile(site.UAMode)
-	primary, primaryKey := diagnoseUpstreamTarget(site.TargetURL)
+	primary, primaryKey := diagnoseUpstreamTarget(site.TargetURL, "metadata_api")
 	primary.Configured = true
 	primary.ShowHealth = true
 	primary.ShowTLS = primary.TLS.Enabled
@@ -1178,7 +1319,7 @@ func diagnoseSite(site *Site, pm *ProxyManager) DiagResult {
 
 	if playbackRaw != "" {
 		var playbackKey string
-		playback, playbackKey = diagnoseUpstreamTarget(playbackRaw)
+		playback, playbackKey = diagnoseUpstreamTarget(playbackRaw, "playback_path")
 		playback.Configured = true
 		playback.UsingFallback = false
 		playback.SameAsPrimary = playbackKey != "" && playbackKey == primaryKey

@@ -124,6 +124,18 @@ func TestDiagnoseSiteUsesRootSystemInfoProbe(t *testing.T) {
 	if result.Health.EmbyVer != "4.8.0.80" {
 		t.Fatalf("emby_version = %q, want 4.8.0.80", result.Health.EmbyVer)
 	}
+	if result.Health.Probe.Kind != "metadata_api" {
+		t.Fatalf("probe.kind = %q, want metadata_api", result.Health.Probe.Kind)
+	}
+	if result.Health.Probe.Method != http.MethodGet {
+		t.Fatalf("probe.method = %q, want GET", result.Health.Probe.Method)
+	}
+	if !strings.HasSuffix(result.Health.Probe.URL, "/System/Info/Public") {
+		t.Fatalf("probe.url = %q, want suffix /System/Info/Public", result.Health.Probe.URL)
+	}
+	if result.Health.Probe.HTTPStatus != http.StatusOK {
+		t.Fatalf("probe.http_status = %d, want 200", result.Health.Probe.HTTPStatus)
+	}
 }
 
 func TestDiagnoseSiteTreatsReachable4xxAsOnline(t *testing.T) {
@@ -144,6 +156,43 @@ func TestDiagnoseSiteTreatsReachable4xxAsOnline(t *testing.T) {
 	}
 	if result.Health.Error != "" {
 		t.Fatalf("health.error = %q, want empty for reachable upstream", result.Health.Error)
+	}
+	if result.Health.Probe.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("probe.http_status = %d, want 403", result.Health.Probe.HTTPStatus)
+	}
+}
+
+func TestDiagnoseSiteMarksRootReachabilityFallbackProbe(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	app := newTestApp(t)
+	site, err := app.db.CreateSite("diag", freePort(t), server.URL, "", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+
+	result := diagnoseSite(site, app.pm)
+	if result.Health.Status != "online" {
+		t.Fatalf("health.status = %q, want online (error=%q)", result.Health.Status, result.Health.Error)
+	}
+	if result.Health.Probe.Kind != "reachability_fallback" {
+		t.Fatalf("probe.kind = %q, want reachability_fallback", result.Health.Probe.Kind)
+	}
+	if result.Health.Probe.Method != http.MethodGet {
+		t.Fatalf("probe.method = %q, want GET", result.Health.Probe.Method)
+	}
+	if result.Health.Probe.URL != server.URL+"/" {
+		t.Fatalf("probe.url = %q, want %q", result.Health.Probe.URL, server.URL+"/")
+	}
+	if result.Health.Probe.HTTPStatus != http.StatusOK {
+		t.Fatalf("probe.http_status = %d, want 200", result.Health.Probe.HTTPStatus)
 	}
 }
 
@@ -183,6 +232,14 @@ func TestHandleSiteDiagReturnsPlaybackFallbackMetadata(t *testing.T) {
 	if got := mustBoolValue(t, primary, "show_health"); !got {
 		t.Fatalf("primary show_health = %v, want true", got)
 	}
+	primaryHealth := mustMapValue(t, primary, "health")
+	primaryProbe := mustMapValue(t, primaryHealth, "probe")
+	if got := mustStringValue(t, primaryProbe, "kind"); got != "metadata_api" {
+		t.Fatalf("primary probe.kind = %q, want metadata_api", got)
+	}
+	if got := mustStringValue(t, primaryProbe, "method"); got != http.MethodGet {
+		t.Fatalf("primary probe.method = %q, want GET", got)
+	}
 	if got := mustStringValue(t, playback, "effective_url"); got != apiServer.URL {
 		t.Fatalf("playback effective_url = %q, want %q", got, apiServer.URL)
 	}
@@ -200,6 +257,10 @@ func TestHandleSiteDiagReturnsPlaybackFallbackMetadata(t *testing.T) {
 	}
 	if got := mustBoolValue(t, playback, "show_tls"); got {
 		t.Fatalf("playback show_tls = %v, want false", got)
+	}
+	playbackProbe := mustMapValue(t, mustMapValue(t, playback, "health"), "probe")
+	if got := mustStringValue(t, playbackProbe, "kind"); got != "metadata_api" {
+		t.Fatalf("fallback playback probe.kind = %q, want metadata_api", got)
 	}
 }
 
@@ -243,6 +304,10 @@ func TestHandleSiteDiagMarksSharedPlaybackTarget(t *testing.T) {
 	if got := mustBoolValue(t, playback, "show_health"); got {
 		t.Fatalf("playback show_health = %v, want false", got)
 	}
+	playbackProbe := mustMapValue(t, mustMapValue(t, playback, "health"), "probe")
+	if got := mustStringValue(t, playbackProbe, "kind"); got != "metadata_api" {
+		t.Fatalf("shared playback probe.kind = %q, want metadata_api", got)
+	}
 }
 
 func TestHandleSiteDiagExposesSeparatePlaybackTLS(t *testing.T) {
@@ -255,12 +320,16 @@ func TestHandleSiteDiagExposesSeparatePlaybackTLS(t *testing.T) {
 	}))
 	defer apiServer.Close()
 
+	var playbackMethod string
+	var playbackPath string
 	playbackServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/System/Info/Public" {
-			http.NotFound(w, r)
+		playbackMethod = r.Method
+		playbackPath = r.URL.Path
+		if r.Method == http.MethodHead && r.URL.Path == "/Videos" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		w.Write([]byte(`{"Version":"4.8.1.1"}`))
+		http.NotFound(w, r)
 	}))
 	defer playbackServer.Close()
 
@@ -283,6 +352,8 @@ func TestHandleSiteDiagExposesSeparatePlaybackTLS(t *testing.T) {
 	upstreams := mustMapValue(t, body, "upstreams")
 	primary := mustMapValue(t, upstreams, "primary")
 	playback := mustMapValue(t, upstreams, "playback")
+	playbackHealth := mustMapValue(t, playback, "health")
+	playbackProbe := mustMapValue(t, playbackHealth, "probe")
 	playbackTLS := mustMapValue(t, playback, "tls")
 
 	if got := mustBoolValue(t, primary, "show_tls"); got {
@@ -300,11 +371,29 @@ func TestHandleSiteDiagExposesSeparatePlaybackTLS(t *testing.T) {
 	if got := mustBoolValue(t, playback, "show_tls"); !got {
 		t.Fatalf("playback show_tls = %v, want true", got)
 	}
+	if got := mustStringValue(t, playbackProbe, "kind"); got != "playback_path" {
+		t.Fatalf("playback probe.kind = %q, want playback_path", got)
+	}
+	if got := mustStringValue(t, playbackProbe, "method"); got != http.MethodHead {
+		t.Fatalf("playback probe.method = %q, want HEAD", got)
+	}
+	if got := mustNumberValue(t, playbackProbe, "http_status"); got != http.StatusMethodNotAllowed {
+		t.Fatalf("playback probe.http_status = %d, want 405", got)
+	}
+	if got := mustStringValue(t, playbackHealth, "status"); got != "online" {
+		t.Fatalf("playback health.status = %q, want online", got)
+	}
 	if got := mustBoolValue(t, playbackTLS, "enabled"); !got {
 		t.Fatalf("playback tls.enabled = %v, want true", got)
 	}
 	if got := mustStringValue(t, playback, "effective_url"); got != playbackServer.URL {
 		t.Fatalf("playback effective_url = %q, want %q", got, playbackServer.URL)
+	}
+	if playbackMethod != http.MethodHead {
+		t.Fatalf("playback request method = %q, want HEAD", playbackMethod)
+	}
+	if playbackPath != "/Videos" {
+		t.Fatalf("playback request path = %q, want /Videos", playbackPath)
 	}
 }
 
@@ -656,4 +745,18 @@ func mustBoolValue(t *testing.T, body map[string]interface{}, key string) bool {
 		t.Fatalf("key %q = %#v, want bool", key, value)
 	}
 	return result
+}
+
+func mustNumberValue(t *testing.T, body map[string]interface{}, key string) int {
+	t.Helper()
+
+	value, ok := body[key]
+	if !ok {
+		t.Fatalf("missing key %q in %#v", key, body)
+	}
+	result, ok := value.(float64)
+	if !ok {
+		t.Fatalf("key %q = %#v, want number", key, value)
+	}
+	return int(result)
 }

@@ -106,6 +106,7 @@ function renderDiagNotes(notes) {
 
 function renderHealthCard(title, subtitle, upstream, staggerClass) {
   const health = upstream.health || {};
+  const probe = health.probe || {};
   const latency = typeof health.latency_ms === 'number' ? health.latency_ms : 0;
   return `
     <div class="diag-card fade-up ${staggerClass}">
@@ -123,6 +124,9 @@ function renderHealthCard(title, subtitle, upstream, staggerClass) {
         <div class="diag-row"><span class="diag-key">连接状态</span><span class="diag-val ${statusClass(health.status)}">${statusText(health.status)}</span></div>
         <div class="diag-row"><span class="diag-key">Emby 版本</span><span class="diag-val">${diagText(health.emby_version)}</span></div>
         <div class="diag-row"><span class="diag-key">响应延迟</span><span class="diag-val ${latencyClass(latency)}">${latency}ms</span></div>
+        <div class="diag-row"><span class="diag-key">探针类型</span><span class="diag-val">${probeLabel(probe)}</span></div>
+        <div class="diag-row"><span class="diag-key">探针请求</span><span class="diag-val diag-wrap">${diagText(probeRequestText(probe))}</span></div>
+        ${typeof probe.http_status === 'number' && probe.http_status > 0 ? `<div class="diag-row"><span class="diag-key">探针响应</span><span class="diag-val">${probe.http_status}</span></div>` : ''}
         ${health.error ? `<div class="diag-row"><span class="diag-key">探针结果</span><span class="diag-val bad diag-wrap">${esc(health.error)}</span></div>` : ''}
       </div>
     </div>
@@ -209,10 +213,34 @@ function playbackNote(playback, primary) {
   if (playback.same_as_primary) {
     return `播放回源已配置，但与主回源相同，当前复用主回源诊断结果，不重复展示完全相同的诊断块。`;
   }
+  const probe = playback.health && playback.health.probe ? playback.health.probe : {};
+  if (probe.kind === 'playback_path') {
+    const probeText = probeRequestText(probe) || 'HEAD 播放路径探针';
+    if (playback.show_tls) {
+      return `播放回源是独立 HTTPS 上游：${playback.effective_url || '--'}。当前健康块使用 ${probeText} 做轻量播放路径探针，不代表完整播放一定成功。`;
+    }
+    return `播放回源是独立上游：${playback.effective_url || '--'}。当前健康块使用 ${probeText} 做轻量播放路径探针，不代表完整播放一定成功。`;
+  }
   if (playback.show_tls) {
     return `播放回源是独立 HTTPS 上游：${playback.effective_url || '--'}，因此会单独展示播放健康和播放 TLS。`;
   }
   return `播放回源是独立上游：${playback.effective_url || '--'}。该上游未使用 HTTPS，因此只展示播放健康。`;
+}
+
+function probeLabel(probe) {
+  if (!probe || !probe.kind) return '--';
+  if (probe.kind === 'playback_path') return '播放路径轻量探针';
+  if (probe.kind === 'reachability_fallback') return '可达性回退探针';
+  if (probe.kind === 'metadata_api') return 'Metadata / API 探针';
+  return probe.kind;
+}
+
+function probeRequestText(probe) {
+  if (!probe) return '';
+  const method = probe.method || '';
+  const url = probe.url || '';
+  if (!method && !url) return '';
+  return `${method} ${url}`.trim();
 }
 
 function statusClass(value) {
