@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="meridian-m" x1="16" y1="46" x2="51" y2="15" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#9C74FF"/>
+      <stop offset="0.52" stop-color="#6EE3FF"/>
+      <stop offset="1" stop-color="#DDFBFF"/>
+    </linearGradient>
+    <filter id="meridian-glow" x="6" y="6" width="52" height="52" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="0" stdDeviation="2.8" flood-color="#78DEFF" flood-opacity="0.58"/>
+      <feDropShadow dx="0" dy="0" stdDeviation="4.6" flood-color="#9C74FF" flood-opacity="0.22"/>
+    </filter>
+  </defs>
+
+  <g filter="url(#meridian-glow)">
+    <path
+      d="M16 44C19 39.5 22 35.75 25.5 33.5C28.75 31.5 31.25 32.25 33.5 35.75C35 38 36 39.25 37.25 39.25C38.75 39.25 40.25 37.5 41.75 34.5L49 18L55 44"
+      stroke="url(#meridian-m)"
+      stroke-width="8.5"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      opacity="0.38"
+    />
+    <path
+      d="M16.75 43.25C19.5 39.25 22.25 35.75 25.5 33.75C28.5 31.9 30.75 32.5 32.75 35.75C34.5 38.5 35.6 39.9 37.1 39.9C38.6 39.9 40.1 38.1 41.6 35.1L49 18.75L54.25 43.25"
+      stroke="url(#meridian-m)"
+      stroke-width="5.6"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+    <path
+      d="M18.1 41.7C20.4 38.55 22.6 35.95 25.25 34.35C27.55 32.95 29.2 33.45 30.85 35.95C32.95 39.1 34.45 40.7 36.65 40.7C39.2 40.7 41.35 38.1 43.2 34.25L49.15 21.25"
+      stroke="#F7FDFF"
+      stroke-width="1.5"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      opacity="0.9"
+    />
+  </g>
+</svg>
