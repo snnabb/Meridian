@@ -2757,7 +2757,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			CustomUserAgent   *string   `json:"custom_user_agent"`
 			CustomClient      *string   `json:"custom_client"`
 			CustomVersion     *string   `json:"custom_version"`
-			Quota             int64     `json:"traffic_quota"`
+			Quota             *int64    `json:"traffic_quota"`
 			SpeedLimit        *int      `json:"speed_limit"`
 		}
 		if err := decodeJSONBody(w, r, &req); err != nil {
@@ -2780,6 +2780,10 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		speedLimit := oldSite.SpeedLimit
 		if req.SpeedLimit != nil {
 			speedLimit = *req.SpeedLimit
+		}
+		quota := oldSite.TrafficQuota
+		if req.Quota != nil {
+			quota = *req.Quota
 		}
 		uaMode, customUserAgent, customClient, customVersion, uaErr := mergeSiteUAConfig(*oldSite, req.UAMode, req.CustomUserAgent, req.CustomClient, req.CustomVersion)
 		if uaErr != nil {
@@ -2804,7 +2808,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		candidate.CustomUserAgent = customUserAgent
 		candidate.CustomClient = customClient
 		candidate.CustomVersion = customVersion
-		candidate.TrafficQuota = req.Quota
+		candidate.TrafficQuota = quota
 		candidate.SpeedLimit = speedLimit
 		if err := validateSiteSettings(candidate.Name, candidate.ListenPort, candidate.TargetURL, candidate.PlaybackTargetURL, candidate.PlaybackMode, streamHostList, candidate.UAMode, candidate.CustomUserAgent, candidate.CustomClient, candidate.CustomVersion, candidate.TrafficQuota, candidate.SpeedLimit); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())

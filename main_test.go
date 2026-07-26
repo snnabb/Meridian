@@ -1891,6 +1891,64 @@ func TestHandleSiteUpdatePreservesOmittedSpeedLimit(t *testing.T) {
 	}
 }
 
+func TestHandleSiteUpdatePreservesOmittedTrafficQuota(t *testing.T) {
+	app := newTestApp(t)
+	port := freePort(t)
+	site, err := app.db.CreateSite("quota", port, "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 5<<30, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	if enabled, err := app.db.ToggleSite(site.ID); err != nil || enabled {
+		t.Fatalf("disable site: enabled=%v err=%v", enabled, err)
+	}
+
+	body := strings.NewReader(`{"name":"quota","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096","ua_mode":"infuse"}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(site.ID), body)
+	rr := httptest.NewRecorder()
+	app.handleSiteByID(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	reloaded, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatalf("GetSite: %v", err)
+	}
+	if reloaded.TrafficQuota != 5<<30 {
+		t.Fatalf("traffic_quota = %d, want preserved value %d", reloaded.TrafficQuota, int64(5<<30))
+	}
+}
+
+// Omitting the field preserves the quota, but sending an explicit 0 must still
+// clear it, so the pointer merge cannot be mistaken for "always ignore".
+func TestHandleSiteUpdateAppliesExplicitZeroTrafficQuota(t *testing.T) {
+	app := newTestApp(t)
+	port := freePort(t)
+	site, err := app.db.CreateSite("quota-clear", port, "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 5<<30, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	if enabled, err := app.db.ToggleSite(site.ID); err != nil || enabled {
+		t.Fatalf("disable site: enabled=%v err=%v", enabled, err)
+	}
+
+	body := strings.NewReader(`{"name":"quota-clear","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096","ua_mode":"infuse","traffic_quota":0}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(site.ID), body)
+	rr := httptest.NewRecorder()
+	app.handleSiteByID(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	reloaded, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatalf("GetSite: %v", err)
+	}
+	if reloaded.TrafficQuota != 0 {
+		t.Fatalf("traffic_quota = %d, want explicit 0", reloaded.TrafficQuota)
+	}
+}
+
 func TestFlushTrafficUpdatesBaselineAndStopPersistsPendingUsage(t *testing.T) {
 	app := newTestApp(t)
 	site, err := app.db.CreateSite("traffic", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 1024, 0)
