@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -256,6 +257,26 @@ func generateSetupToken() (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// setupTokenFilePath returns where the bootstrap token is parked so an operator
+// can read it without trawling the service log. Empty for in-memory or DSN-style
+// database paths, which have no directory to write beside.
+func setupTokenFilePath(dbPath string) string {
+	if dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(dbPath), "setup-token")
+}
+
+// writeSetupTokenFile parks the bootstrap token next to the database, readable
+// only by the owner.
+func writeSetupTokenFile(path, token string) error {
+	if path == "" {
+		return nil
+	}
+	// #nosec G703 -- the path is derived from the operator-controlled DB_PATH and never from a request.
+	return os.WriteFile(path, []byte(token+"\n"), 0600)
 }
 
 func setupTokenMatches(expected, provided string) bool {
@@ -2204,6 +2225,7 @@ type App struct {
 	pm               *ProxyManager
 	siteLifecycleMu  sync.Mutex
 	setupToken       string
+	setupTokenPath   string
 	loginLimiter     *loginRateLimiter
 	loginLimiterOnce sync.Once
 	trustedProxies   []*net.IPNet
@@ -2446,6 +2468,19 @@ func (a *App) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// clearSetupTokenFile removes the parked bootstrap token once an administrator
+// exists and the token can no longer be redeemed, so a dead secret does not sit
+// on disk for the life of the install.
+func (a *App) clearSetupTokenFile() {
+	if a.setupTokenPath == "" {
+		return
+	}
+	// #nosec G703 -- the path is derived from the operator-controlled DB_PATH and never from a request.
+	if err := os.Remove(a.setupTokenPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("could not remove the setup token file %s: %v", a.setupTokenPath, err)
+	}
+}
+
 // POST /api/auth/setup
 func (a *App) handleSetup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -2488,6 +2523,7 @@ func (a *App) handleSetup(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, http.StatusInternalServerError, "unable to create admin user")
 		return
 	}
+	a.clearSetupTokenFile()
 	token, err := generateToken(id, req.Username)
 	if err != nil {
 		a.jsonErr(w, 500, err.Error())
@@ -3156,15 +3192,32 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to count users: %v", err)
 	}
+	setupTokenPath := ""
 	if userCount == 0 {
+		operatorSupplied := true
 		setupToken = strings.TrimSpace(os.Getenv("SETUP_TOKEN"))
 		if setupToken == "" {
+			operatorSupplied = false
 			setupToken, err = generateSetupToken()
 			if err != nil {
 				log.Fatalf("failed to generate initial setup token: %v", err)
 			}
 		}
-		log.Printf("Initial setup token: %s", setupToken)
+		setupTokenPath = setupTokenFilePath(dbPath)
+		if err := writeSetupTokenFile(setupTokenPath, setupToken); err != nil {
+			log.Printf("could not write the setup token file %s: %v", setupTokenPath, err)
+			setupTokenPath = ""
+		} else if setupTokenPath != "" {
+			log.Printf("Initial setup token written to %s; it is removed once the administrator exists.", setupTokenPath)
+		}
+		// An operator-supplied SETUP_TOKEN is never echoed: they already hold it,
+		// and logging it would copy a secret they control into a log that outlives
+		// the setup window. A generated one is still printed, because for the
+		// container flow (README: docker logs meridian) the log is the only
+		// channel available.
+		if !operatorSupplied {
+			log.Printf("Initial setup token: %s", setupToken)
+		}
 	}
 
 	trustedProxies, err := parseTrustedProxyCIDRs(os.Getenv("TRUSTED_PROXY_CIDRS"))
@@ -3175,6 +3228,7 @@ func main() {
 		db:             db,
 		pm:             pm,
 		setupToken:     setupToken,
+		setupTokenPath: setupTokenPath,
 		loginLimiter:   newLoginRateLimiter(),
 		trustedProxies: trustedProxies,
 	}

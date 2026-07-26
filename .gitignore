@@ -15,6 +15,9 @@ meridian.exe
 *.db-wal
 *.db-shm
 
+# Bootstrap credential parked next to the database
+setup-token
+
 # IDE
 .idea/
 .vscode/

@@ -8,6 +8,8 @@
 *.db-journal
 *.db-shm
 *.db-wal
+
+setup-token
 meridian
 meridian.exe
 *.exe
