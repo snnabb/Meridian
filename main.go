@@ -287,8 +287,20 @@ func openDB(path string) (*DB, error) {
 	return d, nil
 }
 
+// warnUnenforcedFileModes keeps the platform warning to one line per process
+// instead of one per openDB call.
+var warnUnenforcedFileModes sync.Once
+
 func hardenDatabaseFilePermissions(path string) error {
 	if path == ":memory:" || strings.HasPrefix(path, "file:") {
+		return nil
+	}
+	if !fileModesEnforced() {
+		// Chmod would report success and change nothing, which is worse than not
+		// trying: it would let the operator believe the database is protected.
+		warnUnenforcedFileModes.Do(func() {
+			log.Printf("This platform does not enforce POSIX file modes, so %s keeps whatever permissions it inherits from its directory. That file holds the administrator password hash and every configured upstream URL: restrict the directory yourself and do not leave it somewhere other local users can read.", path)
+		})
 		return nil
 	}
 	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {

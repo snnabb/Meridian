@@ -34,6 +34,13 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # Release publishes windows and darwin binaries, but every job here runs on
+      # ubuntu, so the !unix build was never even type-checked.
+      - name: Vet non-unix build targets
+        run: |
+          GOOS=windows GOARCH=amd64 go vet ./...
+          GOOS=darwin GOARCH=arm64 go vet ./...
+
       - name: Vulnerability scan
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
