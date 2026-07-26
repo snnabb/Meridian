@@ -1156,8 +1156,79 @@ func (w *rateLimitedWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, fmt.Errorf("hijack not supported")
 }
 
+// tunnelWriter meters, and optionally paces, bytes copied through a hijacked
+// WebSocket tunnel. Accounting has to happen per chunk rather than once the copy
+// returns, otherwise a long-lived tunnel stays invisible to the quota gate and
+// exempt from the site's speed limit for as long as it is open.
+type tunnelWriter struct {
+	dst         io.Writer
+	counter     *atomic.Int64
+	bytesPerSec int64
+	written     int64
+	start       time.Time
+}
+
+func (t *tunnelWriter) Write(b []byte) (int, error) {
+	if t.bytesPerSec <= 0 {
+		n, err := t.dst.Write(b)
+		t.counter.Add(int64(n))
+		return n, err
+	}
+	total := 0
+	for len(b) > 0 {
+		elapsed := time.Since(t.start).Seconds()
+		if elapsed < 0.001 {
+			elapsed = 0.001
+		}
+		allowed := int64(elapsed*float64(t.bytesPerSec)) - t.written
+		if allowed <= 0 {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		chunk := b
+		if int64(len(chunk)) > allowed {
+			chunk = b[:allowed]
+		}
+		n, err := t.dst.Write(chunk)
+		t.counter.Add(int64(n))
+		t.written += int64(n)
+		total += n
+		b = b[n:]
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			return total, io.ErrNoProgress
+		}
+	}
+	return total, nil
+}
+
+// headerHasToken reports whether a comma-separated header such as Connection
+// carries the given token, which is how RFC 9110 requires these be compared.
+func headerHasToken(header http.Header, name, token string) bool {
+	for _, value := range header.Values(name) {
+		for _, part := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), token) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isWebSocketUpgrade reports whether the request is a real RFC 6455 handshake.
+// A bare "Upgrade: websocket" header is not enough to qualify: routing an
+// ordinary request into the hijacked tunnel would skip the metering and
+// speed-limit wrappers that the normal proxy path installs, and would relay raw
+// bytes to an upstream that never agreed to switch protocols. Requests that fail
+// this check fall through to httputil.ReverseProxy, which negotiates protocol
+// switches on its own.
 func isWebSocketUpgrade(r *http.Request) bool {
-	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+	return r.Method == http.MethodGet &&
+		strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
+		headerHasToken(r.Header, "Connection", "upgrade") &&
+		r.Header.Get("Sec-WebSocket-Key") != ""
 }
 
 func normalizeTargetURL(addr string) (*url.URL, error) {
@@ -1366,6 +1437,10 @@ func prepareUpstreamHeaders(header http.Header, inbound *http.Request, profile U
 func prepareWebSocketUpstreamHeaders(inbound *http.Request, target *url.URL, profile UAProfile) http.Header {
 	header := inbound.Header.Clone()
 	for _, name := range []string{
+		// Content-Length must go with the other hop-by-hop headers: the upgrade
+		// path never reads r.Body, so letting a length through would tell the
+		// upstream to frame bytes as a body that this side never sends.
+		"Content-Length",
 		"Keep-Alive",
 		"Proxy-Authenticate",
 		"Proxy-Authorization",
@@ -1384,7 +1459,20 @@ func prepareWebSocketUpstreamHeaders(inbound *http.Request, target *url.URL, pro
 	return header
 }
 
-func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, profile UAProfile, inst *ProxyInstance) {
+// writeWebSocketGatewayError answers a hijacked client directly, since the
+// http.ResponseWriter is no longer usable once the connection is taken over.
+func writeWebSocketGatewayError(conn net.Conn) {
+	const body = `{"error":"upstream refused websocket upgrade"}`
+	_, _ = fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+}
+
+func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, profile UAProfile, inst *ProxyInstance, speedLimitBytes int64) {
+	// Nothing on this path reads r.Body, so a body would be left sitting in the
+	// hijacked buffer and relayed verbatim to the upstream.
+	if r.ContentLength != 0 || len(r.TransferEncoding) > 0 {
+		http.Error(w, "websocket upgrade must not carry a body", http.StatusBadRequest)
+		return
+	}
 	scheme := "ws"
 	if target.Scheme == "https" {
 		scheme = "wss"
@@ -1421,7 +1509,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, pr
 	}
 	if err != nil {
 		log.Printf("[WS] upstream dial error: %v", err)
-		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		writeWebSocketGatewayError(clientConn)
 		return
 	}
 	defer upstreamConn.Close()
@@ -1452,18 +1540,65 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, pr
 		return
 	}
 
+	// Require a real protocol switch before relaying any raw bytes. Without this
+	// check the tunnel starts regardless of what the upstream answered, so if the
+	// upstream ignored the upgrade and stayed in HTTP keep-alive mode, whatever
+	// the client sends next reaches it as requests that never passed through
+	// removeClientForwardingHeaders/setTrustedForwardingHeaders/applyUAProfileHeaders.
+	if err := upstreamConn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		log.Printf("[WS] set handshake read deadline: %v", err)
+		return
+	}
+	// Read through a buffered reader and keep using it below: ReadResponse may
+	// consume bytes past the headers, and those belong to the tunnel.
+	upstreamReader := bufio.NewReader(upstreamConn)
+	resp, err := http.ReadResponse(upstreamReader, r)
+	if err != nil {
+		log.Printf("[WS] read upstream handshake: %v", err)
+		writeWebSocketGatewayError(clientConn)
+		return
+	}
+	defer resp.Body.Close()
+	if err := upstreamConn.SetReadDeadline(time.Time{}); err != nil {
+		log.Printf("[WS] clear handshake read deadline: %v", err)
+		return
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols ||
+		!strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") ||
+		!headerHasToken(resp.Header, "Connection", "upgrade") {
+		// The body is deliberately not relayed. An upstream that answers a
+		// handshake with a normal response must not turn this path into an
+		// unmetered, unthrottled transfer channel.
+		log.Printf("[WS] upstream refused upgrade: status %d", resp.StatusCode)
+		writeWebSocketGatewayError(clientConn)
+		return
+	}
+
+	// Relay the switch verbatim; the client needs Sec-WebSocket-Accept.
+	if _, err := io.WriteString(clientConn, "HTTP/1.1 101 Switching Protocols\r\n"); err != nil {
+		log.Printf("[WS] write handshake response: %v", err)
+		return
+	}
+	if err := resp.Header.Write(clientConn); err != nil {
+		log.Printf("[WS] write handshake headers: %v", err)
+		return
+	}
+	if _, err := io.WriteString(clientConn, "\r\n"); err != nil {
+		log.Printf("[WS] finish handshake response: %v", err)
+		return
+	}
+
 	log.Printf("[WS] tunnel established: client <-> %s", target.Host)
 
-	// Bidirectional copy
+	// Bidirectional copy. Both directions are metered per chunk; only the
+	// download direction is paced, matching rateLimitedWriter on the HTTP path.
 	done := make(chan struct{}, 2)
 	go func() {
-		n, _ := io.Copy(upstreamConn, clientBuf)
-		inst.bytesIn.Add(n)
+		_, _ = io.Copy(&tunnelWriter{dst: upstreamConn, counter: &inst.bytesIn, start: time.Now()}, clientBuf)
 		done <- struct{}{}
 	}()
 	go func() {
-		n, _ := io.Copy(clientConn, upstreamConn)
-		inst.bytesOut.Add(n)
+		_, _ = io.Copy(&tunnelWriter{dst: clientConn, counter: &inst.bytesOut, bytesPerSec: speedLimitBytes, start: time.Now()}, upstreamReader)
 		done <- struct{}{}
 	}()
 	<-done
@@ -1567,7 +1702,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			if isRedirectMode {
 				wsTarget = target
 			}
-			handleWebSocket(w, r, wsTarget, profile, inst)
+			handleWebSocket(w, r, wsTarget, profile, inst, speedLimitBytes)
 			return
 		}
 
