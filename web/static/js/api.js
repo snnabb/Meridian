@@ -54,3 +54,16 @@ const API = {
     this.username = null;
   }
 };
+
+// Shared HTML escaper. It lives in the first-loaded script that every page
+// already depends on, so no page can render markup before escaping exists.
+// Keep it a function declaration: pages reach it as a global.
+function esc(str) {
+  return String(str).replace(/[&<>"']/g, char => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  })[char]);
+}
