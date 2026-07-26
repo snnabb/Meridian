@@ -1288,6 +1288,9 @@ func validateSiteSettings(name string, listenPort int, targetURL, playbackTarget
 	if quota < 0 || speedLimit < 0 {
 		return fmt.Errorf("traffic_quota and speed_limit must not be negative")
 	}
+	if speedLimit > maxSpeedLimitMbps {
+		return fmt.Errorf("speed_limit must not exceed %d Mbps", maxSpeedLimitMbps)
+	}
 	if len(streamHosts) > 128 {
 		return fmt.Errorf("stream_hosts must contain at most 128 entries")
 	}
@@ -1610,6 +1613,17 @@ func (pm *ProxyManager) StartSite(site Site) error {
 
 	pm.mu.Lock()
 	if existing, ok := pm.proxies[site.ID]; ok {
+		// Flush before dropping the instance, the way StopSite does. This branch is
+		// reached when a running site's listen_port changes, which is the one
+		// update path handleSiteByID does not pre-stop, so without this everything
+		// counted since the last 60s tick vanishes from traffic_logs and
+		// sites.traffic_used.
+		pm.flushProxyTraffic(existing)
+		// That flush moved bytes into the row `site` was read from, so carry the
+		// authoritative total forward instead of the snapshot taken before it.
+		if flushed := existing.Site.TrafficUsed; flushed > inst.persistedTraffic.Load() {
+			inst.persistedTraffic.Store(flushed)
+		}
 		if existing.server != nil {
 			existing.server.Close()
 		}
@@ -1919,13 +1933,20 @@ func probeStatusRank(status int) int {
 	}
 }
 
+// probeClient is shared by every diagnostics probe. Building a fresh
+// http.Transport per call left idle keep-alive connections with a zero
+// IdleConnTimeout, meaning they never expired, and CloseIdleConnections was never
+// called, so each run stranded upstream sockets along with their read and write
+// goroutines. DefaultTransport.Clone() brings a 90s IdleConnTimeout, matching
+// what StartSite already does for the proxy transport.
+var probeClient = func() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = secureTLSConfig("")
+	return &http.Client{Timeout: 5 * time.Second, Transport: transport}
+}()
+
 func probeTargetHealth(plan diagProbePlan) DiagHealth {
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: secureTLSConfig(""),
-		},
-	}
+	client := probeClient
 	var bestReachable DiagHealth
 	bestReachableRank := 0
 	var serverError DiagHealth
@@ -2210,7 +2231,11 @@ type App struct {
 }
 
 const (
-	maxJSONBodyBytes       = 64 << 10
+	maxJSONBodyBytes = 64 << 10
+	// speedLimitBytes multiplies this field by 125000, so an unbounded value
+	// wraps int64 and silently disables the limit instead of tightening it.
+	// 1000000 matches the max the site form already enforces.
+	maxSpeedLimitMbps      = 1000000
 	maxLoginFailures       = 5
 	maxTrackedLoginClients = 10000
 	loginFailureWindow     = 15 * time.Minute
