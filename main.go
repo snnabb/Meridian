@@ -31,7 +31,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-crypt/x/bcrypt"
+	"golang.org/x/crypto/bcrypt"
 	sqlite "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 
