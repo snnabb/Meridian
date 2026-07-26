@@ -199,7 +199,10 @@ func TestHandleWebSocketRelaysSwitchAndMetersBothDirections(t *testing.T) {
 	if !strings.Contains(seen, "101 Switching Protocols") {
 		t.Fatalf("client response = %q, want a relayed 101", seen)
 	}
-	if !strings.Contains(seen, "Sec-WebSocket-Accept:") {
+	// Case-insensitive on purpose: http.ReadResponse canonicalises the key to
+	// "Sec-Websocket-Accept", header names are case-insensitive on the wire, and
+	// this is exactly what httputil.ReverseProxy relays too.
+	if !strings.Contains(strings.ToLower(seen), "sec-websocket-accept:") {
 		t.Fatalf("handshake response dropped Sec-WebSocket-Accept: %q", seen)
 	}
 
