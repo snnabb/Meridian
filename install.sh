@@ -306,6 +306,30 @@ append_env_default() {
     install_env_file "$tmp_file"
 }
 
+# Guarantees a non-empty SETUP_TOKEN in .env and echoes the effective value.
+# An existing .env may predate SETUP_TOKEN entirely, or carry it with an empty
+# value. In both cases the panel generates a throwaway token at startup and
+# writes it only to the service log, while the installer used to print nothing,
+# leaving the operator unable to create the first administrator.
+ensure_setup_token() {
+    local tmp_dir="$1" env_file tmp_file token
+    token=$(read_env_value SETUP_TOKEN)
+    if [ -n "$token" ]; then
+        printf '%s\n' "$token"
+        return 0
+    fi
+    env_file=$(env_file_path)
+    token=$(generate_secret)
+    tmp_file="${tmp_dir}/env-setup-token"
+    # $1 is an awk field reference, not a shell variable.
+    # shellcheck disable=SC2016
+    as_root awk -F= '$1 != "SETUP_TOKEN" { print }' "$env_file" > "$tmp_file"
+    printf 'SETUP_TOKEN=%s\n' "$token" >> "$tmp_file"
+    chmod 0600 "$tmp_file"
+    install_env_file "$tmp_file"
+    printf '%s\n' "$token"
+}
+
 set_panel_env() {
     local bind_addr="$1" domain="$2" proxies="$3" tmp_dir="$4" env_file tmp_file
     env_file=$(env_file_path)
@@ -370,6 +394,28 @@ wait_for_health() {
     return 1
 }
 
+# Succeeds only when the panel positively reports an administrator already
+# exists. Probe failures return non-zero so callers keep showing the setup
+# token rather than risk withholding it from an un-provisioned panel.
+panel_setup_complete() {
+    local body
+    command -v curl >/dev/null 2>&1 || return 1
+    body=$(curl --noproxy '*' --proto '=http' --connect-timeout 1 --max-time 2 \
+        -sS "$(health_url)" 2>/dev/null || true)
+    printf '%s' "$body" | grep -q '"needs_setup"[[:space:]]*:[[:space:]]*false'
+}
+
+# Shows the token the panel will demand before the first administrator exists.
+# Both install paths call this: a fresh install falls through to the summary
+# banner, while reinstalling over an existing tree returns early and would
+# otherwise print nothing.
+report_setup_token() {
+    [ -n "$INITIAL_SETUP_TOKEN" ] || return 0
+    panel_setup_complete && return 0
+    printf "  ${YELLOW}首次初始化令牌（请立即保存）:${NC} ${BOLD}%s${NC}\n" "$INITIAL_SETUP_TOKEN"
+    printf '  忘记时可从 %s 的 SETUP_TOKEN 读取\n' "$(env_file_path)"
+}
+
 ensure_service_user() {
     local nologin_shell
     nologin_shell=$(command -v nologin || true)
@@ -413,6 +459,7 @@ prepare_data_and_config() {
         append_env_default PANEL_BIND_ADDR 0.0.0.0 "$tmp_dir"
         append_env_default PANEL_DOMAIN "" "$tmp_dir"
         append_env_default TRUSTED_PROXY_CIDRS "" "$tmp_dir"
+        INITIAL_SETUP_TOKEN=$(ensure_setup_token "$tmp_dir")
         if is_systemd; then
             as_root chown root:"$SERVICE_GROUP" "$env_file"
             as_root chmod 0640 "$env_file"
@@ -922,6 +969,7 @@ do_install() {
         prepare_data_and_config "$tmp_dir"
         rm -rf -- "$tmp_dir"
         apply_domain_choice 1
+        report_setup_token
         return 0
     fi
 
@@ -956,9 +1004,7 @@ do_install() {
         printf '  面板地址: http://服务器IP:%s\n' "$(read_config_port)"
     fi
     printf '  数据目录: %s\n' "$DATA_DIR"
-    if [ -n "$INITIAL_SETUP_TOKEN" ]; then
-        printf "  ${YELLOW}首次初始化令牌（请立即保存）:${NC} ${BOLD}%s${NC}\n" "$INITIAL_SETUP_TOKEN"
-    fi
+    report_setup_token
 }
 
 do_update() {

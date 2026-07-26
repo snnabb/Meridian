@@ -126,6 +126,18 @@ JWT_SECRET=$(openssl rand -hex 32) ./meridian
 
 未配置域名时访问 `http://你的IP:9090`；配置后访问对应的 `https://面板域名`。首次打开会要求输入管理员账号、12–72 字节的密码，以及安装完成时显示的初始化令牌。也可以预先设置 `SETUP_TOKEN` 环境变量。
 
+令牌丢失时不必重装，按部署方式取回即可：
+
+```bash
+# 一键脚本 / systemd 部署
+sudo awk -F= '$1=="SETUP_TOKEN"{print $2}' /opt/meridian/.env
+# 或重新运行 install，尚未创建管理员时会再次打印
+sudo ./install.sh install
+
+# Docker 部署
+docker logs meridian | grep 'Initial setup token'
+```
+
 ---
 
 ## 配置
@@ -152,7 +164,7 @@ unset ADMIN_PASSWORD
 | `PANEL_BIND_ADDR` | `0.0.0.0` | 仅控制管理面板的绑定地址；域名模式由安装器设为 `127.0.0.1`，不影响站点监听端口 |
 | `PANEL_DOMAIN` | 空 | 安装器记录的单个管理面板域名；不作为播放回源配置 |
 | `JWT_SECRET` | 进程启动时随机生成 | 至少 32 字节的 JWT 签名密钥。**生产环境必须显式设置**，否则每次重启后会话全部失效 |
-| `SETUP_TOKEN` | 首次启动时随机生成 | 首次创建管理员所需的一次性初始化令牌；未设置时会写入启动日志 |
+| `SETUP_TOKEN` | 首次启动时随机生成 | 首次创建管理员所需的一次性初始化令牌；未设置时会写入启动日志。一键脚本会将其持久化到 `.env`，并在管理员尚未创建时于每次 `install` 后打印 |
 | `TRUSTED_PROXY_CIDRS` | 空 | 允许提供 `X-Real-IP`/`X-Forwarded-For` 的反向代理 CIDR，多个值用逗号分隔；不要填写不受信任的客户端网段 |
 
 ### Docker Compose

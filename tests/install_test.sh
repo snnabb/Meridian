@@ -254,6 +254,35 @@ if ! (do_install) >"${TEST_ROOT}/install-existing.log" 2>&1; then
 fi
 assert_eq 'v9.9.9' "$(get_current_version)" 'install must not update existing installation'
 
+# Reinstalling over a config that predates SETUP_TOKEN (or that lost it) must
+# still hand the operator a usable token; otherwise the panel demands one nobody
+# can produce and the first administrator can never be created.
+# $1 is an awk field reference, not a shell variable.
+# shellcheck disable=SC2016
+awk -F= '$1 != "SETUP_TOKEN" { print }' "${DATA_DIR}/.env" > "${TEST_ROOT}/env-legacy"
+cp "${TEST_ROOT}/env-legacy" "${DATA_DIR}/.env"
+assert_eq '' "$(read_env_value SETUP_TOKEN)" 'legacy config starts without a setup token'
+if ! (do_install) >"${TEST_ROOT}/install-legacy-token.log" 2>&1; then
+    cat "${TEST_ROOT}/install-legacy-token.log" >&2
+    exit 1
+fi
+legacy_setup_token=$(read_env_value SETUP_TOKEN)
+if [ -z "$legacy_setup_token" ]; then
+    echo 'FAIL: reinstall over legacy config left SETUP_TOKEN empty' >&2
+    exit 1
+fi
+assert_eq '1' "$(grep -c '^SETUP_TOKEN=' "${DATA_DIR}/.env")" 'setup token key not duplicated'
+assert_contains "${TEST_ROOT}/install-legacy-token.log" "$legacy_setup_token"
+assert_eq '0.0.0.0' "$(read_env_value PANEL_BIND_ADDR)" 'existing settings survive token backfill'
+
+# A token that already works must be reused, not rotated on every reinstall.
+if ! (do_install) >"${TEST_ROOT}/install-token-stable.log" 2>&1; then
+    cat "${TEST_ROOT}/install-token-stable.log" >&2
+    exit 1
+fi
+assert_eq "$legacy_setup_token" "$(read_env_value SETUP_TOKEN)" 'setup token stable across reinstalls'
+assert_contains "${TEST_ROOT}/install-token-stable.log" "$legacy_setup_token"
+
 domain_env_before=$(sha256_file "${DATA_DIR}/.env")
 if ! (do_update) >"${TEST_ROOT}/update.log" 2>&1; then
     cat "${TEST_ROOT}/update.log" >&2
