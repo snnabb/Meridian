@@ -183,6 +183,49 @@ func createLegacySiteDatabase(t *testing.T, dbPath string, withHourlyIndex bool)
 	}
 }
 
+func TestOpenDBPreservesDataAndConnectionPragmas(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "persistent.db")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	if _, err := db.db.Exec("INSERT INTO users (username, password_hash) VALUES (?, ?)", "persisted-admin", "hash"); err != nil {
+		db.Close()
+		t.Fatalf("insert persisted user: %v", err)
+	}
+	db.Close()
+
+	db, err = openDB(dbPath)
+	if err != nil {
+		t.Fatalf("reopen database: %v", err)
+	}
+	defer db.Close()
+
+	var journalMode string
+	if err := db.db.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
+		t.Fatalf("read journal mode: %v", err)
+	}
+	if !strings.EqualFold(journalMode, "wal") {
+		t.Fatalf("journal mode = %q, want WAL", journalMode)
+	}
+
+	var busyTimeout int
+	if err := db.db.QueryRow("PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+		t.Fatalf("read busy timeout: %v", err)
+	}
+	if busyTimeout != 5000 {
+		t.Fatalf("busy timeout = %d, want 5000", busyTimeout)
+	}
+
+	var userCount int
+	if err := db.db.QueryRow("SELECT COUNT(*) FROM users WHERE username=?", "persisted-admin").Scan(&userCount); err != nil {
+		t.Fatalf("read persisted user: %v", err)
+	}
+	if userCount != 1 {
+		t.Fatalf("persisted user count = %d, want 1", userCount)
+	}
+}
+
 func TestMigrateAddsCustomUAColumnsForLegacyDatabases(t *testing.T) {
 	for _, withHourlyIndex := range []bool{false, true} {
 		t.Run(fmt.Sprintf("hourly index=%v", withHourlyIndex), func(t *testing.T) {
