@@ -57,6 +57,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/insta
 ```
 
 > 首次安装从 GitHub Releases 下载最新二进制，并使用同一 Release 中的 `SHA256SUMS` 强制校验。systemd 部署默认使用独立的 `meridian` 非 root 用户。重复运行 `install` 不会更新程序，只用于补充或重新配置面板域名。
+>
+> 首次创建管理员需要安装结束时显示的初始化令牌。Linux 一键安装会将其保存在受保护的 `/opt/meridian/.env`；若在尚未创建管理员前遗失安装输出，可由服务器 root 用户从该文件恢复。重复运行 `install` 或 `update` 只会为旧配置补齐缺失令牌，不会轮换已有令牌。令牌等同于首次管理员创建权限，请勿贴到 Issue、日志或截图中。
 
 也可以直接指定四个动作：
 
@@ -127,7 +129,7 @@ go build -o meridian .
 JWT_SECRET=$(openssl rand -hex 32) SETUP_TOKEN=$(openssl rand -hex 32) ./meridian
 ```
 
-未配置域名时访问 `http://你的IP:9090`；配置后访问对应的 `https://面板域名`。首次打开会要求输入管理员账号、12–72 字节的密码，以及安装完成时显示的初始化令牌。源码、Docker 和 Windows 部署必须在首次启动前显式设置 `SETUP_TOKEN`；服务不会自动生成或记录该值。
+未配置域名时访问 `http://你的IP:9090`；配置后访问对应的 `https://面板域名`。首次打开会要求输入管理员账号、12–72 字节的密码，以及安装完成时显示的初始化令牌。源码、Docker 和 Windows 部署必须在首次启动前显式设置 `SETUP_TOKEN`；服务本身不会自动生成或记录该值。
 
 ---
 

@@ -228,7 +228,7 @@ function showSiteModal(site) {
     <div class="form-group">
       <label>单连接限速 (Mbps, 0=不限)</label>
       <input type="number" class="form-input" id="m-speed" value="${isEdit ? (site.speed_limit || 0) : 0}" placeholder="0" min="0" max="1000000" step="1" inputmode="numeric">
-      <div class="form-help">限制单个 HTTP 请求的响应速度；WebSocket 连接不受此项影响。</div>
+      <div class="form-help">限制单个 HTTP 响应和 WebSocket 下行连接的速度；上传方向不受此项影响。</div>
     </div>
   `;
 

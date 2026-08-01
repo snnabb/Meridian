@@ -127,7 +127,7 @@ function renderHealthCard(title, subtitle, upstream, staggerClass) {
         <div class="diag-row"><span class="diag-key">连接状态</span><span class="diag-val ${statusClass(health.status)}">${statusText(health.status)}</span></div>
         <div class="diag-row"><span class="diag-key">Emby 版本</span><span class="diag-val">${diagText(health.emby_version)}</span></div>
         <div class="diag-row"><span class="diag-key">响应延迟</span><span class="diag-val ${latencyClass(latency)}">${latencyText}</span></div>
-        <div class="diag-row"><span class="diag-key">探针类型</span><span class="diag-val">${probeLabel(probe)}</span></div>
+        <div class="diag-row"><span class="diag-key">探针类型</span><span class="diag-val">${esc(probeLabel(probe))}</span></div>
         <div class="diag-row"><span class="diag-key">探针请求</span><span class="diag-val diag-wrap">${diagText(probeRequestText(probe))}</span></div>
         ${typeof probe.http_status === 'number' && probe.http_status > 0 ? `<div class="diag-row"><span class="diag-key">探针响应</span><span class="diag-val">${probe.http_status}</span></div>` : ''}
         ${health.error ? `<div class="diag-row"><span class="diag-key">探针结果</span><span class="diag-val bad diag-wrap">${esc(health.error)}</span></div>` : ''}
@@ -207,7 +207,7 @@ function renderProxyCard(proxy, staggerClass) {
       </div>
       <div class="diag-rows">
         <div class="diag-row"><span class="diag-key">代理运行</span><span class="diag-val ${proxy.running ? 'good' : 'bad'}">${proxy.running ? '运行中' : '已停止'}</span></div>
-        <div class="diag-row"><span class="diag-key">监听端口</span><span class="diag-val">${proxy.listen_port || '--'}</span></div>
+        <div class="diag-row"><span class="diag-key">监听端口</span><span class="diag-val">${esc(proxy.listen_port || '--')}</span></div>
         <div class="diag-row"><span class="diag-key">总请求数</span><span class="diag-val">${typeof proxy.total_requests === 'number' ? proxy.total_requests : '--'}</span></div>
       </div>
     </div>

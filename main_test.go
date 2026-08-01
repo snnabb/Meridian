@@ -787,23 +787,77 @@ func TestRequestClientKeyUsesOnlyConfiguredTrustedProxy(t *testing.T) {
 	}
 }
 
-func TestSessionCookieSecureFlagTrustsOnlyConfiguredProxy(t *testing.T) {
+func TestSessionCookiesUseTransportSecurity(t *testing.T) {
 	trusted, err := parseTrustedProxyCIDRs("127.0.0.1/32")
 	if err != nil {
 		t.Fatalf("parse trusted proxies: %v", err)
 	}
-	trustedRequest := httptest.NewRequest(http.MethodPost, "http://panel.example/api/auth/login", nil)
-	trustedRequest.RemoteAddr = "127.0.0.1:12345"
-	trustedRequest.Header.Set("X-Forwarded-Proto", "https")
-	if !requestIsHTTPS(trustedRequest, trusted) {
-		t.Fatal("trusted proxy HTTPS indication was ignored")
+	app := &App{trustedProxies: trusted}
+	tests := []struct {
+		name             string
+		url              string
+		remoteAddr       string
+		forwardedProto   string
+		wantSecureCookie bool
+	}{
+		{
+			name:             "direct HTTPS",
+			url:              "https://panel.example/api/auth/login",
+			remoteAddr:       "198.51.100.10:12345",
+			wantSecureCookie: true,
+		},
+		{
+			name:             "trusted proxy HTTPS",
+			url:              "http://panel.example/api/auth/login",
+			remoteAddr:       "127.0.0.1:12345",
+			forwardedProto:   "https",
+			wantSecureCookie: true,
+		},
+		{
+			name:             "untrusted proxy forged HTTPS",
+			url:              "http://panel.example/api/auth/login",
+			remoteAddr:       "198.51.100.10:12345",
+			forwardedProto:   "https",
+			wantSecureCookie: false,
+		},
+		{
+			name:             "documented direct HTTP mode",
+			url:              "http://panel.example/api/auth/login",
+			remoteAddr:       "198.51.100.10:12345",
+			wantSecureCookie: false,
+		},
 	}
 
-	untrustedRequest := httptest.NewRequest(http.MethodPost, "http://panel.example/api/auth/login", nil)
-	untrustedRequest.RemoteAddr = "198.51.100.10:12345"
-	untrustedRequest.Header.Set("X-Forwarded-Proto", "https")
-	if requestIsHTTPS(untrustedRequest, trusted) {
-		t.Fatal("untrusted proxy forged the HTTPS indication")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tc.url, nil)
+			req.RemoteAddr = tc.remoteAddr
+			if tc.forwardedProto != "" {
+				req.Header.Set("X-Forwarded-Proto", tc.forwardedProto)
+			}
+
+			setRecorder := httptest.NewRecorder()
+			app.setSessionCookie(setRecorder, req, "session-token")
+			setCookies := setRecorder.Result().Cookies()
+			if len(setCookies) != 1 {
+				t.Fatalf("set cookie count = %d, want 1", len(setCookies))
+			}
+			setCookie := setCookies[0]
+			if setCookie.Secure != tc.wantSecureCookie || !setCookie.HttpOnly || setCookie.SameSite != http.SameSiteStrictMode {
+				t.Fatalf("set cookie = %#v, want secure=%t, HttpOnly, SameSite=Strict", setCookie, tc.wantSecureCookie)
+			}
+
+			clearRecorder := httptest.NewRecorder()
+			app.clearSessionCookie(clearRecorder, req)
+			clearCookies := clearRecorder.Result().Cookies()
+			if len(clearCookies) != 1 {
+				t.Fatalf("clear cookie count = %d, want 1", len(clearCookies))
+			}
+			clearCookie := clearCookies[0]
+			if clearCookie.Secure != tc.wantSecureCookie || !clearCookie.HttpOnly || clearCookie.SameSite != http.SameSiteStrictMode || clearCookie.MaxAge >= 0 {
+				t.Fatalf("clear cookie = %#v, want secure=%t, HttpOnly, SameSite=Strict, deletion", clearCookie, tc.wantSecureCookie)
+			}
+		})
 	}
 }
 
@@ -2068,6 +2122,64 @@ func TestHandleSiteUpdatePreservesOmittedSpeedLimit(t *testing.T) {
 	}
 	if reloaded.SpeedLimit != 25 {
 		t.Fatalf("speed_limit = %d, want preserved value 25", reloaded.SpeedLimit)
+	}
+}
+
+func TestHandleSiteUpdatePreservesOmittedTrafficQuota(t *testing.T) {
+	app := newTestApp(t)
+	port := freePort(t)
+	site, err := app.db.CreateSite("quota", port, "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 5<<30, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	if enabled, err := app.db.ToggleSite(site.ID); err != nil || enabled {
+		t.Fatalf("disable site: enabled=%v err=%v", enabled, err)
+	}
+
+	body := strings.NewReader(`{"name":"quota","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096","ua_mode":"infuse"}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(site.ID), body)
+	rr := httptest.NewRecorder()
+	app.handleSiteByID(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	reloaded, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatalf("GetSite: %v", err)
+	}
+	if reloaded.TrafficQuota != 5<<30 {
+		t.Fatalf("traffic_quota = %d, want preserved value %d", reloaded.TrafficQuota, int64(5<<30))
+	}
+}
+
+// Omitting the field preserves the quota, but sending an explicit 0 must still
+// clear it, so the pointer merge cannot be mistaken for "always ignore".
+func TestHandleSiteUpdateAppliesExplicitZeroTrafficQuota(t *testing.T) {
+	app := newTestApp(t)
+	port := freePort(t)
+	site, err := app.db.CreateSite("quota-clear", port, "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 5<<30, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	if enabled, err := app.db.ToggleSite(site.ID); err != nil || enabled {
+		t.Fatalf("disable site: enabled=%v err=%v", enabled, err)
+	}
+
+	body := strings.NewReader(`{"name":"quota-clear","listen_port":` + jsonNumber(port) + `,"target_url":"http://127.0.0.1:8096","ua_mode":"infuse","traffic_quota":0}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(site.ID), body)
+	rr := httptest.NewRecorder()
+	app.handleSiteByID(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	reloaded, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatalf("GetSite: %v", err)
+	}
+	if reloaded.TrafficQuota != 0 {
+		t.Fatalf("traffic_quota = %d, want explicit 0", reloaded.TrafficQuota)
 	}
 }
 

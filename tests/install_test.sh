@@ -296,6 +296,18 @@ fi
 backup_count_after=$(run_as_test_root find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d '[:space:]')
 assert_eq "$backup_count_before" "$backup_count_after" 'latest update is a no-op'
 
+# Older uninitialized installations did not have SETUP_TOKEN in .env. Updating
+# one must backfill a fresh token and tell the operator that it is required.
+printf 'JWT_SECRET=legacy-jwt-secret-000000000000000000000000000000\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nTRUSTED_PROXY_CIDRS=\n' \
+    "$DATA_DIR" > "${DATA_DIR}/.env"
+MOCK_LATEST='v9.9.11'
+if ! (do_update) >"${TEST_ROOT}/update-legacy-setup.log" 2>&1; then
+    cat "${TEST_ROOT}/update-legacy-setup.log" >&2
+    exit 1
+fi
+[ -n "$(read_env_value SETUP_TOKEN)" ] || { echo 'FAIL: legacy update did not backfill SETUP_TOKEN' >&2; exit 1; }
+assert_contains "${TEST_ROOT}/update-legacy-setup.log" '初始化令牌'
+
 # Exercise the password transaction with a mock binary. The real command and
 # bcrypt behavior are covered by Go tests.
 printf 'old-database-state\n' > "${DATA_DIR}/meridian.db"

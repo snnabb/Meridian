@@ -34,6 +34,13 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # Release publishes windows and darwin binaries, but every job here runs on
+      # ubuntu, so the !unix build was never even type-checked.
+      - name: Vet non-unix build targets
+        run: |
+          GOOS=windows GOARCH=amd64 go vet ./...
+          GOOS=darwin GOARCH=arm64 go vet ./...
+
       - name: Vulnerability scan
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
@@ -47,7 +54,7 @@ jobs:
       - name: Validate frontend and installer syntax
         run: |
           find web/static/js -name '*.js' -print0 | xargs -0 -n1 node --check
-          node --test tests/sites_ua_mode.test.js
+          node --test tests/html_escaping.test.js tests/sites_ua_mode.test.js
           bash -n install.sh
           bash -n tests/install_test.sh
           shellcheck install.sh tests/install_test.sh
