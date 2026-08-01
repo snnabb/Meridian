@@ -157,6 +157,8 @@
         Toast.success('欢迎回来, ' + res.username + '!');
       }
       API.setSession(res);
+      document.getElementById('inp-password').value = '';
+      setupTokenInputEl.value = '';
       enterApp();
     } catch (err) {
       Toast.error(err.message);

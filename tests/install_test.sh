@@ -308,6 +308,66 @@ fi
 [ -n "$(read_env_value SETUP_TOKEN)" ] || { echo 'FAIL: legacy update did not backfill SETUP_TOKEN' >&2; exit 1; }
 assert_contains "${TEST_ROOT}/update-legacy-setup.log" '初始化令牌'
 
+# A newer installed version must never be silently downgraded.
+MOCK_LATEST='v9.8.0'
+if (do_update) >"${TEST_ROOT}/update-downgrade.log" 2>&1; then
+    echo 'FAIL: downgrade update unexpectedly succeeded' >&2; exit 1
+fi
+assert_eq 'v9.9.11' "$(get_current_version)" 'downgrade attempt must keep the installed version'
+assert_contains "${TEST_ROOT}/update-downgrade.log" '拒绝降级'
+
+# A failing new release must roll back the previous binary AND the exact
+# pre-update database and configuration. The mock new binary mutates the
+# database before "starting", then fails the health check.
+printf 'JWT_SECRET=rollback-jwt-secret-00000000000000000000000000\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nTRUSTED_PROXY_CIDRS=\nSETUP_TOKEN=rollback-setup-token-0000000000000000000000000000\n' \
+    "$DATA_DIR" > "${DATA_DIR}/.env"
+printf 'pre-update-db-state\n' > "${DATA_DIR}/meridian.db"
+cp "${DATA_DIR}/.env" "${TEST_ROOT}/rollback-env-before"
+cp "${DATA_DIR}/meridian.db" "${TEST_ROOT}/rollback-db-before"
+touch "$SERVICE_FILE"
+failing_binary="${TEST_ROOT}/failing-meridian"
+cat > "$failing_binary" <<'MOCKBIN'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then
+    echo v9.9.12
+    exit 0
+fi
+printf 'mutated-by-failing-version\n' >> "${MOCK_DB_PATH:?}"
+exit 1
+MOCKBIN
+chmod 0755 "$failing_binary"
+if (
+    is_systemd() { return 0; }
+    service_is_active() { return 0; }
+    systemctl() {
+        case "$*" in
+            *restart*) "${INSTALL_DIR}/${BIN_NAME}" >/dev/null 2>&1 || true ;; # run the new binary like systemd would
+        esac
+        return 0
+    }
+    wait_for_health() { return 1; }
+    MOCK_LATEST='v9.9.12'
+    export MOCK_DB_PATH="${DATA_DIR}/meridian.db"
+    download() {
+        local url="$1" output="$2"
+        if [[ "$url" == */SHA256SUMS ]]; then
+            printf '%s  meridian-linux-amd64\n' "$(sha256_file "$failing_binary")" > "$output"
+            return
+        fi
+        cp "$failing_binary" "$output"
+    }
+    do_update
+) >"${TEST_ROOT}/update-rollback.log" 2>&1; then
+    echo 'FAIL: failing update unexpectedly succeeded' >&2; exit 1
+fi
+assert_contains "${TEST_ROOT}/update-rollback.log" '自动回滚'
+assert_eq 'v9.9.11' "$(get_current_version)" 'rollback must restore the previous binary'
+cmp -s "${DATA_DIR}/meridian.db" "${TEST_ROOT}/rollback-db-before" \
+    || { echo 'FAIL: database was not restored after failed update' >&2; exit 1; }
+cmp -s "${DATA_DIR}/.env" "${TEST_ROOT}/rollback-env-before" \
+    || { echo 'FAIL: configuration was not restored after failed update' >&2; exit 1; }
+assert_contains "${TEST_ROOT}/update-rollback.log" '自动回滚'
+
 # Exercise the password transaction with a mock binary. The real command and
 # bcrypt behavior are covered by Go tests.
 printf 'old-database-state\n' > "${DATA_DIR}/meridian.db"

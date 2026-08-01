@@ -53,6 +53,7 @@ func TestStartSiteFlushesTrafficWhenReplacingRunningInstance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateSite: %v", err)
 	}
+	releasePort(site.ListenPort)
 	if err := app.pm.StartSite(*site); err != nil {
 		t.Fatalf("StartSite: %v", err)
 	}
@@ -73,6 +74,7 @@ func TestStartSiteFlushesTrafficWhenReplacingRunningInstance(t *testing.T) {
 		t.Fatalf("GetSite: %v", err)
 	}
 	moved.ListenPort = freePort(t)
+	releasePort(moved.ListenPort)
 	if err := app.pm.StartSite(*moved); err != nil {
 		t.Fatalf("StartSite on the new port: %v", err)
 	}

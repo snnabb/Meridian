@@ -1,5 +1,5 @@
 const Router = {
-  routes: {},
+  routes: Object.create(null),
   current: null,
   initialized: false,
 

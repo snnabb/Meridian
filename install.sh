@@ -36,6 +36,8 @@ UPDATE_TMP_DIR=""
 UPDATE_WAS_ACTIVE=0
 UPDATE_BINARY_CHANGED=0
 UPDATE_TRANSACTION=0
+UPDATE_SNAPSHOT_DIR=""
+UPDATE_SNAPSHOT_RESTORED=0
 PASSWORD_TMP_DIR=""
 PASSWORD_SNAPSHOT_DIR=""
 PASSWORD_DB_PATH=""
@@ -139,6 +141,49 @@ validate_db_path() {
 
 valid_version() {
     [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+}
+
+version_gt() {
+    # Returns 0 (true) when $1 (vA.B.C[-suffix]) is newer than $2. The numeric
+    # major.minor.patch triple decides; pre-release suffixes are ignored.
+    # shellcheck disable=SC2016
+    printf '%s\n%s\n' "${1#v}" "${2#v}" | awk -F. '
+        function num(s) { gsub(/[^0-9]/, "", s); return s+0 }
+        NR == 1 { a1=num($1); a2=num($2); a3=num($3) }
+        NR == 2 { b1=num($1); b2=num($2); b3=num($3) }
+        END {
+            if (a1 != b1) exit (a1 > b1) ? 0 : 1
+            if (a2 != b2) exit (a2 > b2) ? 0 : 1
+            exit (a3 > b3) ? 0 : 1
+        }'
+}
+
+snapshot_data_dir() {
+    # Byte-level copy of the data directory for automatic rollback. The update
+    # flow stops the service first, so the database, WAL/SHM, and .env are
+    # quiescent when this runs.
+    local snapshot_dir="$1"
+    validate_data_dir
+    as_root test -d "$DATA_DIR" || return 1
+    as_root install -d -o root -g "$ROOT_GROUP" -m 0700 "$snapshot_dir"
+    as_root install -d -o root -g "$ROOT_GROUP" -m 0700 "${snapshot_dir}/data"
+    as_root cp -a -- "$DATA_DIR"/. "${snapshot_dir}/data/"
+}
+
+restore_data_snapshot() {
+    # Restores the exact pre-update data directory. Only called for a validated
+    # absolute DATA_DIR inside the update transaction, so the rm -rf cannot
+    # escape to a broad path.
+    local snapshot_dir="$1"
+    validate_data_dir
+    as_root test -d "${snapshot_dir}/data" || return 1
+    as_root rm -rf -- "$DATA_DIR"
+    as_root cp -a -- "${snapshot_dir}/data" "$DATA_DIR"
+    fix_database_permissions "$(read_env_value DB_PATH)" >/dev/null 2>&1 || true
+    if is_systemd; then
+        as_root chown root:"$SERVICE_GROUP" "$(env_file_path)" 2>/dev/null || true
+        as_root chmod 0640 "$(env_file_path)" 2>/dev/null || true
+    fi
 }
 
 normalize_domain() {
@@ -524,9 +569,14 @@ restore_previous_binary() {
 cleanup_update_transaction() {
     local exit_code=$?
     if [ "$exit_code" -ne 0 ] && [ "$UPDATE_TRANSACTION" = "1" ]; then
-        warn "更新中断，正在恢复更新前的二进制和服务状态..."
+        warn "更新中断，正在恢复更新前的二进制和数据状态..."
         if [ "$UPDATE_BINARY_CHANGED" = "1" ]; then
             restore_previous_binary || true
+        fi
+        if [ -n "$UPDATE_SNAPSHOT_DIR" ] && [ -d "$UPDATE_SNAPSHOT_DIR" ] \
+            && [ "$UPDATE_SNAPSHOT_RESTORED" != "1" ]; then
+            restore_data_snapshot "$UPDATE_SNAPSHOT_DIR" \
+                || warn "数据快照恢复失败，请使用备份手动恢复: ${LAST_BACKUP_PATH:-<unknown>}"
         fi
         if is_systemd; then
             if [ "$UPDATE_WAS_ACTIVE" = "1" ]; then
@@ -1069,12 +1119,14 @@ do_update() {
         ok "当前已是最新版本: $latest_version"
         return 0
     fi
+    if valid_version "$current_version" && version_gt "$current_version" "$latest_version"; then
+        fail "已安装版本 ${current_version} 高于最新 Release ${latest_version}；拒绝降级"
+    fi
 
     tmp_dir=$(mktemp -d)
     chmod 0700 "$tmp_dir"
     UPDATE_TMP_DIR="$tmp_dir"
     download_release_binary "$latest_version" "$tmp_dir"
-    prepare_data_and_config "$tmp_dir"
 
     UPDATE_TRANSACTION=1
     trap cleanup_update_transaction EXIT
@@ -1095,6 +1147,15 @@ do_update() {
     fi
     ok "升级前备份已创建: $LAST_BACKUP_PATH"
 
+    # Byte-level snapshot for automatic rollback, taken while the service is
+    # stopped and before any configuration key is added.
+    UPDATE_SNAPSHOT_DIR="${tmp_dir}/data-snapshot"
+    if ! snapshot_data_dir "$UPDATE_SNAPSHOT_DIR"; then
+        fail "升级前数据快照失败，现有程序未被替换"
+    fi
+
+    prepare_data_and_config "$tmp_dir"
+
     as_root install -o root -g "$ROOT_GROUP" -m 0755 "$current_binary" "${PREVIOUS_BIN}.new"
     as_root mv -f "${PREVIOUS_BIN}.new" "$PREVIOUS_BIN"
     as_root install -o root -g "$ROOT_GROUP" -m 0755 "$DOWNLOADED_BINARY" "${current_binary}.new"
@@ -1105,20 +1166,34 @@ do_update() {
         as_root systemctl restart "$SERVICE_NAME"
         if ! wait_for_health 20; then
             warn "新版本健康检查失败，正在自动回滚..."
-            restore_previous_binary
+            restore_previous_binary || fail "回滚失败：缺少上一版本二进制，请手动恢复 ${LAST_BACKUP_PATH:-备份归档}"
             UPDATE_BINARY_CHANGED=0
+            restore_data_snapshot "$UPDATE_SNAPSHOT_DIR" || warn "数据快照恢复失败，请使用备份手动恢复: $LAST_BACKUP_PATH"
+            UPDATE_SNAPSHOT_RESTORED=1
             as_root systemctl restart "$SERVICE_NAME"
             wait_for_health 20 || fail "新版本与回滚版本均未通过健康检查"
-            fail "新版本启动失败，已恢复上一版本"
+            fail "新版本启动失败，已恢复上一版本及原数据配置"
         fi
         if [ "$should_stop_after" = "1" ]; then
             as_root systemctl stop "$SERVICE_NAME"
         fi
+    else
+        if ! "$current_binary" --version >/dev/null 2>&1; then
+            warn "新版本二进制无法执行，正在自动回滚..."
+            restore_previous_binary || true
+            UPDATE_BINARY_CHANGED=0
+            restore_data_snapshot "$UPDATE_SNAPSHOT_DIR" || warn "数据快照恢复失败，请使用备份手动恢复: $LAST_BACKUP_PATH"
+            UPDATE_SNAPSHOT_RESTORED=1
+            fail "新版本无法执行，已恢复上一版本及原数据配置"
+        fi
+        warn "未检测到 systemd：已跳过自动健康检查，请手动加载 ${DATA_DIR}/.env 后启动"
     fi
 
     UPDATE_TRANSACTION=0
     UPDATE_BINARY_CHANGED=0
     UPDATE_TMP_DIR=""
+    UPDATE_SNAPSHOT_DIR=""
+    UPDATE_SNAPSHOT_RESTORED=0
     rm -rf -- "$tmp_dir"
     trap - EXIT INT TERM
     ok "已更新到最新版本: $latest_version"

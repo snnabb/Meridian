@@ -70,7 +70,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/insta
 bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) install \
   --domain panel.example.com --email admin@example.com -y
 
-# 更新：自动创建数据备份、保留上一版本、启动后健康检查，失败则自动回滚
+# 更新：自动创建数据备份与一致性快照，保留上一版本；systemd 环境启动后健康检查，失败则自动回滚二进制和数据
 bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh) update
 
 # 隐藏输入两次新密码；同时轮换 JWT_SECRET，使全部旧令牌失效
@@ -82,7 +82,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/insta
 
 选择配置域名时，脚本会安装或复用 Nginx、Certbot（支持 apt、dnf/yum、apk、pacman），申请证书并启用 HTTP→HTTPS。生成的配置只代理管理面板 `127.0.0.1:9090`（或自定义 `PORT`），不会读取或修改站点回源、播放地址、50001 或其他站点监听端口。macOS 可安装 Meridian，但不支持自动域名配置。
 
-更新和改密会在内部自动创建一致性备份、执行健康检查并在失败时回滚；这些内部操作不再作为公开菜单命令。备份默认保存在 `/opt/meridian-backups`，权限为 `0600`，其中包含数据库和密钥，请按敏感文件保管。卸载默认保留数据和备份；`--purge` 才删除数据，并且不会删除 Nginx、Certbot 或证书。
+更新和改密会在内部自动创建一致性备份。在 systemd 环境中，更新还会执行健康检查，并在失败时自动回滚到上一版本二进制与升级前数据配置；非 systemd 环境会校验新二进制能否执行，但不会自动做完整健康检查。这些内部操作不再作为公开菜单命令。备份默认保存在 `/opt/meridian-backups`，权限为 `0600`，其中包含数据库和密钥，请按敏感文件保管。卸载默认保留数据和备份；`--purge` 才删除数据，并且不会删除 Nginx、Certbot 或证书。
 
 ### Docker
 
@@ -114,12 +114,20 @@ docker run -d --name meridian \
 
 ```powershell
 Invoke-WebRequest -Uri "https://github.com/snnabb/Meridian/releases/latest/download/meridian-windows-amd64.exe" -OutFile "meridian.exe"
-$env:JWT_SECRET = -join ((1..32) | ForEach-Object { '{0:x2}' -f (Get-Random -Max 256) })
-$env:SETUP_TOKEN = -join ((1..32) | ForEach-Object { '{0:x2}' -f (Get-Random -Max 256) })
+function New-MeridianSecret {
+    $bytes = New-Object byte[] 32
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    -join ($bytes | ForEach-Object { $_.ToString('x2') })
+}
+$env:JWT_SECRET = New-MeridianSecret
+$env:SETUP_TOKEN = New-MeridianSecret
 .\meridian.exe
 ```
 
+> 密钥必须用密码学安全随机数生成。`Get-Random` 不够安全，不要用它生成 `JWT_SECRET` 或 `SETUP_TOKEN`。若以前按旧命令生成过密钥，请重新生成并轮换 `JWT_SECRET`。
+>
 > Windows 二进制下载同样依赖 GitHub Releases。没有已发布版本时，请使用源码构建。
+
 
 ### 从源码构建
 

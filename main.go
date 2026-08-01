@@ -263,6 +263,9 @@ func configuredSetupToken(userCount int, value string) (string, error) {
 	if token == "" {
 		return "", errors.New("SETUP_TOKEN must be configured before creating the first administrator")
 	}
+	if len(token) < 32 {
+		return "", errors.New("SETUP_TOKEN must be at least 32 bytes")
+	}
 	return token, nil
 }
 
@@ -507,18 +510,6 @@ func (d *DB) UserCount() (int, error) {
 		return 0, err
 	}
 	return n, nil
-}
-
-func (d *DB) CreateUser(username, password string) (int64, error) {
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	if err != nil {
-		return 0, err
-	}
-	res, err := d.db.Exec("INSERT INTO users (username, password_hash) VALUES (?, ?)", username, string(hash))
-	if err != nil {
-		return 0, err
-	}
-	return res.LastInsertId()
 }
 
 var errAdminAlreadyExists = errors.New("admin user already exists")
@@ -877,6 +868,14 @@ func (t *redirectFollowTransport) RoundTrip(req *http.Request) (*http.Response, 
 			newReq.Header[k] = v
 		}
 		newReq.Host = locURL.Host
+		if !sameRedirectAuthority(req.URL, locURL) {
+			// A redirect to a different scheme/host/port is a new security
+			// domain: the browser's cookies and the client's Emby access token
+			// must not follow the hop to a playback or CDN host. The UA profile
+			// is reapplied below, so identity rewriting stays consistent while
+			// secrets stay behind.
+			stripSensitiveRedirectHeaders(newReq.Header)
+		}
 		applyUAProfileHeaders(newReq.Header, t.profile)
 		resp, err = t.base.RoundTrip(newReq)
 		if err != nil {
@@ -1052,6 +1051,73 @@ func rewriteEmbyAuthorizationHeaders(header http.Header, headerName string, prof
 		}
 		for index, value := range values {
 			values[index] = rewriteEmbyAuthorizationValue(value, profile)
+		}
+	}
+}
+
+// stripEmbyAuthorizationToken blanks the Token attribute of an Emby
+// authorization value, leaving every other attribute byte-identical. Values
+// that cannot be parsed safely are returned untouched: they never carried a
+// recognizable token, and rewriting them risks corrupting a valid header.
+func stripEmbyAuthorizationToken(value string) string {
+	offset := 0
+	for offset < len(value) && isEmbyAuthWhitespace(value[offset]) {
+		offset++
+	}
+	schemeStart := offset
+	for offset < len(value) && isEmbyAuthToken(value[offset]) {
+		offset++
+	}
+	if schemeStart == offset {
+		return value
+	}
+	scheme := value[schemeStart:offset]
+	if !strings.EqualFold(scheme, "MediaBrowser") && !strings.EqualFold(scheme, "Emby") {
+		return value
+	}
+	if offset < len(value) && !isEmbyAuthWhitespace(value[offset]) {
+		return value
+	}
+	for offset < len(value) && isEmbyAuthWhitespace(value[offset]) {
+		offset++
+	}
+	if offset == len(value) {
+		return value
+	}
+	attributes, ok := parseEmbyAuthorizationAttributes(value, offset)
+	if !ok {
+		return value
+	}
+	tokenIndex := -1
+	for index, attribute := range attributes {
+		if strings.EqualFold(attribute.name, "Token") {
+			if tokenIndex >= 0 {
+				return value
+			}
+			tokenIndex = index
+		}
+	}
+	if tokenIndex < 0 {
+		return value
+	}
+	attribute := attributes[tokenIndex]
+	return value[:attribute.valueStart] + value[attribute.valueEnd:]
+}
+
+// stripSensitiveRedirectHeaders removes browser credentials and access tokens
+// before a playback redirect crosses to a different authority. Only the Emby
+// identity fields (Client/Version/Device/DeviceId) survive, and the UA profile
+// is reapplied by the caller afterwards.
+func stripSensitiveRedirectHeaders(header http.Header) {
+	header.Del("Cookie")
+	header.Del("Authorization")
+	header.Del("Proxy-Authorization")
+	for name, values := range header {
+		if !strings.EqualFold(name, "X-Emby-Authorization") {
+			continue
+		}
+		for index, value := range values {
+			values[index] = stripEmbyAuthorizationToken(value)
 		}
 	}
 }
@@ -1317,6 +1383,13 @@ func redirectHostKey(target *url.URL) string {
 		authority = net.JoinHostPort(host, port)
 	}
 	return scheme + "://" + authority
+}
+
+// sameRedirectAuthority reports whether two URLs share scheme, host, and
+// effective port. Redirects that stay within the same authority may keep the
+// client's headers; anything else is a cross-origin hop.
+func sameRedirectAuthority(from, to *url.URL) bool {
+	return redirectHostKey(from) == redirectHostKey(to)
 }
 
 func singleJoiningSlash(a, b string) string {
@@ -2107,7 +2180,24 @@ func probeStatusRank(status int) int {
 var probeClient = func() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = secureTLSConfig("")
-	return &http.Client{Timeout: 5 * time.Second, Transport: transport}
+	return &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: transport,
+		// Diagnostics must never become an internal scanner: a configured
+		// upstream that answers with a redirect is only allowed to point back
+		// at the same authority. Everything else stops the probe instead of
+		// following the hop into private or third-party ranges.
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return errors.New("diagnostic probe followed too many redirects")
+			}
+			previous := via[len(via)-1]
+			if !sameRedirectAuthority(previous.URL, req.URL) {
+				return errors.New("diagnostic probe redirect to a different host is not allowed")
+			}
+			return nil
+		},
+	}
 }()
 
 func probeTargetHealth(plan diagProbePlan) DiagHealth {
@@ -2136,6 +2226,9 @@ func probeTargetHealth(plan diagProbePlan) DiagHealth {
 		latency := time.Since(start).Milliseconds()
 		health.LatencyMs = latency
 		if err != nil {
+			if resp != nil {
+				resp.Body.Close()
+			}
 			health.Status = "offline"
 			health.Error = err.Error()
 			return health
@@ -2286,8 +2379,8 @@ func diagnoseUpstreamTarget(targetURL, probeKind string) (DiagUpstream, string) 
 	trimmed := strings.TrimSpace(targetURL)
 	result := DiagUpstream{
 		Configured:    trimmed != "",
-		ConfiguredURL: trimmed,
-		EffectiveURL:  trimmed,
+		ConfiguredURL: displayTargetURL(trimmed),
+		EffectiveURL:  displayTargetURL(trimmed),
 		ShowHealth:    true,
 	}
 
@@ -2297,8 +2390,8 @@ func diagnoseUpstreamTarget(targetURL, probeKind string) (DiagUpstream, string) 
 		return result, ""
 	}
 
-	result.ConfiguredURL = parsed.String()
-	result.EffectiveURL = parsed.String()
+	result.ConfiguredURL = displayTargetURL(parsed.String())
+	result.EffectiveURL = displayTargetURL(parsed.String())
 	switch probeKind {
 	case "playback_path":
 		result.Health = probePlaybackHealth(parsed.String())
@@ -2309,6 +2402,18 @@ func diagnoseUpstreamTarget(targetURL, probeKind string) (DiagUpstream, string) 
 	result.ShowTLS = result.TLS.Enabled
 
 	return result, canonicalTargetKey(parsed)
+}
+
+// displayTargetURL drops the query string before a configured upstream is
+// shown in the panel: signed URLs and API keys in query parameters must not be
+// rendered, because diagnostics output can be captured in screenshots or logs.
+func displayTargetURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" {
+		return raw
+	}
+	parsed.RawQuery = ""
+	return parsed.String()
 }
 
 func diagnoseSite(site *Site, pm *ProxyManager) DiagResult {
@@ -2771,6 +2876,12 @@ func (a *App) handleSetup(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, 405, "method not allowed")
 		return
 	}
+	client := requestClientKey(r, a.trustedProxies)
+	if allowed, retryAfter := a.limiter().allow(client, time.Now()); !allowed {
+		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(retryAfter.Seconds()+0.5))))
+		a.jsonErr(w, http.StatusTooManyRequests, "too many setup attempts; try again later")
+		return
+	}
 	a.setupTokenMu.Lock()
 	defer a.setupTokenMu.Unlock()
 	userCount, err := a.db.UserCount()
@@ -2797,18 +2908,21 @@ func (a *App) handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if a.setupToken == "" || !setupTokenMatches(a.setupToken, req.SetupToken) {
+		a.limiter().recordFailure(client, time.Now())
 		a.jsonErr(w, http.StatusForbidden, "invalid setup token")
 		return
 	}
 	id, err := a.db.CreateInitialUser(req.Username, req.Password)
 	if err != nil {
 		if errors.Is(err, errAdminAlreadyExists) {
+			a.limiter().recordFailure(client, time.Now())
 			a.jsonErr(w, http.StatusConflict, errAdminAlreadyExists.Error())
 			return
 		}
 		a.jsonErr(w, http.StatusInternalServerError, "unable to create admin user")
 		return
 	}
+	a.limiter().reset(client)
 	token, err := generateToken(id, req.Username)
 	if err != nil {
 		a.jsonErr(w, 500, err.Error())
@@ -3332,7 +3446,7 @@ func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.5.3"
+var appVersion = "v1.5.6"
 
 func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, error) {
 	if len(args) == 0 {
