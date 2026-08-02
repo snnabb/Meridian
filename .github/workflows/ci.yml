@@ -54,7 +54,7 @@ jobs:
       - name: Validate frontend and installer syntax
         run: |
           find web/static/js -name '*.js' -print0 | xargs -0 -n1 node --check
-          node --test tests/html_escaping.test.js tests/sites_ua_mode.test.js
+          node --test tests/*.test.js
           bash -n install.sh
           bash -n tests/install_test.sh
           shellcheck install.sh tests/install_test.sh
