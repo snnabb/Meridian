@@ -1487,8 +1487,8 @@ func TestDatabaseReadFailuresAreReported(t *testing.T) {
 	if _, err := app.db.UserCount(); err == nil {
 		t.Fatal("UserCount unexpectedly ignored a closed database")
 	}
-	if _, err := app.db.DashboardStats(); err == nil {
-		t.Fatal("DashboardStats unexpectedly ignored a closed database")
+	if _, err := app.pm.TrafficSnapshot(); err == nil {
+		t.Fatal("TrafficSnapshot unexpectedly ignored a closed database")
 	}
 	if _, err := app.pm.StartAllEnabled(); err == nil {
 		t.Fatal("StartAllEnabled unexpectedly ignored a closed database")
@@ -2685,6 +2685,1234 @@ func TestAddTrafficAggregatesSameHour(t *testing.T) {
 	}
 	if logs[0].BytesIn != 15 || logs[0].BytesOut != 27 {
 		t.Fatalf("aggregated log = in:%d out:%d", logs[0].BytesIn, logs[0].BytesOut)
+	}
+}
+
+// setDBReadonly flips the single pooled connection's query_only pragma, making
+// every DB write fail while reads keep working. openDB pins SetMaxOpenConns(1),
+// so the connection-scoped pragma is deterministic.
+func setDBReadonly(t *testing.T, app *App, readonly bool) {
+	t.Helper()
+	value := "OFF"
+	if readonly {
+		value = "ON"
+	}
+	if _, err := app.db.db.Exec("PRAGMA query_only=" + value); err != nil {
+		t.Fatalf("PRAGMA query_only=%s: %v", value, err)
+	}
+}
+
+// execTestSQL runs a one-off statement on the test app's single pooled
+// connection, so schema-level failure injection (SQLite triggers) is
+// deterministic. Used to make one specific write fail while the flush's own
+// writes keep succeeding - the granularity query_only cannot express.
+func execTestSQL(t *testing.T, app *App, statement string) {
+	t.Helper()
+	if _, err := app.db.db.Exec(statement); err != nil {
+		t.Fatalf("exec %q: %v", statement, err)
+	}
+}
+
+func findLiveSite(t *testing.T, snap *TrafficSnapshot, id int64) SiteTraffic {
+	t.Helper()
+	for _, st := range snap.LiveSites {
+		if st.ID == id {
+			return st
+		}
+	}
+	t.Fatalf("site %d missing from TrafficSnapshot live sites: %+v", id, snap.LiveSites)
+	return SiteTraffic{}
+}
+
+// Pending bytes are flushed to the DB exactly once, the authoritative total
+// traffic_used = persisted + pending is conserved across flushes, and the
+// current-hour log bucket aggregates without double counting.
+func TestFlushPersistsPendingExactlyOnceAndConservesTotals(t *testing.T) {
+	app := newTestApp(t)
+	site, err := app.db.CreateSite("conservation", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+
+	inst := &ProxyInstance{Site: *site, server: &http.Server{}}
+	inst.bytesIn.Store(120)
+	inst.bytesOut.Store(80)
+	app.pm.proxies[site.ID] = inst
+
+	// Before any flush the live total already includes the pending bytes.
+	snap, err := app.pm.TrafficSnapshot()
+	if err != nil {
+		t.Fatalf("TrafficSnapshot: %v", err)
+	}
+	live := findLiveSite(t, snap, site.ID)
+	if live.TrafficUsed != 200 || live.PersistedTraffic != 0 || live.BytesIn != 120 || live.BytesOut != 80 {
+		t.Fatalf("pre-flush live state = %+v, want used=200 persisted=0 in=120 out=80", live)
+	}
+
+	app.pm.FlushTraffic()
+
+	// Pending moved to the baseline exactly once.
+	if got := inst.persistedTraffic.Load(); got != 200 {
+		t.Fatalf("persistedTraffic after flush = %d, want 200", got)
+	}
+	if got := inst.bytesIn.Load(); got != 0 {
+		t.Fatalf("bytesIn after flush = %d, want 0", got)
+	}
+	if got := inst.bytesOut.Load(); got != 0 {
+		t.Fatalf("bytesOut after flush = %d, want 0", got)
+	}
+	reloaded, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatalf("GetSite: %v", err)
+	}
+	if reloaded.TrafficUsed != 200 {
+		t.Fatalf("traffic_used = %d, want 200", reloaded.TrafficUsed)
+	}
+	logs, err := app.db.GetTrafficLogs(site.ID, 1)
+	if err != nil {
+		t.Fatalf("GetTrafficLogs: %v", err)
+	}
+	if len(logs) != 1 || logs[0].BytesIn != 120 || logs[0].BytesOut != 80 {
+		t.Fatalf("logs after flush = %+v, want one row with 120/80", logs)
+	}
+
+	// A second flush with fresh pending accumulates; nothing is double counted.
+	inst.bytesIn.Store(30)
+	inst.bytesOut.Store(10)
+	app.pm.FlushTraffic()
+	if got := inst.persistedTraffic.Load(); got != 240 {
+		t.Fatalf("persistedTraffic after second flush = %d, want 240", got)
+	}
+	logs, err = app.db.GetTrafficLogs(site.ID, 1)
+	if err != nil {
+		t.Fatalf("GetTrafficLogs: %v", err)
+	}
+	if len(logs) != 1 || logs[0].BytesIn != 150 || logs[0].BytesOut != 90 {
+		t.Fatalf("logs after second flush = %+v, want one aggregated row 150/90", logs)
+	}
+	snap, err = app.pm.TrafficSnapshot()
+	if err != nil {
+		t.Fatalf("TrafficSnapshot: %v", err)
+	}
+	live = findLiveSite(t, snap, site.ID)
+	if live.TrafficUsed != 240 || snap.TotalTraffic != 240 {
+		t.Fatalf("post-flush total = site:%d snapshot:%d, want 240/240", live.TrafficUsed, snap.TotalTraffic)
+	}
+}
+
+// A failed flush restores the pending counters verbatim and a later retry
+// persists exactly those bytes, so no traffic is lost or double counted.
+func TestFlushFailureRestoresPendingAndRetryPersistsExactlyOnce(t *testing.T) {
+	app := newTestApp(t)
+	site, err := app.db.CreateSite("retry", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+
+	inst := &ProxyInstance{Site: *site, server: &http.Server{}}
+	inst.bytesIn.Store(120)
+	inst.bytesOut.Store(80)
+	app.pm.proxies[site.ID] = inst
+
+	setDBReadonly(t, app, true)
+	if err := app.pm.flushProxyTraffic(inst); err == nil {
+		t.Fatal("flush succeeded against a read-only database")
+	}
+	// Full refill: pending intact, baseline and DB untouched.
+	if got := inst.bytesIn.Load(); got != 120 {
+		t.Fatalf("bytesIn after failed flush = %d, want 120 restored", got)
+	}
+	if got := inst.bytesOut.Load(); got != 80 {
+		t.Fatalf("bytesOut after failed flush = %d, want 80 restored", got)
+	}
+	if got := inst.persistedTraffic.Load(); got != 0 {
+		t.Fatalf("persistedTraffic after failed flush = %d, want 0", got)
+	}
+	reloaded, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatalf("GetSite: %v", err)
+	}
+	if reloaded.TrafficUsed != 0 {
+		t.Fatalf("traffic_used after failed flush = %d, want 0", reloaded.TrafficUsed)
+	}
+
+	// Retry after the DB recovers persists the exact same bytes, once.
+	setDBReadonly(t, app, false)
+	if err := app.pm.flushProxyTraffic(inst); err != nil {
+		t.Fatalf("flush retry: %v", err)
+	}
+	if got := inst.persistedTraffic.Load(); got != 200 {
+		t.Fatalf("persistedTraffic after retry = %d, want 200", got)
+	}
+	reloaded, err = app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatalf("GetSite: %v", err)
+	}
+	if reloaded.TrafficUsed != 200 {
+		t.Fatalf("traffic_used after retry = %d, want 200", reloaded.TrafficUsed)
+	}
+	logs, err := app.db.GetTrafficLogs(site.ID, 1)
+	if err != nil {
+		t.Fatalf("GetTrafficLogs: %v", err)
+	}
+	if len(logs) != 1 || logs[0].BytesIn != 120 || logs[0].BytesOut != 80 {
+		t.Fatalf("logs after retry = %+v, want one row 120/80", logs)
+	}
+}
+
+// The single-site history snapshot reads DB logs, persisted baseline and
+// pending under one lock: pending bytes land in the current-hour bucket of the
+// returned copy (synthetic ID=0 bucket when absent, no-op when pending is 0).
+func TestSiteTrafficHistoryMergesPendingIntoCurrentHourBucket(t *testing.T) {
+	app := newTestApp(t)
+	site, err := app.db.CreateSite("merge", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	pastHour := time.Now().Add(-2 * time.Hour).Truncate(time.Hour).Format("2006-01-02 15:04:05")
+	if _, err := app.db.db.Exec("INSERT INTO traffic_logs (site_id, bytes_in, bytes_out, recorded_at) VALUES (?,?,?,?)", site.ID, 100, 50, pastHour); err != nil {
+		t.Fatalf("insert past log: %v", err)
+	}
+	if _, err := app.db.db.Exec("UPDATE sites SET traffic_used=150 WHERE id=?", site.ID); err != nil {
+		t.Fatalf("bump traffic_used: %v", err)
+	}
+
+	inst := &ProxyInstance{Site: *site, server: &http.Server{}}
+	inst.persistedTraffic.Store(150)
+	inst.bytesIn.Store(30)
+	inst.bytesOut.Store(20)
+	app.pm.proxies[site.ID] = inst
+
+	history, err := app.pm.SiteTrafficHistory(*site, 24)
+	if err != nil {
+		t.Fatalf("SiteTrafficHistory: %v", err)
+	}
+	if len(history.Logs) != 2 {
+		t.Fatalf("logs = %+v, want past row plus synthetic current-hour bucket", history.Logs)
+	}
+	if history.Logs[0].ID == 0 || history.Logs[0].BytesIn != 100 || history.Logs[0].BytesOut != 50 {
+		t.Fatalf("past bucket mutated = %+v, want 100/50 untouched", history.Logs[0])
+	}
+	current := history.Logs[1]
+	hourBefore := time.Now()
+	if _, err := time.Parse(time.RFC3339, current.RecordedAt); err != nil {
+		t.Fatalf("synthetic recorded_at %q is not RFC3339: %v", current.RecordedAt, err)
+	}
+	hourAfter := time.Now()
+	if current.ID != 0 || current.BytesIn != 30 || current.BytesOut != 20 || !(sameTrafficHour(current.RecordedAt, hourBefore) || sameTrafficHour(current.RecordedAt, hourAfter)) {
+		t.Fatalf("synthetic current bucket = %+v, want ID=0 30/20 at the current hour", current)
+	}
+	if !history.Snapshot.Running || history.Snapshot.PersistedTraffic != 150 || history.Snapshot.BytesIn != 30 || history.Snapshot.BytesOut != 20 || history.Snapshot.TrafficUsed != 200 {
+		t.Fatalf("snapshot = %+v, want running persisted=150 in=30 out=20 used=200", history.Snapshot)
+	}
+
+	// pending = 0 is a no-op: no synthetic bucket is appended.
+	inst.bytesIn.Store(0)
+	inst.bytesOut.Store(0)
+	history, err = app.pm.SiteTrafficHistory(*site, 24)
+	if err != nil {
+		t.Fatalf("SiteTrafficHistory: %v", err)
+	}
+	if len(history.Logs) != 1 {
+		t.Fatalf("logs with zero pending = %+v, want only the past row", history.Logs)
+	}
+
+	// When the current hour already has a bucket, pending merges into it.
+	// Use the synchronous addTraffic so the bucket is committed before the
+	// immediate read below (AddTraffic only logs errors and races the read).
+	// The bucket is identified by its bytes and real ID, never by a recorded_at
+	// string layout: the SQLite driver re-serializes DATETIME columns as
+	// RFC3339, so the persisted value must be matched by time semantics.
+	if err := app.db.addTraffic(site.ID, 10, 5); err != nil {
+		t.Fatalf("addTraffic: %v", err)
+	}
+	inst.bytesIn.Store(7)
+	inst.bytesOut.Store(3)
+	history, err = app.pm.SiteTrafficHistory(*site, 24)
+	if err != nil {
+		t.Fatalf("SiteTrafficHistory: %v", err)
+	}
+	if len(history.Logs) != 2 {
+		t.Fatalf("logs after merge = %+v, want past row plus one current-hour bucket, no synthetic duplicate", history.Logs)
+	}
+	var merged *TrafficLog
+	for i := range history.Logs {
+		l := &history.Logs[i]
+		if l.ID == 0 {
+			t.Fatalf("synthetic ID=0 bucket present although the real row exists: %+v", l)
+		}
+		if l.BytesIn == 17 && l.BytesOut == 8 {
+			if merged != nil {
+				t.Fatalf("two buckets carry 17/8: %+v and %+v", *merged, *l)
+			}
+			merged = l
+		}
+	}
+	if merged == nil {
+		t.Fatalf("no 17/8 bucket in %+v; pending must merge into the real addTraffic row", history.Logs)
+	}
+}
+
+// The merge identifies the current hour by time semantics, across every
+// format persisted rows carry: RFC3339 / RFC3339Nano (what the modernc
+// SQLite driver re-serializes DATETIME columns as) and the legacy
+// "2006-01-02 15:04:05" SQL layout. Rows from other hours and values that
+// parse as neither never absorb pending bytes; zero pending is a no-op.
+func TestMergePendingIntoLogsHourRecognition(t *testing.T) {
+	tests := []struct {
+		name       string
+		recordedAt string
+		pendingIn  int64
+		pendingOut int64
+		wantMerge  bool // pending lands in the existing bucket
+		wantAppend bool // synthetic ID=0 bucket is appended
+	}{
+		{"RFC3339 current hour", "", 8, 4, true, false},
+		{"RFC3339Nano current hour", "", 8, 4, true, false},
+		{"RFC3339Nano current hour with fraction", "", 8, 4, true, false},
+		{"legacy SQL layout current hour", "", 8, 4, true, false},
+		{"RFC3339 other hour", "", 8, 4, false, true},
+		{"legacy SQL layout other hour", "", 8, 4, false, true},
+		{"unparseable value", "not-a-timestamp", 8, 4, false, true},
+		{"empty value", "", 8, 4, false, true},
+		{"zero pending no-op", "", 0, 0, false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.Now()
+			nowLocal := now.In(time.Local)
+			// wallHour is the current local wall hour stamped as UTC, the exact
+			// shape the SQLite driver returns for a stored local-hour row.
+			wallHour := func(h int) time.Time {
+				return time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day(), h, 0, 0, 0, time.UTC)
+			}
+			recordedAt := tt.recordedAt
+			switch tt.name {
+			case "RFC3339 current hour":
+				recordedAt = wallHour(nowLocal.Hour()).Format(time.RFC3339)
+			case "RFC3339Nano current hour":
+				recordedAt = wallHour(nowLocal.Hour()).Format(time.RFC3339Nano)
+			case "RFC3339Nano current hour with fraction":
+				recordedAt = wallHour(nowLocal.Hour()).Add(250 * time.Millisecond).Format(time.RFC3339Nano)
+			case "legacy SQL layout current hour":
+				recordedAt = nowLocal.Format("2006-01-02 15:04:05")
+			case "RFC3339 other hour":
+				recordedAt = wallHour(nowLocal.Hour() - 1).Format(time.RFC3339)
+			case "legacy SQL layout other hour":
+				recordedAt = nowLocal.Add(-time.Hour).Format("2006-01-02 15:04:05")
+			}
+
+			in := []TrafficLog{{ID: 7, SiteID: 3, BytesIn: 10, BytesOut: 5, RecordedAt: recordedAt}}
+			out := mergePendingIntoLogs(in, 3, tt.pendingIn, tt.pendingOut)
+
+			if tt.wantMerge {
+				if len(out) != 1 {
+					t.Fatalf("len(out) = %d, want the existing bucket merged; got %+v", len(out), out)
+				}
+				if out[0].ID != 7 || out[0].BytesIn != 18 || out[0].BytesOut != 9 {
+					t.Fatalf("merged bucket = %+v, want ID=7 18/9", out[0])
+				}
+				return
+			}
+			if tt.wantAppend {
+				if len(out) != 2 {
+					t.Fatalf("len(out) = %d, want original plus synthetic bucket; got %+v", len(out), out)
+				}
+				if out[0].ID != 7 || out[0].BytesIn != 10 || out[0].BytesOut != 5 {
+					t.Fatalf("existing bucket mutated = %+v, want 10/5 untouched", out[0])
+				}
+				syn := out[1]
+				if syn.ID != 0 || syn.SiteID != 3 || syn.BytesIn != 8 || syn.BytesOut != 4 {
+					t.Fatalf("synthetic bucket = %+v, want ID=0 site=3 8/4", syn)
+				}
+				if _, err := time.Parse(time.RFC3339, syn.RecordedAt); err != nil {
+					t.Fatalf("synthetic recorded_at %q is not RFC3339: %v", syn.RecordedAt, err)
+				}
+				if !sameTrafficHour(syn.RecordedAt, time.Now()) {
+					t.Fatalf("synthetic recorded_at %q is not the current hour", syn.RecordedAt)
+				}
+				return
+			}
+			if len(out) != 1 || out[0] != in[0] {
+				t.Fatalf("zero pending must be a no-op, got %+v", out)
+			}
+		})
+	}
+}
+
+// mergePendingIntoLogs is only ever allowed to touch the copy it is given
+// (GetTrafficLogs always returns a fresh slice): mutating the returned slice
+// must never leak into the caller's own data.
+func TestMergePendingIntoLogsOnlyMutatesPrivateCopy(t *testing.T) {
+	now := time.Now()
+	nowLocal := now.In(time.Local)
+	wallHour := time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day(), nowLocal.Hour(), 0, 0, 0, time.UTC)
+	src := []TrafficLog{
+		{ID: 1, SiteID: 3, BytesIn: 10, BytesOut: 5, RecordedAt: wallHour.Format(time.RFC3339)},
+		{ID: 2, SiteID: 3, BytesIn: 1, BytesOut: 1, RecordedAt: wallHour.Add(-3 * time.Hour).Format(time.RFC3339)},
+	}
+	work := append([]TrafficLog(nil), src...)
+	out := mergePendingIntoLogs(work, 3, 8, 4)
+	// Pending lands in the current-hour element of the returned copy.
+	if len(out) != 2 || out[0].BytesIn != 18 || out[0].BytesOut != 9 {
+		t.Fatalf("merged result = %+v, want current-hour bucket 18/9", out)
+	}
+	// Caller-side mutation of the result must not touch the caller's original.
+	out[0].BytesIn = 999
+	out[0].BytesOut = 999
+	if src[0].BytesIn != 10 || src[0].BytesOut != 5 || src[1].BytesIn != 1 {
+		t.Fatalf("source slice mutated through the result: %+v", src)
+	}
+}
+
+// In a non-UTC deployment the DB stores local wall-clock hours and the driver
+// stamps them as UTC on read, so matching must compare wall-clock components
+// and the synthetic bucket must carry the current local wall hour as Z. This
+// pins that behavior with the process zone fixed to UTC+8: an RFC3339 row
+// whose hour reads 08:00Z matches a now of 08:30+08, a different wall hour
+// does not, and the synthetic bucket is exactly the local 08:00Z row the next
+// addTraffic will persist.
+func TestMergePendingIntoLogsFixedZoneUTC8(t *testing.T) {
+	savedLocal := time.Local
+	time.Local = time.FixedZone("UTC+8", 8*3600)
+	defer func() { time.Local = savedLocal }()
+
+	now := time.Now().In(time.Local)
+	wallHour := func(h int) time.Time {
+		return time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, time.UTC)
+	}
+	// RFC3339 08:00Z matches a now of 08:30+08: the stored local hour 08 read
+	// back as Z is the same wall clock, even though the instants differ.
+	if !sameTrafficHour(wallHour(now.Hour()).Format(time.RFC3339), now) {
+		t.Fatalf("RFC3339 %q must match local wall hour %s", wallHour(now.Hour()).Format(time.RFC3339), now.Format(time.RFC3339))
+	}
+	// The legacy local wall-clock row matches by the same wall-clock rule.
+	if !sameTrafficHour(now.Format("2006-01-02 15:04:05"), now) {
+		t.Fatalf("legacy %q must match local wall hour %s", now.Format("2006-01-02 15:04:05"), now.Format(time.RFC3339))
+	}
+	// A different wall hour never matches, regardless of instant proximity.
+	if sameTrafficHour(wallHour(now.Hour()-1).Format(time.RFC3339), now) {
+		t.Fatalf("RFC3339 %q must not match local wall hour %s", wallHour(now.Hour()-1).Format(time.RFC3339), now.Format(time.RFC3339))
+	}
+
+	// A real current-hour RFC3339 row absorbs pending bytes.
+	in := []TrafficLog{{ID: 5, SiteID: 2, BytesIn: 1, BytesOut: 1, RecordedAt: wallHour(now.Hour()).Format(time.RFC3339)}}
+	out := mergePendingIntoLogs(in, 2, 9, 3)
+	if len(out) != 1 || out[0].ID != 5 || out[0].BytesIn != 10 || out[0].BytesOut != 4 {
+		t.Fatalf("merged bucket = %+v, want ID=5 10/4", out)
+	}
+
+	// The synthetic bucket is the current local wall hour stamped as UTC,
+	// byte-identical to the row the next addTraffic will persist and read back.
+	in = []TrafficLog{{ID: 5, SiteID: 2, BytesIn: 1, BytesOut: 1, RecordedAt: wallHour(now.Hour() - 1).Format(time.RFC3339)}}
+	out = mergePendingIntoLogs(in, 2, 9, 3)
+	if len(out) != 2 {
+		t.Fatalf("len(out) = %d, want original plus synthetic bucket; got %+v", len(out), out)
+	}
+	want := wallHour(now.Hour()).Format(time.RFC3339)
+	if out[1].RecordedAt != want {
+		t.Fatalf("synthetic recorded_at = %q, want %q (local wall hour as Z)", out[1].RecordedAt, want)
+	}
+}
+
+// The global snapshot is one authoritative payload: every DB site overlaid
+// with persistedTraffic + pending for running sites, with unified totals.
+func TestTrafficSnapshotUnifiedPayloadAndTotals(t *testing.T) {
+	app := newTestApp(t)
+	siteA, err := app.db.CreateSite("running-a", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 1024, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	siteB, err := app.db.CreateSite("idle-b", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	app.db.AddTraffic(siteB.ID, 40, 0)
+
+	inst := &ProxyInstance{Site: *siteA, server: &http.Server{}}
+	inst.persistedTraffic.Store(100)
+	inst.bytesIn.Store(30)
+	inst.bytesOut.Store(20)
+	app.pm.proxies[siteA.ID] = inst
+
+	snap, err := app.pm.TrafficSnapshot()
+	if err != nil {
+		t.Fatalf("TrafficSnapshot: %v", err)
+	}
+	if snap.TotalSites != 2 || snap.OnlineSites != 2 || snap.RunningSites != 1 {
+		t.Fatalf("counts = total:%d online:%d running:%d, want 2/2/1", snap.TotalSites, snap.OnlineSites, snap.RunningSites)
+	}
+	if snap.TotalTraffic != 190 {
+		t.Fatalf("total_traffic = %d, want 190 (100+30+20 persisted+pending + 40 DB)", snap.TotalTraffic)
+	}
+	a := findLiveSite(t, snap, siteA.ID)
+	if !a.Running || a.TrafficQuota != 1024 || a.PersistedTraffic != 100 || a.BytesIn != 30 || a.BytesOut != 20 || a.TrafficUsed != 150 {
+		t.Fatalf("running site entry = %+v, want running quota=1024 persisted=100 in=30 out=20 used=150", a)
+	}
+	b := findLiveSite(t, snap, siteB.ID)
+	if b.Running || b.PersistedTraffic != 40 || b.BytesIn != 0 || b.BytesOut != 0 || b.TrafficUsed != 40 {
+		t.Fatalf("idle site entry = %+v, want not running persisted=40 used=40", b)
+	}
+}
+
+// The legacy endpoint keeps the plain TrafficLog[] shape (with live-merged
+// current hour) and returns [] for unknown sites; the /snapshot endpoint
+// returns the {snapshot, logs} envelope and 404 for unknown sites.
+func TestHandleTrafficLegacyArrayAndSnapshotEnvelope(t *testing.T) {
+	app := newTestApp(t)
+	site, err := app.db.CreateSite("shape", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	inst := &ProxyInstance{Site: *site, server: &http.Server{}}
+	inst.bytesIn.Store(40)
+	inst.bytesOut.Store(10)
+	app.pm.proxies[site.ID] = inst
+
+	// Legacy: plain array, live-merged current hour.
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/traffic/"+jsonNumber64(site.ID)+"?hours=24", nil)
+	app.handleTraffic(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("legacy status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var logs []TrafficLog
+	if err := json.Unmarshal(rr.Body.Bytes(), &logs); err != nil {
+		t.Fatalf("legacy body is not a TrafficLog array: %v body=%s", err, rr.Body.String())
+	}
+	if len(logs) != 1 || logs[0].ID != 0 || logs[0].BytesIn != 40 || logs[0].BytesOut != 10 {
+		t.Fatalf("legacy logs = %+v, want synthetic current-hour bucket 40/10", logs)
+	}
+
+	// Envelope: {snapshot, logs} with the same live state.
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/traffic/"+jsonNumber64(site.ID)+"/snapshot?hours=24", nil)
+	app.handleTraffic(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("snapshot status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	body := decodeBody(t, rr)
+	snap := mustMapValue(t, body, "snapshot")
+	if mustNumberValue(t, snap, "traffic_used") != 50 || mustNumberValue(t, snap, "persisted_traffic") != 0 || mustNumberValue(t, snap, "bytes_in") != 40 || mustNumberValue(t, snap, "bytes_out") != 10 {
+		t.Fatalf("envelope snapshot = %v, want used=50 persisted=0 in=40 out=10", snap)
+	}
+	if !mustBoolValue(t, snap, "running") {
+		t.Fatal("envelope snapshot must report the site as running")
+	}
+	envLogs, ok := body["logs"].([]interface{})
+	if !ok || len(envLogs) != 1 {
+		t.Fatalf("envelope logs = %v, want one merged bucket", body["logs"])
+	}
+
+	// Legacy unknown site: empty array, not an error.
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/traffic/999999?hours=24", nil)
+	app.handleTraffic(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("legacy missing-site status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	logs = nil
+	if err := json.Unmarshal(rr.Body.Bytes(), &logs); err != nil || len(logs) != 0 {
+		t.Fatalf("legacy missing-site body = %q, want []", rr.Body.String())
+	}
+
+	// Envelope unknown site: 404.
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/traffic/999999/snapshot?hours=24", nil)
+	app.handleTraffic(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("snapshot missing-site status = %d, want 404; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+// StopSite fails closed when the flush cannot persist: the instance stays
+// registered, its pending bytes stay intact, and a later retry succeeds.
+func TestStopSiteFailClosedOnFlushError(t *testing.T) {
+	app := newTestApp(t)
+	site, err := app.db.CreateSite("stopclosed", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+
+	inst := &ProxyInstance{Site: *site, server: &http.Server{}}
+	inst.bytesIn.Store(50)
+	inst.bytesOut.Store(25)
+	app.pm.proxies[site.ID] = inst
+
+	setDBReadonly(t, app, true)
+	if err := app.pm.StopSite(site.ID); err == nil {
+		t.Fatal("StopSite succeeded against a read-only database")
+	}
+	if !app.pm.IsRunning(site.ID) {
+		t.Fatal("StopSite dropped the instance despite the failed flush")
+	}
+	if got := inst.bytesIn.Load(); got != 50 {
+		t.Fatalf("bytesIn after failed stop = %d, want 50", got)
+	}
+	if got := inst.bytesOut.Load(); got != 25 {
+		t.Fatalf("bytesOut after failed stop = %d, want 25", got)
+	}
+	if got := inst.persistedTraffic.Load(); got != 0 {
+		t.Fatalf("persistedTraffic after failed stop = %d, want 0", got)
+	}
+	reloaded, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatalf("GetSite: %v", err)
+	}
+	if reloaded.TrafficUsed != 0 {
+		t.Fatalf("traffic_used after failed stop = %d, want 0", reloaded.TrafficUsed)
+	}
+
+	// Same stop succeeds once the DB recovers and persists exactly once.
+	setDBReadonly(t, app, false)
+	if err := app.pm.StopSite(site.ID); err != nil {
+		t.Fatalf("StopSite retry: %v", err)
+	}
+	if app.pm.IsRunning(site.ID) {
+		t.Fatal("instance still registered after successful stop")
+	}
+	reloaded, err = app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatalf("GetSite: %v", err)
+	}
+	if reloaded.TrafficUsed != 75 {
+		t.Fatalf("traffic_used after stop retry = %d, want 75", reloaded.TrafficUsed)
+	}
+}
+
+// DELETE only deletes the DB row when the stop (and its flush) succeeded; a
+// failed flush aborts with the instance and the row intact.
+func TestDeleteSiteAbortsWhenFlushFails(t *testing.T) {
+	app := newTestApp(t)
+	site, err := app.db.CreateSite("delclosed", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+
+	inst := &ProxyInstance{Site: *site, server: &http.Server{}}
+	inst.bytesIn.Store(10)
+	inst.bytesOut.Store(5)
+	app.pm.proxies[site.ID] = inst
+
+	setDBReadonly(t, app, true)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/api/sites/"+jsonNumber64(site.ID), nil)
+	app.handleSiteByID(rr, req)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("DELETE status = %d, want 500; body=%s", rr.Code, rr.Body.String())
+	}
+	if _, err := app.db.GetSite(site.ID); err != nil {
+		t.Fatal("site row was deleted despite the failed flush")
+	}
+	if !app.pm.IsRunning(site.ID) {
+		t.Fatal("instance was stopped despite the failed flush")
+	}
+	if got := inst.bytesIn.Load(); got != 10 {
+		t.Fatalf("bytesIn after failed delete = %d, want 10", got)
+	}
+	setDBReadonly(t, app, false)
+}
+
+// Replacing a running instance fails closed when the flush cannot persist: the
+// old instance and its pending bytes stay registered and the new instance's
+// freshly bound listener is released.
+func TestStartSiteReplaceFailClosedAndReleasesNewListener(t *testing.T) {
+	app := newTestApp(t)
+	site, err := app.db.CreateSite("replaceclosed", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	releasePort(site.ListenPort)
+	if err := app.pm.StartSite(*site); err != nil {
+		t.Fatalf("StartSite: %v", err)
+	}
+	t.Cleanup(func() { app.pm.StopSite(site.ID) })
+
+	app.pm.mu.RLock()
+	inst := app.pm.proxies[site.ID]
+	app.pm.mu.RUnlock()
+	if inst == nil {
+		t.Fatal("site did not register a proxy instance")
+	}
+	inst.bytesIn.Store(60)
+	inst.bytesOut.Store(40)
+
+	moved := *site
+	moved.ListenPort = freePort(t)
+	releasePort(moved.ListenPort)
+	setDBReadonly(t, app, true)
+	if err := app.pm.StartSite(moved); err == nil {
+		t.Fatal("replace succeeded against a read-only database")
+	}
+	setDBReadonly(t, app, false)
+
+	// The old instance is still the registered one, with pending intact.
+	app.pm.mu.RLock()
+	still := app.pm.proxies[site.ID]
+	app.pm.mu.RUnlock()
+	if still != inst {
+		t.Fatal("old instance was replaced despite the failed flush")
+	}
+	if got := inst.bytesIn.Load(); got != 60 {
+		t.Fatalf("bytesIn after failed replace = %d, want 60", got)
+	}
+	if got := inst.bytesOut.Load(); got != 40 {
+		t.Fatalf("bytesOut after failed replace = %d, want 40", got)
+	}
+	if got := inst.persistedTraffic.Load(); got != 0 {
+		t.Fatalf("persistedTraffic after failed replace = %d, want 0", got)
+	}
+
+	// The new listener was released: the new port binds again immediately.
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", moved.ListenPort))
+	if err != nil {
+		t.Fatalf("new listener was not released after failed replace: %v", err)
+	}
+	ln.Close()
+}
+
+// Concurrent flush/snapshot/history must never expose a torn per-instance
+// view (traffic_used != persisted + pending), and every byte written ends up
+// persisted exactly once. Run with -race.
+func TestConcurrentFlushSnapshotAndHistoryStayConsistent(t *testing.T) {
+	app := newTestApp(t)
+	site, err := app.db.CreateSite("race", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+
+	inst := &ProxyInstance{Site: *site, server: &http.Server{}}
+	app.pm.proxies[site.ID] = inst
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Writer: accumulates 300 * 10 = 3000 pending bytes.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 300; i++ {
+			inst.bytesIn.Add(7)
+			inst.bytesOut.Add(3)
+			time.Sleep(time.Microsecond)
+		}
+		close(stop)
+	}()
+
+	// Flusher: keeps draining pending into the DB until the writer stops.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				app.pm.FlushTraffic()
+				time.Sleep(100 * time.Microsecond)
+			}
+		}
+	}()
+
+	// Snapshotter: every observed per-site view must satisfy the invariant.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			snap, err := app.pm.TrafficSnapshot()
+			if err != nil {
+				t.Errorf("TrafficSnapshot: %v", err)
+				return
+			}
+			for _, st := range snap.LiveSites {
+				if st.ID == site.ID && st.TrafficUsed != st.PersistedTraffic+st.BytesIn+st.BytesOut {
+					t.Errorf("torn snapshot view: used=%d persisted=%d in=%d out=%d", st.TrafficUsed, st.PersistedTraffic, st.BytesIn, st.BytesOut)
+					return
+				}
+			}
+			time.Sleep(50 * time.Microsecond)
+		}
+	}()
+
+	// Historian: same invariant on the single-site envelope.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			h, err := app.pm.SiteTrafficHistory(*site, 24)
+			if err != nil {
+				t.Errorf("SiteTrafficHistory: %v", err)
+				return
+			}
+			if h.Snapshot.TrafficUsed != h.Snapshot.PersistedTraffic+h.Snapshot.BytesIn+h.Snapshot.BytesOut {
+				t.Errorf("torn history view: used=%d persisted=%d in=%d out=%d", h.Snapshot.TrafficUsed, h.Snapshot.PersistedTraffic, h.Snapshot.BytesIn, h.Snapshot.BytesOut)
+				return
+			}
+			time.Sleep(50 * time.Microsecond)
+		}
+	}()
+
+	wg.Wait()
+
+	// Conservation: the final flush persists every written byte exactly once.
+	app.pm.FlushTraffic()
+	if got := inst.persistedTraffic.Load(); got != 3000 {
+		t.Fatalf("persistedTraffic after concurrent run = %d, want 3000", got)
+	}
+	if got := inst.bytesIn.Load() + inst.bytesOut.Load(); got != 0 {
+		t.Fatalf("pending after concurrent run = %d, want 0", got)
+	}
+	reloaded, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatalf("GetSite: %v", err)
+	}
+	if reloaded.TrafficUsed != 3000 {
+		t.Fatalf("traffic_used after concurrent run = %d, want 3000", reloaded.TrafficUsed)
+	}
+}
+
+// The read-only traffic paths (legacy, envelope, dashboard, overview, SSE)
+// must never write the database: they all succeed while the DB rejects writes.
+func TestTrafficReadsDoNotWriteDatabase(t *testing.T) {
+	app := newTestApp(t)
+	site, err := app.db.CreateSite("readonly", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+
+	inst := &ProxyInstance{Site: *site, server: &http.Server{}}
+	inst.bytesIn.Store(11)
+	inst.bytesOut.Store(9)
+	app.pm.proxies[site.ID] = inst
+
+	setDBReadonly(t, app, true)
+	defer setDBReadonly(t, app, false)
+
+	// Legacy array endpoint.
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/traffic/"+jsonNumber64(site.ID)+"?hours=24", nil)
+	app.handleTraffic(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("legacy status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	// Envelope endpoint; the live pending shows up in the read-only view.
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/traffic/"+jsonNumber64(site.ID)+"/snapshot?hours=24", nil)
+	app.handleTraffic(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("envelope status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	body := decodeBody(t, rr)
+	snap := mustMapValue(t, body, "snapshot")
+	if mustNumberValue(t, snap, "bytes_in") != 11 || mustNumberValue(t, snap, "traffic_used") != 20 {
+		t.Fatalf("read-only envelope snapshot = %v, want in=11 used=20", snap)
+	}
+
+	// Dashboard and overview share the unified snapshot payload.
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/dashboard", nil)
+	app.handleDashboard(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("dashboard status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	body = decodeBody(t, rr)
+	if mustNumberValue(t, body, "total_traffic") != 20 || mustNumberValue(t, body, "running_sites") != 1 {
+		t.Fatalf("dashboard payload = %v, want total_traffic=20 running_sites=1", body)
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/traffic/overview", nil)
+	app.handleTraffic(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("overview status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	body = decodeBody(t, rr)
+	if mustNumberValue(t, body, "total_traffic") != 20 {
+		t.Fatalf("overview payload = %v, want total_traffic=20", body)
+	}
+
+	// SSE event frame.
+	rr = httptest.NewRecorder()
+	if err := app.sendSSEEvent(rr, rr); err != nil {
+		t.Fatalf("sendSSEEvent against a read-only DB: %v", err)
+	}
+	if !strings.HasPrefix(rr.Body.String(), "data: ") || !strings.Contains(rr.Body.String(), "\"total_traffic\":20") {
+		t.Fatalf("SSE frame = %q, want data: frame with total_traffic 20", rr.Body.String())
+	}
+
+	// And the DB really is untouched: no logs, no usage.
+	reloaded, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatalf("GetSite: %v", err)
+	}
+	if reloaded.TrafficUsed != 0 {
+		t.Fatalf("traffic_used = %d, want 0 (reads must not write)", reloaded.TrafficUsed)
+	}
+	logs, err := app.db.GetTrafficLogs(site.ID, 24)
+	if err != nil {
+		t.Fatalf("GetTrafficLogs: %v", err)
+	}
+	if len(logs) != 0 {
+		t.Fatalf("traffic_logs = %+v, want empty (reads must not write)", logs)
+	}
+}
+
+// Toggle-off stops (and flushes) before flipping the flag; a failed flush
+// aborts with the flag still on and the instance still running.
+func TestToggleOffAbortsWhenFlushFails(t *testing.T) {
+	app := newTestApp(t)
+	site, err := app.db.CreateSite("togglestop", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+
+	inst := &ProxyInstance{Site: *site, server: &http.Server{}}
+	inst.bytesIn.Store(20)
+	app.pm.proxies[site.ID] = inst
+
+	setDBReadonly(t, app, true)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/sites/"+jsonNumber64(site.ID)+"/toggle", nil)
+	app.handleSiteByID(rr, req)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("toggle status = %d, want 500; body=%s", rr.Code, rr.Body.String())
+	}
+	setDBReadonly(t, app, false)
+
+	reloaded, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatalf("GetSite: %v", err)
+	}
+	if !reloaded.Enabled {
+		t.Fatal("toggle-off flipped the flag despite the failed flush")
+	}
+	if !app.pm.IsRunning(site.ID) {
+		t.Fatal("toggle-off stopped the instance despite the failed flush")
+	}
+	if got := inst.bytesIn.Load(); got != 20 {
+		t.Fatalf("bytesIn after failed toggle = %d, want 20", got)
+	}
+}
+
+// The PUT pre-stop runs before the DB update; a failed flush aborts with the
+// old config still in the DB and the old instance still running.
+func TestSiteUpdateAbortsWhenPreStopFlushFails(t *testing.T) {
+	app := newTestApp(t)
+	site, err := app.db.CreateSite("prestop", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	releasePort(site.ListenPort)
+	if err := app.pm.StartSite(*site); err != nil {
+		t.Fatalf("StartSite: %v", err)
+	}
+	t.Cleanup(func() { app.pm.StopSite(site.ID) })
+
+	app.pm.mu.RLock()
+	inst := app.pm.proxies[site.ID]
+	app.pm.mu.RUnlock()
+	if inst == nil {
+		t.Fatal("site did not register a proxy instance")
+	}
+	inst.bytesIn.Store(33)
+
+	// Same listen_port -> the update path pre-stops; the flush fails -> abort.
+	body := strings.NewReader(`{"name":"renamed","listen_port":` + jsonNumber(site.ListenPort) + `,"target_url":"http://127.0.0.1:8096","ua_mode":"infuse"}`)
+	setDBReadonly(t, app, true)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(site.ID), body)
+	app.handleSiteByID(rr, req)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("PUT status = %d, want 500; body=%s", rr.Code, rr.Body.String())
+	}
+	setDBReadonly(t, app, false)
+
+	reloaded, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatalf("GetSite: %v", err)
+	}
+	if reloaded.Name != "prestop" {
+		t.Fatalf("name = %q, want the old config preserved", reloaded.Name)
+	}
+	if !reloaded.Enabled {
+		t.Fatal("PUT disabled the site despite the failed flush")
+	}
+	if reloaded.TrafficUsed != 0 {
+		t.Fatalf("traffic_used = %d, want 0", reloaded.TrafficUsed)
+	}
+	app.pm.mu.RLock()
+	still := app.pm.proxies[site.ID]
+	app.pm.mu.RUnlock()
+	if still != inst {
+		t.Fatal("pre-stop replaced the instance despite the failed flush")
+	}
+	if got := inst.bytesIn.Load(); got != 33 {
+		t.Fatalf("bytesIn after failed PUT = %d, want 33", got)
+	}
+}
+
+// GET /api/sites overlays the authoritative live traffic (persisted + pending)
+// for running sites while preserving the exact Site JSON shape plus the
+// running flag; the read never writes the database, so pending bytes appear
+// before any flush.
+func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
+	app := newTestApp(t)
+	running, err := app.db.CreateSite("live", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	stopped, err := app.db.CreateSite("stopped", freePort(t), "http://127.0.0.1:8097", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+
+	inst := &ProxyInstance{Site: *running, server: &http.Server{}}
+	inst.persistedTraffic.Store(100)
+	inst.bytesIn.Store(11)
+	inst.bytesOut.Store(9)
+	app.pm.proxies[running.ID] = inst
+
+	// The GET must succeed while the DB rejects every write, proving the live
+	// overlay is a pure read.
+	setDBReadonly(t, app, true)
+	defer setDBReadonly(t, app, false)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/sites", nil)
+	app.handleSites(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /api/sites status = %d; body=%s", rr.Code, rr.Body.String())
+	}
+
+	// The response rows keep exactly the Site JSON fields plus "running": the
+	// overlay may only change traffic_used, never add per-component fields.
+	var raw []map[string]json.RawMessage
+	if err := json.Unmarshal(rr.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode /api/sites: %v", err)
+	}
+	expectedKeys := map[string]bool{
+		"id": true, "name": true, "listen_port": true, "target_url": true,
+		"playback_target_url": true, "playback_mode": true, "stream_hosts": true,
+		"ua_mode": true, "custom_user_agent": true, "custom_client": true,
+		"custom_version": true, "enabled": true, "traffic_quota": true,
+		"traffic_used": true, "speed_limit": true, "created_at": true,
+		"updated_at": true, "running": true,
+	}
+	if len(raw) != 2 {
+		t.Fatalf("GET /api/sites returned %d rows, want 2: %s", len(raw), rr.Body.String())
+	}
+	for i, row := range raw {
+		if len(row) != len(expectedKeys) {
+			t.Fatalf("row %d has %d fields, want %d: %v", i, len(row), len(expectedKeys), row)
+		}
+		for key := range row {
+			if !expectedKeys[key] {
+				t.Fatalf("row %d has unexpected field %q", i, key)
+			}
+		}
+	}
+
+	var rows []struct {
+		ID          int64 `json:"id"`
+		Running     bool  `json:"running"`
+		Enabled     bool  `json:"enabled"`
+		TrafficUsed int64 `json:"traffic_used"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &rows); err != nil {
+		t.Fatalf("decode /api/sites rows: %v", err)
+	}
+	var liveRow, stoppedRow *struct {
+		ID          int64 `json:"id"`
+		Running     bool  `json:"running"`
+		Enabled     bool  `json:"enabled"`
+		TrafficUsed int64 `json:"traffic_used"`
+	}
+	for i := range rows {
+		switch rows[i].ID {
+		case running.ID:
+			liveRow = &rows[i]
+		case stopped.ID:
+			stoppedRow = &rows[i]
+		}
+	}
+	if liveRow == nil || stoppedRow == nil {
+		t.Fatalf("expected both sites in the response: %+v", rows)
+	}
+	if liveRow.TrafficUsed != 120 {
+		t.Fatalf("live traffic_used = %d, want 120 (100 persisted + 11 + 9 pending)", liveRow.TrafficUsed)
+	}
+	if !liveRow.Running {
+		t.Fatal("running site must be flagged running")
+	}
+	if !liveRow.Enabled {
+		t.Fatal("non-traffic fields must keep their DB values")
+	}
+	if stoppedRow.TrafficUsed != 0 || stoppedRow.Running {
+		t.Fatalf("stopped site row = traffic_used %d running %v, want 0/false", stoppedRow.TrafficUsed, stoppedRow.Running)
+	}
+
+	// The read left the DB untouched: no flush, no logs.
+	reloaded, err := app.db.GetSite(running.ID)
+	if err != nil {
+		t.Fatalf("GetSite: %v", err)
+	}
+	if reloaded.TrafficUsed != 0 {
+		t.Fatalf("DB traffic_used = %d, want 0 (the read must not flush)", reloaded.TrafficUsed)
+	}
+	logs, err := app.db.GetTrafficLogs(running.ID, 24)
+	if err != nil {
+		t.Fatalf("GetTrafficLogs: %v", err)
+	}
+	if len(logs) != 0 {
+		t.Fatalf("traffic_logs = %+v, want empty (the read must not write)", logs)
+	}
+}
+
+// A PUT whose record update fails after a successful pre-stop must restart the
+// old instance: the enabled row is never left without a running proxy. The
+// failure is injected with a trigger that aborts name updates only, so the
+// pre-stop flush (which updates traffic_used, not name) still succeeds - the
+// granularity query_only cannot express.
+func TestSiteUpdateRestartsPreStoppedInstanceWhenRecordUpdateFails(t *testing.T) {
+	app := newTestApp(t)
+	port := freePort(t)
+	site, err := app.db.CreateSite("rename-me", port, "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	releasePort(port)
+	if err := app.pm.StartSite(*site); err != nil {
+		t.Fatalf("StartSite: %v", err)
+	}
+	t.Cleanup(func() { app.pm.StopSite(site.ID) })
+
+	app.pm.mu.RLock()
+	inst := app.pm.proxies[site.ID]
+	app.pm.mu.RUnlock()
+	if inst == nil {
+		t.Fatal("site did not register a proxy instance")
+	}
+	inst.bytesIn.Store(33)
+
+	execTestSQL(t, app, "CREATE TRIGGER block_rename BEFORE UPDATE OF name ON sites BEGIN SELECT RAISE(ABORT, 'rename blocked'); END;")
+	defer execTestSQL(t, app, "DROP TRIGGER block_rename")
+
+	// Same listen_port -> the update path pre-stops; the flush succeeds but the
+	// record update (which sets name) is aborted.
+	body := strings.NewReader(`{"name":"renamed","listen_port":` + jsonNumber(site.ListenPort) + `,"target_url":"http://127.0.0.1:8096","ua_mode":"infuse"}`)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(site.ID), body)
+	app.handleSiteByID(rr, req)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("PUT status = %d, want 500; body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "rename blocked") {
+		t.Fatalf("PUT error must report the record update failure: %s", rr.Body.String())
+	}
+
+	reloaded, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatalf("GetSite: %v", err)
+	}
+	if reloaded.Name != "rename-me" {
+		t.Fatalf("name = %q, want the old config preserved", reloaded.Name)
+	}
+	if !reloaded.Enabled {
+		t.Fatal("PUT disabled the site despite the failed record update")
+	}
+	if reloaded.TrafficUsed != 33 {
+		t.Fatalf("traffic_used = %d, want 33 (the pre-stop flush persisted pending bytes)", reloaded.TrafficUsed)
+	}
+	if !app.pm.IsRunning(site.ID) {
+		t.Fatal("the pre-stopped instance was not restarted after the failed record update")
+	}
+	app.pm.mu.RLock()
+	restarted := app.pm.proxies[site.ID]
+	app.pm.mu.RUnlock()
+	if restarted == nil || restarted == inst {
+		t.Fatal("expected a fresh instance for the restored site")
+	}
+	if got := restarted.persistedTraffic.Load(); got != 33 {
+		t.Fatalf("restarted persistedTraffic = %d, want 33", got)
+	}
+	if got := restarted.bytesIn.Load(); got != 0 {
+		t.Fatalf("restarted bytesIn = %d, want 0", got)
+	}
+}
+
+// DELETE restarts the stopped enabled site when the row deletion fails: the
+// instance is never left stopped while the enabled row survives. The failure
+// is injected with a trigger that aborts row deletion after the stop flush.
+func TestDeleteSiteRestartsInstanceWhenDeleteFails(t *testing.T) {
+	app := newTestApp(t)
+	port := freePort(t)
+	site, err := app.db.CreateSite("del-restore", port, "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	releasePort(port)
+	if err := app.pm.StartSite(*site); err != nil {
+		t.Fatalf("StartSite: %v", err)
+	}
+	t.Cleanup(func() { app.pm.StopSite(site.ID) })
+
+	app.pm.mu.RLock()
+	inst := app.pm.proxies[site.ID]
+	app.pm.mu.RUnlock()
+	if inst == nil {
+		t.Fatal("site did not register a proxy instance")
+	}
+	inst.bytesIn.Store(10)
+	inst.bytesOut.Store(5)
+
+	execTestSQL(t, app, "CREATE TRIGGER block_delete BEFORE DELETE ON sites BEGIN SELECT RAISE(ABORT, 'delete blocked'); END;")
+	defer execTestSQL(t, app, "DROP TRIGGER block_delete")
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/api/sites/"+jsonNumber64(site.ID), nil)
+	app.handleSiteByID(rr, req)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("DELETE status = %d, want 500; body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "delete blocked") {
+		t.Fatalf("DELETE error must report the delete failure: %s", rr.Body.String())
+	}
+
+	reloaded, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatalf("GetSite: %v", err)
+	}
+	if !reloaded.Enabled {
+		t.Fatal("site row was mutated despite the failed delete")
+	}
+	if reloaded.TrafficUsed != 15 {
+		t.Fatalf("traffic_used = %d, want 15 (the stop flush persisted pending bytes)", reloaded.TrafficUsed)
+	}
+	if !app.pm.IsRunning(site.ID) {
+		t.Fatal("the stopped instance was not restarted after the failed delete")
+	}
+	app.pm.mu.RLock()
+	restarted := app.pm.proxies[site.ID]
+	app.pm.mu.RUnlock()
+	if restarted == nil || restarted == inst {
+		t.Fatal("expected a fresh instance for the surviving row")
+	}
+	if got := restarted.persistedTraffic.Load(); got != 15 {
+		t.Fatalf("restarted persistedTraffic = %d, want 15", got)
+	}
+	if in, out := restarted.bytesIn.Load(), restarted.bytesOut.Load(); in != 0 || out != 0 {
+		t.Fatalf("restarted pending counters = in:%d out:%d, want 0/0", in, out)
 	}
 }
 

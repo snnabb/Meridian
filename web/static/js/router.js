@@ -18,6 +18,9 @@ const Router = {
     if (previous === 'dashboard' && hash !== 'dashboard' && typeof stopDashSSE === 'function') {
       stopDashSSE();
     }
+    if (previous === 'traffic' && hash !== 'traffic' && typeof stopTrafficRefresh === 'function') {
+      stopTrafficRefresh();
+    }
 
     this.current = hash;
 

@@ -121,6 +121,7 @@
   function teardownAppRuntime() {
     stopDashboardRefresh();
     if (typeof stopDashSSE === 'function') stopDashSSE();
+    if (typeof stopTrafficRefresh === 'function') stopTrafficRefresh();
   }
 
   document.getElementById('loginForm').addEventListener('submit', async function(e) {

@@ -504,6 +504,41 @@ type TrafficLog struct {
 	RecordedAt string `json:"recorded_at"`
 }
 
+// SiteTraffic is the authoritative per-site traffic state: the persisted
+// baseline plus in-memory pending bytes. TrafficUsed is always
+// PersistedTraffic + BytesIn + BytesOut (pending, not yet flushed).
+type SiteTraffic struct {
+	ID               int64  `json:"id"`
+	Name             string `json:"name"`
+	Running          bool   `json:"running"`
+	TrafficQuota     int64  `json:"traffic_quota"`
+	PersistedTraffic int64  `json:"persisted_traffic"`
+	BytesIn          int64  `json:"bytes_in"`
+	BytesOut         int64  `json:"bytes_out"`
+	TrafficUsed      int64  `json:"traffic_used"`
+	Requests         int64  `json:"requests"`
+}
+
+// TrafficSnapshot is the single authoritative global traffic payload shared by
+// /api/dashboard, /api/traffic/overview and SSE events.
+type TrafficSnapshot struct {
+	TotalSites    int           `json:"total_sites"`
+	OnlineSites   int           `json:"online_sites"`
+	RunningSites  int           `json:"running_sites"`
+	TotalTraffic  int64         `json:"total_traffic"`
+	TotalRequests int64         `json:"total_requests"`
+	UptimeSeconds int64         `json:"uptime_seconds"`
+	LiveSites     []SiteTraffic `json:"live_sites"`
+}
+
+// TrafficHistory is the single-site envelope returned by
+// /api/traffic/{id}/snapshot: an atomically captured live snapshot plus the
+// log window with pending bytes merged into the current-hour bucket.
+type TrafficHistory struct {
+	Snapshot SiteTraffic  `json:"snapshot"`
+	Logs     []TrafficLog `json:"logs"`
+}
+
 func (d *DB) UserCount() (int, error) {
 	var n int
 	if err := d.db.QueryRow("SELECT COUNT(*) FROM users").Scan(&n); err != nil {
@@ -807,25 +842,6 @@ func (d *DB) GetTrafficLogs(siteID int64, hours int) ([]TrafficLog, error) {
 		logs = []TrafficLog{}
 	}
 	return logs, nil
-}
-
-func (d *DB) DashboardStats() (map[string]interface{}, error) {
-	var total, online int
-	var totalTraffic int64
-	if err := d.db.QueryRow(`
-		SELECT
-			COUNT(*),
-			COALESCE(SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(traffic_used), 0)
-		FROM sites
-	`).Scan(&total, &online, &totalTraffic); err != nil {
-		return nil, err
-	}
-	return map[string]interface{}{
-		"total_sites":   total,
-		"online_sites":  online,
-		"total_traffic": totalTraffic,
-	}, nil
 }
 
 type redirectFollowTransport struct {
@@ -1140,10 +1156,15 @@ func stripSensitiveRedirectHeaders(header http.Header) {
 }
 
 type ProxyInstance struct {
-	Site             Site
-	server           *http.Server
-	listener         net.Listener
-	startedAt        time.Time
+	Site      Site
+	server    *http.Server
+	listener  net.Listener
+	startedAt time.Time
+	// trafficMu serializes this instance's traffic state transitions: flush,
+	// single-site history snapshot and the live overlay in global snapshots.
+	// Lock order is pm.mu -> trafficMu; helpers that take trafficMu (e.g.
+	// flushProxyTraffic) must never be called from code that already holds it.
+	trafficMu        sync.Mutex
 	bytesIn          atomic.Int64
 	bytesOut         atomic.Int64
 	reqCount         atomic.Int64
@@ -1872,7 +1893,15 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		// update path handleSiteByID does not pre-stop, so without this everything
 		// counted since the last 60s tick vanishes from traffic_logs and
 		// sites.traffic_used.
-		pm.flushProxyTraffic(existing)
+		if err := pm.flushProxyTraffic(existing); err != nil {
+			// Fail closed: keep the old instance and its pending bytes, release
+			// the new instance's freshly bound listener, and leave the proxies
+			// map untouched. The Serve goroutine below never starts, so closing
+			// the raw listener is enough.
+			pm.mu.Unlock()
+			_ = listener.Close()
+			return fmt.Errorf("flush traffic of the instance being replaced: %w", err)
+		}
 		// That flush moved bytes into the row `site` was read from, so carry the
 		// authoritative total forward instead of the snapshot taken before it.
 		if flushed := existing.Site.TrafficUsed; flushed > inst.persistedTraffic.Load() {
@@ -1905,16 +1934,24 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	return nil
 }
 
-func (pm *ProxyManager) StopSite(id int64) {
+func (pm *ProxyManager) StopSite(id int64) error {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
-	if inst, ok := pm.proxies[id]; ok {
-		pm.flushProxyTraffic(inst)
-		if inst.server != nil {
-			inst.server.Close()
-		}
-		delete(pm.proxies, id)
+	inst, ok := pm.proxies[id]
+	if !ok {
+		return nil
 	}
+	// Flush before dropping the instance so pending bytes reach the DB. If the
+	// flush fails the instance stays running with its pending bytes intact and
+	// the caller must abort (or retry) so instance and DB remain consistent.
+	if err := pm.flushProxyTraffic(inst); err != nil {
+		return err
+	}
+	if inst.server != nil {
+		inst.server.Close()
+	}
+	delete(pm.proxies, id)
+	return nil
 }
 
 func (pm *ProxyManager) IsRunning(id int64) bool {
@@ -1939,30 +1976,226 @@ func (pm *ProxyManager) StartAllEnabled() (int, error) {
 	return len(sites), nil
 }
 
-// Flush traffic counters to DB periodically
+// FlushTraffic flushes every running instance's pending traffic to the DB. It
+// is driven by the periodic ticker: a failed flush restores the pending
+// counters and is logged here, so the next tick retries the same bytes.
 func (pm *ProxyManager) FlushTraffic() {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	for _, inst := range pm.proxies {
-		pm.flushProxyTraffic(inst)
+		if err := pm.flushProxyTraffic(inst); err != nil {
+			log.Printf("[%s] failed to flush traffic: %v", inst.Site.Name, err)
+		}
 	}
 }
 
-func (pm *ProxyManager) flushProxyTraffic(inst *ProxyInstance) {
+// flushProxyTraffic persists inst's pending bytes into the DB and moves them
+// into the persisted baseline. The caller must hold pm.mu (read or write);
+// inst.trafficMu is acquired here. On failure the pending counters are fully
+// restored so the next flush retries the same bytes. Never call this from
+// code that already holds inst.trafficMu (no nested re-entry).
+func (pm *ProxyManager) flushProxyTraffic(inst *ProxyInstance) error {
+	inst.trafficMu.Lock()
+	defer inst.trafficMu.Unlock()
+	return pm.flushProxyTrafficLocked(inst)
+}
+
+// flushProxyTrafficLocked is the body of flushProxyTraffic and assumes
+// inst.trafficMu is held. Order is swap -> DB -> persisted baseline: the
+// pending counters are zeroed first, the baseline moves only after the DB
+// transaction commits, and the counters are restored verbatim on any error.
+func (pm *ProxyManager) flushProxyTrafficLocked(inst *ProxyInstance) error {
 	in := inst.bytesIn.Swap(0)
 	out := inst.bytesOut.Swap(0)
 	if in == 0 && out == 0 {
-		return
+		return nil
 	}
 	if err := pm.database.addTraffic(inst.Site.ID, in, out); err != nil {
 		inst.bytesIn.Add(in)
 		inst.bytesOut.Add(out)
-		log.Printf("[%s] failed to flush traffic: %v", inst.Site.Name, err)
-		return
+		return err
 	}
 	delta := in + out
 	inst.persistedTraffic.Add(delta)
 	inst.Site.TrafficUsed += delta
+	return nil
+}
+
+// sameTrafficHour reports whether a persisted recorded_at value falls in the
+// same wall-clock hour as now. Stored rows are wall-clock values: legacy
+// "2006-01-02 15:04:05" rows carry the writer's local time, and the modernc
+// SQLite driver re-serializes DATETIME columns as RFC3339 with the stored
+// wall clock in UTC (it attaches Z to whatever text was written). The
+// year/month/day/hour components of the stored value are therefore compared
+// against the current local wall clock, never the instants: an instant-based
+// comparison would shift the bucket by the zone offset in non-UTC
+// deployments. Values that parse as neither format never match, so a corrupt
+// or foreign string cannot swallow pending bytes.
+func sameTrafficHour(recordedAt string, now time.Time) bool {
+	t, err := time.Parse(time.RFC3339Nano, recordedAt)
+	if err != nil {
+		if t, err = time.ParseInLocation("2006-01-02 15:04:05", recordedAt, time.Local); err != nil {
+			return false
+		}
+	}
+	nowLocal := now.In(time.Local)
+	y, m, d := t.Date()
+	ny, nm, nd := nowLocal.Date()
+	return y == ny && m == nm && d == nd && t.Hour() == nowLocal.Hour()
+}
+
+// mergePendingIntoLogs merges live pending bytes into the current-hour bucket
+// of the returned log copy: it adds to the existing bucket when present, or
+// appends a synthetic bucket with ID 0 when the hour has no bucket yet and
+// pending bytes are non-zero. A zero pending pair is a no-op. The input slice
+// must be a private copy (GetTrafficLogs always returns one). The current
+// hour is matched by wall-clock semantics via sameTrafficHour, so rows
+// persisted in either the RFC3339 form the SQLite driver returns or the
+// legacy SQL layout merge correctly. The synthetic bucket is built from the
+// current local wall hour stamped as UTC, exactly the representation the next
+// addTraffic row will carry after the driver re-serializes it, with ID 0.
+func mergePendingIntoLogs(logs []TrafficLog, siteID, pendingIn, pendingOut int64) []TrafficLog {
+	if pendingIn == 0 && pendingOut == 0 {
+		return logs
+	}
+	now := time.Now()
+	for i := range logs {
+		if sameTrafficHour(logs[i].RecordedAt, now) {
+			logs[i].BytesIn += pendingIn
+			logs[i].BytesOut += pendingOut
+			return logs
+		}
+	}
+	nowLocal := now.In(time.Local)
+	return append(logs, TrafficLog{
+		ID:         0,
+		SiteID:     siteID,
+		BytesIn:    pendingIn,
+		BytesOut:   pendingOut,
+		RecordedAt: time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day(), nowLocal.Hour(), 0, 0, 0, time.UTC).Format(time.RFC3339),
+	})
+}
+
+// SiteTrafficHistory captures a single site's traffic history as a consistent
+// point-in-time view: the DB log window plus live pending bytes merged into
+// the returned copy's current-hour bucket, alongside the authoritative live
+// state. For a running site the DB read and the live counters happen under
+// inst.trafficMu (with pm.mu held read-only to pin the instance), so the view
+// never interleaves with a concurrent flush.
+func (pm *ProxyManager) SiteTrafficHistory(site Site, hours int) (*TrafficHistory, error) {
+	snap := SiteTraffic{
+		ID:               site.ID,
+		Name:             site.Name,
+		TrafficQuota:     site.TrafficQuota,
+		PersistedTraffic: site.TrafficUsed,
+		TrafficUsed:      site.TrafficUsed,
+	}
+
+	pm.mu.RLock()
+	inst, running := pm.proxies[site.ID]
+	if !running {
+		pm.mu.RUnlock()
+		logs, err := pm.database.GetTrafficLogs(site.ID, hours)
+		if err != nil {
+			return nil, err
+		}
+		return &TrafficHistory{Snapshot: snap, Logs: logs}, nil
+	}
+	// pm.mu -> trafficMu lock order. trafficMu stays held across the DB read
+	// so the logs and the live counters describe the same instant.
+	inst.trafficMu.Lock()
+	defer inst.trafficMu.Unlock()
+	defer pm.mu.RUnlock()
+
+	logs, err := pm.database.GetTrafficLogs(site.ID, hours)
+	if err != nil {
+		return nil, err
+	}
+	snap.Running = true
+	snap.PersistedTraffic = inst.persistedTraffic.Load()
+	snap.BytesIn = inst.bytesIn.Load()
+	snap.BytesOut = inst.bytesOut.Load()
+	snap.TrafficUsed = snap.PersistedTraffic + snap.BytesIn + snap.BytesOut
+	snap.Requests = inst.reqCount.Load()
+	logs = mergePendingIntoLogs(logs, site.ID, snap.BytesIn, snap.BytesOut)
+	return &TrafficHistory{Snapshot: snap, Logs: logs}, nil
+}
+
+// overlaySiteTrafficLocked fills st with the authoritative live per-instance
+// state for a running site: persistedTraffic + pending bytes, exactly the same
+// merge every traffic view renders. The caller must hold pm.mu (read or
+// write); inst.trafficMu is acquired here following the pm.mu -> trafficMu
+// lock order, so the overlay never interleaves with a concurrent flush. This
+// is the single per-site merge algorithm for all live traffic payloads.
+func (pm *ProxyManager) overlaySiteTrafficLocked(s Site, st *SiteTraffic) {
+	if inst, ok := pm.proxies[s.ID]; ok {
+		inst.trafficMu.Lock()
+		st.Running = true
+		st.PersistedTraffic = inst.persistedTraffic.Load()
+		st.BytesIn = inst.bytesIn.Load()
+		st.BytesOut = inst.bytesOut.Load()
+		st.TrafficUsed = st.PersistedTraffic + st.BytesIn + st.BytesOut
+		st.Requests = inst.reqCount.Load()
+		inst.trafficMu.Unlock()
+	}
+}
+
+// LiveSiteTraffic overlays the authoritative live traffic state (persisted
+// baseline plus pending bytes, under each instance's trafficMu) onto the given
+// DB sites and returns it as a map keyed by site ID. One pm.mu read lock is
+// taken for the whole map, so the view is consistent and there is no N+1 lock
+// churn; the lock order is pm.mu -> trafficMu.
+func (pm *ProxyManager) LiveSiteTraffic(sites []Site) map[int64]SiteTraffic {
+	live := make(map[int64]SiteTraffic, len(sites))
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	for _, s := range sites {
+		st := SiteTraffic{
+			ID:               s.ID,
+			Name:             s.Name,
+			TrafficQuota:     s.TrafficQuota,
+			PersistedTraffic: s.TrafficUsed,
+			TrafficUsed:      s.TrafficUsed,
+		}
+		pm.overlaySiteTrafficLocked(s, &st)
+		live[s.ID] = st
+	}
+	return live
+}
+
+// TrafficSnapshot builds the authoritative global traffic payload: every DB
+// site, overlaid with live per-instance state for running sites. Dashboard,
+// traffic overview and SSE events all render this single payload.
+func (pm *ProxyManager) TrafficSnapshot() (*TrafficSnapshot, error) {
+	sites, err := pm.database.ListSites()
+	if err != nil {
+		return nil, err
+	}
+	snap := &TrafficSnapshot{
+		TotalSites: len(sites),
+		LiveSites:  make([]SiteTraffic, 0, len(sites)),
+	}
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	snap.RunningSites = len(pm.proxies)
+	for _, s := range sites {
+		st := SiteTraffic{
+			ID:               s.ID,
+			Name:             s.Name,
+			TrafficQuota:     s.TrafficQuota,
+			PersistedTraffic: s.TrafficUsed,
+			TrafficUsed:      s.TrafficUsed,
+		}
+		if s.Enabled {
+			snap.OnlineSites++
+		}
+		pm.overlaySiteTrafficLocked(s, &st)
+		snap.TotalTraffic += st.TrafficUsed
+		snap.TotalRequests += st.Requests
+		snap.LiveSites = append(snap.LiveSites, st)
+	}
+	snap.UptimeSeconds = int64(time.Since(startTime).Seconds())
+	return snap, nil
 }
 
 func (pm *ProxyManager) GetRunningCount() int {
@@ -1991,17 +2224,6 @@ func (pm *ProxyManager) GracefulShutdown(ctx context.Context) {
 		inst.server.Shutdown(ctx)
 		delete(pm.proxies, id)
 	}
-}
-
-// GetTotalRequests returns total request count across all proxies
-func (pm *ProxyManager) GetTotalRequests() int64 {
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-	var total int64
-	for _, inst := range pm.proxies {
-		total += inst.reqCount.Load()
-	}
-	return total
 }
 
 type DiagResult struct {
@@ -3043,13 +3265,12 @@ func (a *App) handleAuthCheck(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/dashboard
 func (a *App) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	stats, err := a.db.DashboardStats()
+	snap, err := a.pm.TrafficSnapshot()
 	if err != nil {
 		a.jsonErr(w, http.StatusInternalServerError, "dashboard unavailable")
 		return
 	}
-	stats["running_sites"] = a.pm.GetRunningCount()
-	a.jsonOK(w, stats)
+	a.jsonOK(w, snap)
 }
 
 // GET/POST /api/sites
@@ -3061,6 +3282,11 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, 500, err.Error())
 			return
 		}
+		// Overlay the authoritative live traffic state (persisted + pending)
+		// for running sites, exactly the merge TrafficSnapshot renders; every
+		// non-traffic field keeps its DB value. One pm.mu read lock covers the
+		// whole map, so there is no N+1 lock handoff per site.
+		live := a.pm.LiveSiteTraffic(sites)
 		// Add running status
 		type SiteWithStatus struct {
 			Site
@@ -3068,7 +3294,9 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 		}
 		result := make([]SiteWithStatus, len(sites))
 		for i, s := range sites {
-			result[i] = SiteWithStatus{Site: s, Running: a.pm.IsRunning(s.ID)}
+			st := live[s.ID]
+			result[i] = SiteWithStatus{Site: s, Running: st.Running}
+			result[i].TrafficUsed = st.TrafficUsed
 		}
 		a.jsonOK(w, result)
 
@@ -3177,33 +3405,57 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 	case action == "toggle" && r.Method == "POST":
 		a.siteLifecycleMu.Lock()
 		defer a.siteLifecycleMu.Unlock()
-		newState, err := a.db.ToggleSite(id)
+		site, err := a.db.GetSite(id)
 		if err != nil {
 			a.jsonErr(w, 500, err.Error())
 			return
 		}
-		if newState {
-			site, err := a.db.GetSite(id)
-			if err != nil {
-				if _, revertErr := a.db.ToggleSite(id); revertErr != nil {
-					a.jsonErr(w, 500, fmt.Sprintf("load site: %v; rollback toggle: %v", err, revertErr))
-					return
-				}
+		if site.Enabled {
+			// Turning off: stop (and flush) before flipping the flag, so a failed
+			// flush aborts with the instance still running and the flag still on
+			// - instance and DB stay consistent.
+			if err := a.pm.StopSite(id); err != nil {
 				a.jsonErr(w, 500, err.Error())
 				return
 			}
-			if err := a.pm.StartSite(*site); err != nil {
-				if _, revertErr := a.db.ToggleSite(id); revertErr != nil {
-					a.jsonErr(w, 500, fmt.Sprintf("start site: %v; rollback toggle: %v", err, revertErr))
-					return
+			if _, err := a.db.ToggleSite(id); err != nil {
+				// The instance is stopped but the flag stayed on: restart it so the
+				// DB and the running set stay consistent.
+				if restarted, getErr := a.db.GetSite(id); getErr == nil {
+					if startErr := a.pm.StartSite(*restarted); startErr == nil {
+						a.jsonErr(w, 500, fmt.Sprintf("toggle off: %v", err))
+						return
+					}
 				}
-				a.jsonErr(w, 500, err.Error())
+				a.jsonErr(w, 500, fmt.Sprintf("toggle off: %v; site stopped but flag update failed", err))
 				return
 			}
-		} else {
-			a.pm.StopSite(id)
+			a.jsonOK(w, map[string]interface{}{"enabled": false})
+			return
 		}
-		a.jsonOK(w, map[string]interface{}{"enabled": newState})
+		// Turning on: flip the flag first so a failed start can roll it back.
+		if _, err := a.db.ToggleSite(id); err != nil {
+			a.jsonErr(w, 500, err.Error())
+			return
+		}
+		site, err = a.db.GetSite(id)
+		if err != nil {
+			if _, revertErr := a.db.ToggleSite(id); revertErr != nil {
+				a.jsonErr(w, 500, fmt.Sprintf("load site: %v; rollback toggle: %v", err, revertErr))
+				return
+			}
+			a.jsonErr(w, 500, err.Error())
+			return
+		}
+		if err := a.pm.StartSite(*site); err != nil {
+			if _, revertErr := a.db.ToggleSite(id); revertErr != nil {
+				a.jsonErr(w, 500, fmt.Sprintf("start site: %v; rollback toggle: %v", err, revertErr))
+				return
+			}
+			a.jsonErr(w, 500, err.Error())
+			return
+		}
+		a.jsonOK(w, map[string]interface{}{"enabled": true})
 
 	case action == "diag" && r.Method == "GET":
 		site, err := a.db.GetSite(id)
@@ -3290,20 +3542,61 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		needsPreStop := oldSite.Enabled && oldSite.ListenPort == candidate.ListenPort && a.pm.IsRunning(id)
+		if needsPreStop {
+			// Stop (and flush) before the DB update, so a failed flush aborts with
+			// the old config still in the DB and the old instance still running -
+			// instance and DB stay consistent.
+			if err := a.pm.StopSite(id); err != nil {
+				a.jsonErr(w, 500, err.Error())
+				return
+			}
+		}
 		if err := a.db.UpdateSiteRecord(candidate); err != nil {
+			if needsPreStop {
+				// The instance is stopped; bring it back from a fresh read (which
+				// includes the flushed traffic) so the DB flag and the running set
+				// stay consistent. If even the reload fails, say so explicitly:
+				// the enabled row must never silently sit without an instance.
+				restored, getErr := a.db.GetSite(id)
+				if getErr != nil {
+					a.jsonErr(w, 500, fmt.Sprintf("update site: %v; site stopped and reload failed: %v", err, getErr))
+					return
+				}
+				if restartErr := a.pm.StartSite(*restored); restartErr != nil {
+					a.jsonErr(w, 500, fmt.Sprintf("update site: %v; restore instance: %v", err, restartErr))
+					return
+				}
+			}
 			a.jsonErr(w, 500, err.Error())
 			return
 		}
 		site, err := a.db.GetSite(id)
 		if err != nil {
+			// The record was already updated but cannot be reloaded for the
+			// restart: roll the DB back to the old record so the enabled flag
+			// never points at a configuration that never ran, then bring the
+			// pre-stopped instance back from a fresh read. Any failure in the
+			// rollback itself is reported explicitly.
+			if rollbackErr := a.db.UpdateSiteRecord(*oldSite); rollbackErr != nil {
+				a.jsonErr(w, 500, fmt.Sprintf("reload updated site: %v; rollback update: %v", err, rollbackErr))
+				return
+			}
+			restoredSite, getErr := a.db.GetSite(id)
+			if getErr != nil {
+				a.jsonErr(w, 500, fmt.Sprintf("reload updated site: %v; reload rollback site: %v", err, getErr))
+				return
+			}
+			if needsPreStop {
+				if restartErr := a.pm.StartSite(*restoredSite); restartErr != nil {
+					a.jsonErr(w, 500, fmt.Sprintf("reload updated site: %v; restored configuration is enabled but proxy is not running: %v", err, restartErr))
+					return
+				}
+			}
 			a.jsonErr(w, 500, err.Error())
 			return
 		}
 		if site.Enabled {
-			needsPreStop := oldSite.Enabled && oldSite.ListenPort == site.ListenPort && a.pm.IsRunning(id)
-			if needsPreStop {
-				a.pm.StopSite(id)
-			}
 			if err := a.pm.StartSite(*site); err != nil {
 				if rollbackErr := a.db.UpdateSiteRecord(*oldSite); rollbackErr != nil {
 					a.jsonErr(w, 500, fmt.Sprintf("start updated site: %v; rollback update: %v", err, rollbackErr))
@@ -3329,8 +3622,28 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 	case action == "" && r.Method == "DELETE":
 		a.siteLifecycleMu.Lock()
 		defer a.siteLifecycleMu.Unlock()
-		a.pm.StopSite(id)
+		// Only delete the DB row after the instance stopped cleanly (flush
+		// succeeded); a failed flush aborts with the instance and row intact.
+		if err := a.pm.StopSite(id); err != nil {
+			a.jsonErr(w, 500, err.Error())
+			return
+		}
 		if err := a.db.DeleteSite(id); err != nil {
+			// The row survived the delete, so an enabled site must not be left
+			// without a running instance: restart it from a fresh read (which
+			// includes the traffic StopSite flushed). Failures in the restore
+			// are reported explicitly instead of claiming success.
+			restored, getErr := a.db.GetSite(id)
+			if getErr != nil {
+				a.jsonErr(w, 500, fmt.Sprintf("delete site: %v; site stopped and reload failed: %v", err, getErr))
+				return
+			}
+			if restored.Enabled {
+				if restartErr := a.pm.StartSite(*restored); restartErr != nil {
+					a.jsonErr(w, 500, fmt.Sprintf("delete site: %v; restore instance: %v", err, restartErr))
+					return
+				}
+			}
 			a.jsonErr(w, 500, err.Error())
 			return
 		}
@@ -3341,18 +3654,24 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// GET /api/traffic/{site_id}
+// GET /api/traffic/{site_id} and GET /api/traffic/{site_id}/snapshot
 func (a *App) handleTraffic(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/traffic/")
 
 	if path == "overview" {
-		stats, err := a.db.DashboardStats()
+		snap, err := a.pm.TrafficSnapshot()
 		if err != nil {
 			a.jsonErr(w, http.StatusInternalServerError, "traffic overview unavailable")
 			return
 		}
-		a.jsonOK(w, stats)
+		a.jsonOK(w, snap)
 		return
+	}
+
+	envelope := false
+	if strings.HasSuffix(path, "/snapshot") {
+		envelope = true
+		path = strings.TrimSuffix(path, "/snapshot")
 	}
 
 	siteID, err := strconv.ParseInt(path, 10, 64)
@@ -3371,12 +3690,32 @@ func (a *App) handleTraffic(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	logs, err := a.db.GetTrafficLogs(siteID, hours)
+	site, err := a.db.GetSite(siteID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			if envelope {
+				a.jsonErr(w, http.StatusNotFound, "site not found")
+				return
+			}
+			// The legacy endpoint keeps returning an empty log array for
+			// unknown sites.
+			a.jsonOK(w, []TrafficLog{})
+			return
+		}
+		a.jsonErr(w, 500, err.Error())
+		return
+	}
+
+	history, err := a.pm.SiteTrafficHistory(*site, hours)
 	if err != nil {
 		a.jsonErr(w, 500, err.Error())
 		return
 	}
-	a.jsonOK(w, logs)
+	if envelope {
+		a.jsonOK(w, history)
+		return
+	}
+	a.jsonOK(w, history.Logs)
 }
 
 // GET /api/ua-profiles
@@ -3425,31 +3764,12 @@ func (a *App) handleSSE(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
-	stats, err := a.db.DashboardStats()
+	snap, err := a.pm.TrafficSnapshot()
 	if err != nil {
 		return err
 	}
-	stats["running_sites"] = a.pm.GetRunningCount()
-	stats["total_requests"] = a.pm.GetTotalRequests()
-	stats["uptime_seconds"] = int(time.Since(startTime).Seconds())
 
-	// Collect per-site live stats
-	a.pm.mu.RLock()
-	siteStats := make([]map[string]interface{}, 0)
-	for _, inst := range a.pm.proxies {
-		siteStats = append(siteStats, map[string]interface{}{
-			"id":        inst.Site.ID,
-			"name":      inst.Site.Name,
-			"bytes_in":  inst.bytesIn.Load(),
-			"bytes_out": inst.bytesOut.Load(),
-			"requests":  inst.reqCount.Load(),
-			"running":   true,
-		})
-	}
-	a.pm.mu.RUnlock()
-	stats["live_sites"] = siteStats
-
-	data, err := json.Marshal(stats)
+	data, err := json.Marshal(snap)
 	if err != nil {
 		return err
 	}

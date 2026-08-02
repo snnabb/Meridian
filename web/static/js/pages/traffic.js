@@ -31,12 +31,18 @@ function renderTraffic() {
 
   document.getElementById('traffic-site-select').onchange = loadTrafficChart;
   document.getElementById('traffic-hours-select').onchange = loadTrafficChart;
+
+  startTrafficRefresh();
 }
 
 async function loadTrafficSites() {
   try {
     const sites = await API.listSites();
+    // The page may have been left (or re-rendered) while the request was in
+    // flight; only touch the live DOM when traffic is still the active route.
+    if (Router.current !== 'traffic') return;
     const sel = document.getElementById('traffic-site-select');
+    if (!sel) return;
     if (!sites || sites.length === 0) {
       sel.innerHTML = '<option value="">暂无站点</option>';
       return;
@@ -54,9 +60,14 @@ async function loadTrafficChart() {
   if (!siteId) return;
 
   try {
-    const logs = await API.getTraffic(siteId, hours);
-    const sites = await API.listSites();
-    const site = sites.find(s => s.id === parseInt(siteId));
+    // Single {snapshot, logs} request: snapshot carries the live total
+    // (persisted + pending) for the totals cards, logs already include the
+    // current hour's pending bytes merged in, so the chart is live too.
+    const data = await API.getTrafficSnapshot(siteId, hours);
+    if (!data || !trafficChartStillCurrent(siteId, hours)) return;
+
+    const snapshot = data.snapshot || {};
+    const logs = data.logs || [];
 
     // Update totals
     const totalIn = logs.reduce((a, l) => a + (l.bytes_in || 0), 0);
@@ -73,8 +84,8 @@ async function loadTrafficChart() {
       </div>
       <div class="total-card fade-up stagger-5">
         <div class="total-label">累计使用</div>
-        <div class="total-value">${formatBytes(site ? site.traffic_used : 0)}</div>
-        ${site && site.traffic_quota > 0 ? `<div class="total-delta" style="color:var(--white-38)">额度 ${formatBytes(site.traffic_quota)}</div>` : ''}
+        <div class="total-value">${formatBytes(snapshot.traffic_used || 0)}</div>
+        ${snapshot.traffic_quota > 0 ? `<div class="total-delta" style="color:var(--white-38)">额度 ${formatBytes(snapshot.traffic_quota)}</div>` : ''}
       </div>
     `;
 
@@ -82,6 +93,30 @@ async function loadTrafficChart() {
   } catch (e) {
     console.error('Traffic load error:', e);
   }
+}
+
+// A chart request may finish after the user navigated away or switched site/
+// hours; those late responses must not paint over the new page or selection.
+function trafficChartStillCurrent(siteId, hours) {
+  if (Router.current !== 'traffic') return false;
+  const sel = document.getElementById('traffic-site-select');
+  const hoursSel = document.getElementById('traffic-hours-select');
+  return !!sel && !!hoursSel && sel.value === siteId && parseInt(hoursSel.value) === hours;
+}
+
+let trafficRefreshTimer = null;
+
+function startTrafficRefresh() {
+  stopTrafficRefresh();
+  trafficRefreshTimer = setInterval(() => {
+    if (Router.current === 'traffic') loadTrafficChart();
+  }, 15000);
+}
+
+function stopTrafficRefresh() {
+  if (!trafficRefreshTimer) return;
+  clearInterval(trafficRefreshTimer);
+  trafficRefreshTimer = null;
 }
 
 function drawTrafficChart(logs, hours) {
