@@ -1997,6 +1997,8 @@ func TestRedirectFollowStripsSensitiveHeadersCrossOrigin(t *testing.T) {
 	request.Header.Set("Cookie", "session=secret-cookie")
 	request.Header.Set("Authorization", "Bearer opaque-bearer")
 	request.Header.Set("X-Emby-Authorization", `MediaBrowser Device="TV", DeviceId="device-1", Token="emby-access-token", Client="old", Version="old"`)
+	request.Header.Set("X-Emby-Token", "emby-access-token")
+	request.Header.Set("X-MediaBrowser-Token", "emby-access-token")
 	applyUAProfileHeaders(request.Header, profile)
 	response, err := transport.RoundTrip(request)
 	if err != nil {
@@ -2012,6 +2014,12 @@ func TestRedirectFollowStripsSensitiveHeadersCrossOrigin(t *testing.T) {
 	}
 	if got := followedHeaders.Get("Authorization"); got != "" {
 		t.Fatalf("Authorization forwarded across origin: %q", got)
+	}
+	if got := followedHeaders.Get("X-Emby-Token"); got != "" {
+		t.Fatalf("X-Emby-Token forwarded across origin: %q", got)
+	}
+	if got := followedHeaders.Get("X-MediaBrowser-Token"); got != "" {
+		t.Fatalf("X-MediaBrowser-Token forwarded across origin: %q", got)
 	}
 	emby := followedHeaders.Get("X-Emby-Authorization")
 	if strings.Contains(emby, "emby-access-token") {
@@ -2080,6 +2088,175 @@ func TestRedirectFollowKeepsHeadersSameOrigin(t *testing.T) {
 	emby := followedHeaders.Get("X-Emby-Authorization")
 	if !strings.Contains(emby, "emby-access-token") {
 		t.Fatalf("Emby token lost on same-origin redirect: %q", emby)
+	}
+}
+
+func TestStripEmbyAuthorizationToken(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    string
+		want     string
+		wantSafe bool
+	}{
+		{
+			name:     "removes token and keeps identity",
+			value:    `MediaBrowser Client="App", Device="TV", DeviceId="d1", Token="secret", Version="1"`,
+			want:     `MediaBrowser Client="App", Device="TV", DeviceId="d1", Token="", Version="1"`,
+			wantSafe: true,
+		},
+		{
+			name:     "emby scheme is stripped like mediabrowser",
+			value:    `Emby Device="TV", Token="secret"`,
+			want:     `Emby Device="TV", Token=""`,
+			wantSafe: true,
+		},
+		{
+			name:     "leading whitespace is preserved",
+			value:    `  MediaBrowser Token="secret"`,
+			want:     `  MediaBrowser Token=""`,
+			wantSafe: true,
+		},
+		{
+			name:     "value without token is unchanged",
+			value:    `MediaBrowser Client="App"`,
+			want:     `MediaBrowser Client="App"`,
+			wantSafe: true,
+		},
+		{
+			name:     "bare scheme has no token",
+			value:    `MediaBrowser`,
+			want:     `MediaBrowser`,
+			wantSafe: true,
+		},
+		{
+			name:     "empty value has no token",
+			value:    "",
+			want:     "",
+			wantSafe: true,
+		},
+		{
+			name:     "duplicate token fails closed",
+			value:    `MediaBrowser Token="a", Token="b"`,
+			want:     `MediaBrowser Token="a", Token="b"`,
+			wantSafe: false,
+		},
+		{
+			name:     "unterminated attribute fails closed",
+			value:    `MediaBrowser Client="unterminated`,
+			want:     `MediaBrowser Client="unterminated`,
+			wantSafe: false,
+		},
+		{
+			name:     "unknown scheme fails closed",
+			value:    `Bearer opaque-bearer`,
+			want:     `Bearer opaque-bearer`,
+			wantSafe: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, safe := stripEmbyAuthorizationToken(tt.value)
+			if got != tt.want {
+				t.Fatalf("stripped = %q, want %q", got, tt.want)
+			}
+			if safe != tt.wantSafe {
+				t.Fatalf("safe = %v, want %v", safe, tt.wantSafe)
+			}
+		})
+	}
+}
+
+func TestStripSensitiveRedirectHeadersRemovesDedicatedTokenHeaders(t *testing.T) {
+	header := http.Header{
+		"X-Emby-Authorization": []string{`MediaBrowser Device="TV", Token="emby-access-token", Client="old"`},
+		"X-Emby-Token":         []string{"emby-access-token"},
+		"X-MediaBrowser-Token": []string{"emby-access-token"},
+		"Authorization":        []string{"Bearer opaque-bearer"},
+		"Cookie":               []string{"session=secret"},
+		"X-Forwarded-For":      []string{"10.0.0.1"},
+	}
+	stripSensitiveRedirectHeaders(header)
+	if got := header.Get("X-Emby-Token"); got != "" {
+		t.Fatalf("X-Emby-Token forwarded: %q", got)
+	}
+	if got := header.Get("X-MediaBrowser-Token"); got != "" {
+		t.Fatalf("X-MediaBrowser-Token forwarded: %q", got)
+	}
+	if got := header.Get("Cookie"); got != "" {
+		t.Fatalf("Cookie forwarded: %q", got)
+	}
+	if got := header.Get("Authorization"); got != "" {
+		t.Fatalf("Authorization forwarded: %q", got)
+	}
+	emby := header.Get("X-Emby-Authorization")
+	if strings.Contains(emby, "emby-access-token") {
+		t.Fatalf("Emby access token forwarded: %q", emby)
+	}
+	if !strings.Contains(emby, `Device="TV"`) {
+		t.Fatalf("identity fields lost: %q", emby)
+	}
+	if got := header.Get("X-Forwarded-For"); got != "10.0.0.1" {
+		t.Fatalf("non-sensitive header dropped: %q", got)
+	}
+}
+
+func TestStripSensitiveRedirectHeadersDropsUnsafeEmbyAuthorization(t *testing.T) {
+	header := http.Header{
+		"X-Emby-Authorization": []string{`MediaBrowser Token="a", Token="b", Device="TV"`},
+	}
+	stripSensitiveRedirectHeaders(header)
+	if got := header.Values("X-Emby-Authorization"); len(got) != 0 {
+		t.Fatalf("unsafe authorization value forwarded: %q", got)
+	}
+}
+
+func TestRedirectFollowDropsUnsafeEmbyAuthorizationCrossOrigin(t *testing.T) {
+	// A value with a duplicate Token cannot be stripped safely, so the whole
+	// header must be dropped on a cross-authority hop instead of being
+	// forwarded with a token intact.
+	target, err := normalizeTargetURL("https://media.example.com")
+	if err != nil {
+		t.Fatalf("normalize target: %v", err)
+	}
+	profile := UAProfile{Name: "Custom", UserAgent: "Meridian Test/1.0", Client: "Meridian Test", Version: "1.0.0"}
+	var followedHeaders http.Header
+	calls := 0
+	transport := &redirectFollowTransport{
+		playbackHosts: map[string]bool{redirectHostKey(target): true},
+		profile:       profile,
+		base: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			calls++
+			if calls == 1 {
+				return &http.Response{
+					StatusCode: http.StatusFound,
+					Header:     http.Header{"Location": []string{"https://media.example.com/Videos/1/stream"}},
+					Body:       io.NopCloser(strings.NewReader("")),
+					Request:    request,
+				}, nil
+			}
+			followedHeaders = request.Header.Clone()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("ok")),
+				Request:    request,
+			}, nil
+		}),
+	}
+	request := httptest.NewRequest(http.MethodGet, "https://api.example.com/Videos/1/stream", nil)
+	request.Header.Set("X-Emby-Authorization", `MediaBrowser Token="first", Token="second", Device="TV"`)
+	applyUAProfileHeaders(request.Header, profile)
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		t.Fatalf("follow redirect: %v", err)
+	}
+	response.Body.Close()
+
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+	if got := followedHeaders.Values("X-Emby-Authorization"); len(got) != 0 {
+		t.Fatalf("unsafe X-Emby-Authorization forwarded across origin: %q", got)
 	}
 }
 

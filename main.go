@@ -1055,11 +1055,13 @@ func rewriteEmbyAuthorizationHeaders(header http.Header, headerName string, prof
 	}
 }
 
-// stripEmbyAuthorizationToken blanks the Token attribute of an Emby
-// authorization value, leaving every other attribute byte-identical. Values
-// that cannot be parsed safely are returned untouched: they never carried a
-// recognizable token, and rewriting them risks corrupting a valid header.
-func stripEmbyAuthorizationToken(value string) string {
+// stripEmbyAuthorizationToken removes the Token attribute from an Emby
+// authorization value, leaving every other attribute byte-identical. The
+// boolean result reports whether the value is safe to forward: false means the
+// value carries (or may carry) an access token that could not be stripped, and
+// the caller must drop the entire header instead of forwarding it. Values
+// without any recognizable Token attribute are returned unchanged with true.
+func stripEmbyAuthorizationToken(value string) (string, bool) {
 	offset := 0
 	for offset < len(value) && isEmbyAuthWhitespace(value[offset]) {
 		offset++
@@ -1069,55 +1071,70 @@ func stripEmbyAuthorizationToken(value string) string {
 		offset++
 	}
 	if schemeStart == offset {
-		return value
+		// Empty or whitespace-only value: nothing to strip.
+		return value, true
 	}
 	scheme := value[schemeStart:offset]
 	if !strings.EqualFold(scheme, "MediaBrowser") && !strings.EqualFold(scheme, "Emby") {
-		return value
+		// Unknown scheme: it cannot be proven token-free, so fail closed.
+		return value, false
 	}
 	if offset < len(value) && !isEmbyAuthWhitespace(value[offset]) {
-		return value
+		return value, false
 	}
 	for offset < len(value) && isEmbyAuthWhitespace(value[offset]) {
 		offset++
 	}
 	if offset == len(value) {
-		return value
+		// A bare scheme carries no attributes and therefore no token.
+		return value, true
 	}
 	attributes, ok := parseEmbyAuthorizationAttributes(value, offset)
 	if !ok {
-		return value
+		return value, false
 	}
 	tokenIndex := -1
 	for index, attribute := range attributes {
 		if strings.EqualFold(attribute.name, "Token") {
 			if tokenIndex >= 0 {
-				return value
+				// Duplicate Token attributes cannot be stripped without
+				// guessing which one the server honors: fail closed.
+				return value, false
 			}
 			tokenIndex = index
 		}
 	}
 	if tokenIndex < 0 {
-		return value
+		return value, true
 	}
 	attribute := attributes[tokenIndex]
-	return value[:attribute.valueStart] + value[attribute.valueEnd:]
+	return value[:attribute.valueStart] + value[attribute.valueEnd:], true
 }
 
 // stripSensitiveRedirectHeaders removes browser credentials and access tokens
 // before a playback redirect crosses to a different authority. Only the Emby
 // identity fields (Client/Version/Device/DeviceId) survive, and the UA profile
-// is reapplied by the caller afterwards.
+// is reapplied by the caller afterwards. Cross-authority protection is
+// fail-closed: an X-Emby-Authorization value that may still carry a token is
+// dropped together with the whole header rather than forwarded.
 func stripSensitiveRedirectHeaders(header http.Header) {
 	header.Del("Cookie")
 	header.Del("Authorization")
 	header.Del("Proxy-Authorization")
+	// Dedicated token headers must not follow the hop either.
+	header.Del("X-Emby-Token")
+	header.Del("X-MediaBrowser-Token")
 	for name, values := range header {
 		if !strings.EqualFold(name, "X-Emby-Authorization") {
 			continue
 		}
 		for index, value := range values {
-			values[index] = stripEmbyAuthorizationToken(value)
+			stripped, safe := stripEmbyAuthorizationToken(value)
+			if !safe {
+				header.Del(name)
+				break
+			}
+			values[index] = stripped
 		}
 	}
 }

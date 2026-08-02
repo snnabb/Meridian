@@ -109,6 +109,34 @@ if MERIDIAN_BACKUP_DIR=/var/ bash -c 'source "$1"; validate_backup_dir' _ "${REP
     exit 1
 fi
 
+# Pre-release/build suffixes must not corrupt numeric version comparison:
+# v1.5.6-rc1 is patch 6, not patch 61.
+version_gt v1.5.10 v1.5.6-rc1 || { echo 'FAIL: v1.5.10 must be newer than v1.5.6-rc1' >&2; exit 1; }
+version_gt v1.5.6-rc1 v1.5.5 || { echo 'FAIL: v1.5.6-rc1 must be newer than v1.5.5' >&2; exit 1; }
+version_gt v1.6.0-rc1 v1.5.10 || { echo 'FAIL: v1.6.0-rc1 must be newer than v1.5.10' >&2; exit 1; }
+version_gt v2.0.0-beta.1 v1.9.9 || { echo 'FAIL: v2.0.0-beta.1 must be newer than v1.9.9' >&2; exit 1; }
+version_gt v1.5.7 v1.5.6-rc1 || { echo 'FAIL: v1.5.7 must be newer than v1.5.6-rc1' >&2; exit 1; }
+if version_gt v1.5.6-rc1 v1.5.6; then
+    echo 'FAIL: v1.5.6-rc1 must not compare as newer than v1.5.6' >&2
+    exit 1
+fi
+if version_gt v1.5.6 v1.5.6-rc1; then
+    echo 'FAIL: v1.5.6 must not compare as newer than v1.5.6-rc1' >&2
+    exit 1
+fi
+if version_gt v1.5.6+beta2 v1.5.6; then
+    echo 'FAIL: v1.5.6+beta2 must not compare as newer than v1.5.6' >&2
+    exit 1
+fi
+if version_gt v1.5.6 v1.5.6; then
+    echo 'FAIL: equal versions must not compare as newer' >&2
+    exit 1
+fi
+if version_gt v1.5.6 v1.5.10; then
+    echo 'FAIL: v1.5.6 must not compare as newer than v1.5.10' >&2
+    exit 1
+fi
+
 package_log="${TEST_ROOT}/package.log"
 for manager in apt dnf yum apk pacman; do
     : > "$package_log"
@@ -367,6 +395,307 @@ cmp -s "${DATA_DIR}/meridian.db" "${TEST_ROOT}/rollback-db-before" \
 cmp -s "${DATA_DIR}/.env" "${TEST_ROOT}/rollback-env-before" \
     || { echo 'FAIL: configuration was not restored after failed update' >&2; exit 1; }
 assert_contains "${TEST_ROOT}/update-rollback.log" '自动回滚'
+
+# A missing snapshot must fail the restore without touching the live data.
+rm -rf -- "$DATA_DIR" "${TEST_ROOT}/snapshot-missing"
+mkdir -p "$DATA_DIR"
+printf 'live-marker\n' > "${DATA_DIR}/live.txt"
+if restore_data_snapshot "${TEST_ROOT}/snapshot-missing" 2>/dev/null; then
+    echo 'FAIL: restore with a missing snapshot unexpectedly succeeded' >&2; exit 1
+fi
+assert_file "${DATA_DIR}/live.txt"
+
+# A snapshot without the configuration must be rejected before any swap: the
+# live directory stays byte-identical and no staging residue is left behind.
+rm -rf -- "${TEST_ROOT}/snapshot-noenv"
+mkdir -p "${TEST_ROOT}/snapshot-noenv/data"
+printf 'orphan\n' > "${TEST_ROOT}/snapshot-noenv/data/orphan.txt"
+if restore_data_snapshot "${TEST_ROOT}/snapshot-noenv" 2>/dev/null; then
+    echo 'FAIL: restore of a snapshot without .env unexpectedly succeeded' >&2; exit 1
+fi
+assert_file "${DATA_DIR}/live.txt"
+[ ! -e "${TEST_ROOT}/.data.restore.$$" ] || { echo 'FAIL: staging residue after rejected restore' >&2; exit 1; }
+
+# A failed swap must return non-zero and move the displaced directory back, so
+# the live data directory is never lost.
+rm -rf -- "$DATA_DIR" "${TEST_ROOT}/snapshot-swap-fail"
+mkdir -p "$DATA_DIR" "${TEST_ROOT}/snapshot-swap-fail/data"
+printf 'live-marker\n' > "${DATA_DIR}/live.txt"
+printf 'JWT_SECRET=swap-jwt-secret-00000000000000000000000000000\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nTRUSTED_PROXY_CIDRS=\n' \
+    "$DATA_DIR" > "${TEST_ROOT}/snapshot-swap-fail/data/.env"
+printf 'snapshot-db\n' > "${TEST_ROOT}/snapshot-swap-fail/data/meridian.db"
+restore_swap_log="${TEST_ROOT}/restore-swap.log"
+if (
+    as_root() {
+        printf '%s\n' "$*" >> "$restore_swap_log"
+        if [ "$1" = "mv" ] && [ "$2" = "-f" ] && [ "$3" = "--" ] \
+            && [ "$4" = "${TEST_ROOT}/.data.restore.$$" ]; then
+            return 1
+        fi
+        command "$@"
+    }
+    restore_data_snapshot "${TEST_ROOT}/snapshot-swap-fail"
+); then
+    echo 'FAIL: restore with a failing swap unexpectedly succeeded' >&2; exit 1
+fi
+assert_file "${DATA_DIR}/live.txt"
+assert_contains "$restore_swap_log" "mv -f -- $DATA_DIR"
+
+# A successful restore swaps in the snapshot contents and, outside systemd,
+# gives the calling user back ownership of the data directory.
+rm -rf -- "$DATA_DIR" "${TEST_ROOT}/snapshot-ok"
+mkdir -p "$DATA_DIR" "${TEST_ROOT}/snapshot-ok/data"
+printf 'JWT_SECRET=live-jwt-secret-000000000000000000000000000000\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nTRUSTED_PROXY_CIDRS=\n' \
+    "$DATA_DIR" > "${DATA_DIR}/.env"
+printf 'live-db\n' > "${DATA_DIR}/meridian.db"
+printf 'live-marker\n' > "${DATA_DIR}/live.txt"
+printf 'JWT_SECRET=snapshot-jwt-secret-0000000000000000000000000000\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nTRUSTED_PROXY_CIDRS=\n' \
+    "$DATA_DIR" > "${TEST_ROOT}/snapshot-ok/data/.env"
+printf 'snapshot-db\n' > "${TEST_ROOT}/snapshot-ok/data/meridian.db"
+printf 'snapshot-extra\n' > "${TEST_ROOT}/snapshot-ok/data/extra.txt"
+(
+    is_systemd() { return 1; }
+    restore_data_snapshot "${TEST_ROOT}/snapshot-ok"
+) || { echo 'FAIL: snapshot restore failed' >&2; exit 1; }
+[ ! -e "${DATA_DIR}/live.txt" ] || { echo 'FAIL: live files survived restore' >&2; exit 1; }
+assert_file "${DATA_DIR}/extra.txt"
+cmp -s "${DATA_DIR}/.env" "${TEST_ROOT}/snapshot-ok/data/.env" \
+    || { echo 'FAIL: .env not restored' >&2; exit 1; }
+cmp -s "${DATA_DIR}/meridian.db" "${TEST_ROOT}/snapshot-ok/data/meridian.db" \
+    || { echo 'FAIL: database not restored' >&2; exit 1; }
+[ "$(stat -c %u "$DATA_DIR")" = "$(id -u)" ] || { echo 'FAIL: data directory owner not restored to the calling user' >&2; exit 1; }
+[ "$(stat -c %a "$DATA_DIR")" = "750" ] || { echo 'FAIL: data directory mode not restored to 0750' >&2; exit 1; }
+
+# Under systemd the restore must leave DATA_DIR traversable and owned by the
+# service user, the database writable by the service user, and .env back at
+# root:SERVICE_GROUP 0640, matching prepare_data_and_config.
+rm -rf -- "$DATA_DIR" "${TEST_ROOT}/snapshot-systemd"
+mkdir -p "$DATA_DIR" "${TEST_ROOT}/snapshot-systemd/data"
+printf 'JWT_SECRET=systemd-jwt-secret-0000000000000000000000000000\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nTRUSTED_PROXY_CIDRS=\n' \
+    "$DATA_DIR" > "${DATA_DIR}/.env"
+printf 'live-db\n' > "${DATA_DIR}/meridian.db"
+cp "${DATA_DIR}/.env" "${TEST_ROOT}/snapshot-systemd/data/.env"
+cp "${DATA_DIR}/meridian.db" "${TEST_ROOT}/snapshot-systemd/data/meridian.db"
+restore_perm_log="${TEST_ROOT}/restore-perm.log"
+: > "$restore_perm_log"
+(
+    as_root() {
+        printf '%s\n' "$*" >> "$restore_perm_log"
+        command "$@"
+    }
+    is_systemd() { return 0; }
+    restore_data_snapshot "${TEST_ROOT}/snapshot-systemd"
+) || { echo 'FAIL: systemd snapshot restore failed' >&2; exit 1; }
+assert_contains "$restore_perm_log" "chown meridian:meridian $DATA_DIR"
+assert_contains "$restore_perm_log" "chmod 0750 $DATA_DIR"
+assert_contains "$restore_perm_log" "chown root:meridian ${DATA_DIR}/.env"
+assert_contains "$restore_perm_log" "chmod 0640 ${DATA_DIR}/.env"
+assert_contains "$restore_perm_log" "chown meridian:meridian ${DATA_DIR}/meridian.db"
+assert_contains "$restore_perm_log" "chmod 0600 ${DATA_DIR}/meridian.db"
+
+# A restore whose permission normalization fails must return non-zero (so
+# UPDATE_SNAPSHOT_RESTORED stays unset and the transaction is retried or
+# escalated) and must say what is broken, even though the data contents were
+# already swapped in.
+rm -rf -- "$DATA_DIR" "${TEST_ROOT}/snapshot-permfail"
+mkdir -p "$DATA_DIR" "${TEST_ROOT}/snapshot-permfail/data"
+printf 'JWT_SECRET=permfail-jwt-secret-00000000000000000000000000\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nTRUSTED_PROXY_CIDRS=\n' \
+    "$DATA_DIR" > "${DATA_DIR}/.env"
+printf 'live-db\n' > "${DATA_DIR}/meridian.db"
+printf 'JWT_SECRET=permfail-snapshot-secret-0000000000000000000000\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nTRUSTED_PROXY_CIDRS=\n' \
+    "$DATA_DIR" > "${TEST_ROOT}/snapshot-permfail/data/.env"
+printf 'snapshot-db\n' > "${TEST_ROOT}/snapshot-permfail/data/meridian.db"
+perm_fail_out="${TEST_ROOT}/restore-permfail.out"
+if (
+    as_root() {
+        if [ "$1" = "chown" ]; then return 1; fi
+        command "$@"
+    }
+    is_systemd() { return 0; }
+    restore_data_snapshot "${TEST_ROOT}/snapshot-permfail"
+) >"$perm_fail_out" 2>&1; then
+    echo 'FAIL: restore with failing permission fix unexpectedly succeeded' >&2; exit 1
+fi
+cmp -s "${DATA_DIR}/meridian.db" "${TEST_ROOT}/snapshot-permfail/data/meridian.db" \
+    || { echo 'FAIL: database content not restored despite permission failure' >&2; exit 1; }
+assert_contains "$perm_fail_out" '无法设置数据目录属主'
+assert_contains "$perm_fail_out" '请手动修复'
+
+# A restore that cannot remove the displaced directory must return non-zero,
+# keep the live DATA_DIR on the restored contents, and name the residue for
+# manual cleanup.
+rm -rf -- "$DATA_DIR" "${TEST_ROOT}/snapshot-oldresidue"
+mkdir -p "$DATA_DIR" "${TEST_ROOT}/snapshot-oldresidue/data"
+printf 'JWT_SECRET=oldresidue-jwt-secret-000000000000000000000000\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nTRUSTED_PROXY_CIDRS=\n' \
+    "$DATA_DIR" > "${DATA_DIR}/.env"
+printf 'live-db\n' > "${DATA_DIR}/meridian.db"
+printf 'JWT_SECRET=oldresidue-snapshot-secret-000000000000000000000\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nTRUSTED_PROXY_CIDRS=\n' \
+    "$DATA_DIR" > "${TEST_ROOT}/snapshot-oldresidue/data/.env"
+printf 'snapshot-db\n' > "${TEST_ROOT}/snapshot-oldresidue/data/meridian.db"
+old_residue_out="${TEST_ROOT}/restore-oldresidue.out"
+if (
+    as_root() {
+        if [ "$1" = "rm" ]; then return 1; fi
+        command "$@"
+    }
+    is_systemd() { return 1; }
+    restore_data_snapshot "${TEST_ROOT}/snapshot-oldresidue"
+) >"$old_residue_out" 2>&1; then
+    echo 'FAIL: restore with uncleaned old directory unexpectedly succeeded' >&2; exit 1
+fi
+cmp -s "${DATA_DIR}/meridian.db" "${TEST_ROOT}/snapshot-oldresidue/data/meridian.db" \
+    || { echo 'FAIL: database content not restored' >&2; exit 1; }
+assert_contains "$old_residue_out" '旧数据目录残留'
+assert_contains "$old_residue_out" "${TEST_ROOT}/.data.pre-restore.$$"
+[ -d "${TEST_ROOT}/.data.pre-restore.$$" ] || { echo 'FAIL: displaced directory was not preserved for manual cleanup' >&2; exit 1; }
+
+# The update transaction cleanup must remove the root-owned snapshot through
+# as_root (a plain rm would silently leave root-owned files behind) and must
+# say so when the cleanup itself fails.
+update_tmp="${TEST_ROOT}/update-tmp"
+mkdir -p "$update_tmp"
+rm_log="${TEST_ROOT}/cleanup-rm.log"
+(
+    as_root() {
+        printf '%s\n' "$*" >> "$rm_log"
+        command "$@"
+    }
+    UPDATE_TMP_DIR="$update_tmp"
+    UPDATE_TRANSACTION=0
+    UPDATE_BINARY_CHANGED=0
+    UPDATE_SNAPSHOT_DIR=""
+    UPDATE_SNAPSHOT_RESTORED=0
+    UPDATE_WAS_ACTIVE=0
+    cleanup_update_transaction
+)
+assert_contains "$rm_log" "rm -rf -- $update_tmp"
+UPDATE_TMP_DIR=""
+
+update_tmp_fail="${TEST_ROOT}/update-tmp-fail"
+mkdir -p "$update_tmp_fail"
+(
+    as_root() { return 1; }
+    UPDATE_TMP_DIR="$update_tmp_fail"
+    UPDATE_TRANSACTION=0
+    UPDATE_BINARY_CHANGED=0
+    UPDATE_SNAPSHOT_DIR=""
+    UPDATE_SNAPSHOT_RESTORED=0
+    UPDATE_WAS_ACTIVE=0
+    cleanup_update_transaction
+    exit 0
+) >"${TEST_ROOT}/cleanup-fail.out" 2>&1
+assert_contains "${TEST_ROOT}/cleanup-fail.out" '无法清理更新临时目录'
+assert_contains "${TEST_ROOT}/cleanup-fail.out" "$update_tmp_fail"
+
+# After a successful restore the exit-trap cleanup must not restore again.
+restore_gate_log="${TEST_ROOT}/restore-gate.log"
+update_tmp_gate="${TEST_ROOT}/update-tmp-gate"
+mkdir -p "$update_tmp_gate" "${TEST_ROOT}/snapshot-gate"
+(
+    set +e
+    as_root() {
+        printf '%s\n' "$*" >> "$restore_gate_log"
+        command "$@"
+    }
+    restore_data_snapshot() { printf 'restore-called\n' >> "$restore_gate_log"; }
+    UPDATE_TMP_DIR="$update_tmp_gate"
+    UPDATE_TRANSACTION=1
+    UPDATE_BINARY_CHANGED=0
+    UPDATE_SNAPSHOT_DIR="${TEST_ROOT}/snapshot-gate"
+    UPDATE_SNAPSHOT_RESTORED=1
+    UPDATE_WAS_ACTIVE=0
+    false
+    cleanup_update_transaction
+    exit 0
+) >"${TEST_ROOT}/cleanup-gate.out" 2>&1
+if grep -Fq 'restore-called' "$restore_gate_log"; then
+    echo 'FAIL: cleanup restored again after a successful restore' >&2; exit 1
+fi
+
+# A restore that fails inside cleanup must be reported with the backup
+# reference and must not be silently swallowed.
+restore_fail_log="${TEST_ROOT}/restore-fail.log"
+update_tmp_retry="${TEST_ROOT}/update-tmp-retry"
+mkdir -p "$update_tmp_retry" "${TEST_ROOT}/snapshot-retry"
+(
+    set +e
+    as_root() {
+        printf '%s\n' "$*" >> "$restore_fail_log"
+        command "$@"
+    }
+    restore_data_snapshot() {
+        printf 'restore-called\n' >> "$restore_fail_log"
+        return 1
+    }
+    is_systemd() { return 1; }
+    UPDATE_TMP_DIR="$update_tmp_retry"
+    UPDATE_TRANSACTION=1
+    UPDATE_BINARY_CHANGED=0
+    UPDATE_SNAPSHOT_DIR="${TEST_ROOT}/snapshot-retry"
+    UPDATE_SNAPSHOT_RESTORED=0
+    UPDATE_WAS_ACTIVE=0
+    LAST_BACKUP_PATH="${TEST_ROOT}/backup.tar.gz"
+    false
+    cleanup_update_transaction
+    exit 0
+) >"${TEST_ROOT}/cleanup-restore-fail.out" 2>&1
+assert_contains "${TEST_ROOT}/cleanup-restore-fail.out" '数据快照恢复失败'
+assert_contains "${TEST_ROOT}/cleanup-restore-fail.out" "${TEST_ROOT}/backup.tar.gz"
+grep -Fq 'restore-called' "$restore_fail_log" || { echo 'FAIL: cleanup did not attempt the restore' >&2; exit 1; }
+
+# A failing snapshot restore during an update must not be marked as restored:
+# the in-flow rollback warns, the live data directory is left alone, and the
+# exit-trap cleanup retries the restore instead of skipping it.
+printf 'JWT_SECRET=retry-jwt-secret-0000000000000000000000000000\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nTRUSTED_PROXY_CIDRS=\nSETUP_TOKEN=retry-setup-token-000000000000000000000000000000\n' \
+    "$DATA_DIR" > "${DATA_DIR}/.env"
+printf 'pre-update-db-state\n' > "${DATA_DIR}/meridian.db"
+cp "${DATA_DIR}/.env" "${TEST_ROOT}/restore-retry-env-before"
+cp "${DATA_DIR}/meridian.db" "${TEST_ROOT}/restore-retry-db-before"
+touch "$SERVICE_FILE"
+restore_attempt_file="${TEST_ROOT}/restore-attempts"
+printf '0\n' > "$restore_attempt_file"
+retry_failing_binary="${TEST_ROOT}/retry-failing-meridian"
+cat > "$retry_failing_binary" <<'MOCKBIN'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then
+    echo v9.9.13
+    exit 0
+fi
+printf 'mutated-by-retry-failing-version\n' >> "${MOCK_DB_PATH:?}"
+exit 1
+MOCKBIN
+chmod 0755 "$retry_failing_binary"
+if (
+    is_systemd() { return 0; }
+    service_is_active() { return 0; }
+    systemctl() { return 0; }
+    wait_for_health() { return 1; }
+    restore_data_snapshot() {
+        local n
+        n=$(cat "$restore_attempt_file")
+        printf '%s\n' "$((n + 1))" > "$restore_attempt_file"
+        return 1
+    }
+    MOCK_LATEST='v9.9.13'
+    export MOCK_DB_PATH="${DATA_DIR}/meridian.db"
+    download() {
+        local url="$1" output="$2"
+        if [[ "$url" == */SHA256SUMS ]]; then
+            printf '%s  meridian-linux-amd64\n' "$(sha256_file "$retry_failing_binary")" > "$output"
+            return
+        fi
+        cp "$retry_failing_binary" "$output"
+    }
+    do_update
+) >"${TEST_ROOT}/update-restore-retry.log" 2>&1; then
+    echo 'FAIL: failing update unexpectedly succeeded' >&2; exit 1
+fi
+assert_eq '2' "$(cat "$restore_attempt_file")" 'failed restore must be retried by the exit-trap cleanup'
+assert_contains "${TEST_ROOT}/update-restore-retry.log" '数据快照恢复失败'
+cmp -s "${DATA_DIR}/meridian.db" "${TEST_ROOT}/restore-retry-db-before" \
+    || { echo 'FAIL: live database was modified when restore failed' >&2; exit 1; }
+cmp -s "${DATA_DIR}/.env" "${TEST_ROOT}/restore-retry-env-before" \
+    || { echo 'FAIL: live .env was modified when restore failed' >&2; exit 1; }
 
 # Exercise the password transaction with a mock binary. The real command and
 # bcrypt behavior are covered by Go tests.
