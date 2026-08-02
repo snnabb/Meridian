@@ -330,7 +330,7 @@ go build -trimpath -buildvcs=false -o meridian .      # 编译
 - 多平台构建（linux/amd64、linux/arm64、windows/amd64、darwin/amd64、darwin/arm64）
 - 创建 GitHub Release 并上传二进制
 - 生成并上传 `SHA256SUMS`
-- 构建并推送 Docker 镜像到 `ghcr.io`
+- 构建并推送 linux/amd64、linux/arm64 多架构 Docker 镜像到 `ghcr.io`
 
 ---
 
