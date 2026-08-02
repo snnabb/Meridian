@@ -494,7 +494,13 @@ restore_perm_log="${TEST_ROOT}/restore-perm.log"
 (
     as_root() {
         printf '%s\n' "$*" >> "$restore_perm_log"
-        command "$@"
+        # This case only asserts that the chown/chmod arguments are correct;
+        # actually running them as a non-root runner would EPERM. File
+        # operations (cp/mv/rm/test/awk) still execute for real.
+        case "$1" in
+            chown|chmod) return 0 ;;
+            *) command "$@" ;;
+        esac
     }
     is_systemd() { return 0; }
     restore_data_snapshot "${TEST_ROOT}/snapshot-systemd"
