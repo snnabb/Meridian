@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2317
+# This file is a mock harness: the mock functions it defines are invoked
+# indirectly by the sourced install.sh, which ShellCheck cannot statically
+# trace, so every mock body would otherwise look unreachable.
+
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -353,6 +358,10 @@ printf 'pre-update-db-state\n' > "${DATA_DIR}/meridian.db"
 cp "${DATA_DIR}/.env" "${TEST_ROOT}/rollback-env-before"
 cp "${DATA_DIR}/meridian.db" "${TEST_ROOT}/rollback-db-before"
 touch "$SERVICE_FILE"
+# MOCK_DB_PATH must reach the mock binaries inside every subshell. Exporting
+# it once at top level (instead of inside each subshell) keeps the assignment
+# in the parent scope (SC2030/SC2031) and is inherited by all subshells.
+export MOCK_DB_PATH="${DATA_DIR}/meridian.db"
 failing_binary="${TEST_ROOT}/failing-meridian"
 cat > "$failing_binary" <<'MOCKBIN'
 #!/usr/bin/env bash
@@ -375,7 +384,6 @@ if (
     }
     wait_for_health() { return 1; }
     MOCK_LATEST='v9.9.12'
-    export MOCK_DB_PATH="${DATA_DIR}/meridian.db"
     download() {
         local url="$1" output="$2"
         if [[ "$url" == */SHA256SUMS ]]; then
@@ -628,11 +636,20 @@ mkdir -p "$update_tmp_retry" "${TEST_ROOT}/snapshot-retry"
         return 1
     }
     is_systemd() { return 1; }
+    # The UPDATE_* values below are consumed by cleanup_update_transaction
+    # (defined in install.sh), which shellcheck cannot trace; each assignment
+    # carries its own local SC2034 suppression.
+    # shellcheck disable=SC2034
     UPDATE_TMP_DIR="$update_tmp_retry"
+    # shellcheck disable=SC2034
     UPDATE_TRANSACTION=1
+    # shellcheck disable=SC2034
     UPDATE_BINARY_CHANGED=0
+    # shellcheck disable=SC2034
     UPDATE_SNAPSHOT_DIR="${TEST_ROOT}/snapshot-retry"
+    # shellcheck disable=SC2034
     UPDATE_SNAPSHOT_RESTORED=0
+    # shellcheck disable=SC2034
     UPDATE_WAS_ACTIVE=0
     LAST_BACKUP_PATH="${TEST_ROOT}/backup.tar.gz"
     false
@@ -677,7 +694,6 @@ if (
         return 1
     }
     MOCK_LATEST='v9.9.13'
-    export MOCK_DB_PATH="${DATA_DIR}/meridian.db"
     download() {
         local url="$1" output="$2"
         if [[ "$url" == */SHA256SUMS ]]; then
@@ -721,7 +737,6 @@ MOCKBIN
 chmod 0755 "$password_mock_binary"
 run_as_test_root install -m 0755 "$password_mock_binary" "${INSTALL_DIR}/${BIN_NAME}"
 touch "$SERVICE_FILE"
-export MOCK_DB_PATH="${DATA_DIR}/meridian.db"
 
 run_password_case() {
     local health_result="$1"
