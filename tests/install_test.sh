@@ -398,14 +398,19 @@ if (
 fi
 assert_contains "${TEST_ROOT}/update-rollback.log" '自动回滚'
 assert_eq 'v9.9.11' "$(get_current_version)" 'rollback must restore the previous binary'
-cmp -s "${DATA_DIR}/meridian.db" "${TEST_ROOT}/rollback-db-before" \
+# The restored DATA_DIR is owned by the service user (0750, db 0600,
+# .env root:meridian 0640), so a non-root runner cannot read it directly.
+run_as_test_root cmp -s "${DATA_DIR}/meridian.db" "${TEST_ROOT}/rollback-db-before" \
     || { echo 'FAIL: database was not restored after failed update' >&2; exit 1; }
-cmp -s "${DATA_DIR}/.env" "${TEST_ROOT}/rollback-env-before" \
+run_as_test_root cmp -s "${DATA_DIR}/.env" "${TEST_ROOT}/rollback-env-before" \
     || { echo 'FAIL: configuration was not restored after failed update' >&2; exit 1; }
 assert_contains "${TEST_ROOT}/update-rollback.log" '自动回滚'
 
 # A missing snapshot must fail the restore without touching the live data.
-rm -rf -- "$DATA_DIR" "${TEST_ROOT}/snapshot-missing"
+# DATA_DIR is still service-user-owned (0750) after the systemd rollback
+# above, so the reset must run as root; the mkdir below returns it to the
+# runner.
+run_as_test_root rm -rf -- "$DATA_DIR" "${TEST_ROOT}/snapshot-missing"
 mkdir -p "$DATA_DIR"
 printf 'live-marker\n' > "${DATA_DIR}/live.txt"
 if restore_data_snapshot "${TEST_ROOT}/snapshot-missing" 2>/dev/null; then
@@ -505,7 +510,9 @@ assert_contains "$restore_perm_log" "chmod 0600 ${DATA_DIR}/meridian.db"
 # UPDATE_SNAPSHOT_RESTORED stays unset and the transaction is retried or
 # escalated) and must say what is broken, even though the data contents were
 # already swapped in.
-rm -rf -- "$DATA_DIR" "${TEST_ROOT}/snapshot-permfail"
+# The previous systemd-mode restore left DATA_DIR service-user-owned, and
+# the chown failure below leaves it root-owned; both need root to reset.
+run_as_test_root rm -rf -- "$DATA_DIR" "${TEST_ROOT}/snapshot-permfail"
 mkdir -p "$DATA_DIR" "${TEST_ROOT}/snapshot-permfail/data"
 printf 'JWT_SECRET=permfail-jwt-secret-00000000000000000000000000\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nTRUSTED_PROXY_CIDRS=\n' \
     "$DATA_DIR" > "${DATA_DIR}/.env"
@@ -524,7 +531,9 @@ if (
 ) >"$perm_fail_out" 2>&1; then
     echo 'FAIL: restore with failing permission fix unexpectedly succeeded' >&2; exit 1
 fi
-cmp -s "${DATA_DIR}/meridian.db" "${TEST_ROOT}/snapshot-permfail/data/meridian.db" \
+# The swapped-in directory is still root-owned here (chown was mocked to
+# fail), so the content check needs root.
+run_as_test_root cmp -s "${DATA_DIR}/meridian.db" "${TEST_ROOT}/snapshot-permfail/data/meridian.db" \
     || { echo 'FAIL: database content not restored despite permission failure' >&2; exit 1; }
 assert_contains "$perm_fail_out" '无法设置数据目录属主'
 assert_contains "$perm_fail_out" '请手动修复'
@@ -532,7 +541,9 @@ assert_contains "$perm_fail_out" '请手动修复'
 # A restore that cannot remove the displaced directory must return non-zero,
 # keep the live DATA_DIR on the restored contents, and name the residue for
 # manual cleanup.
-rm -rf -- "$DATA_DIR" "${TEST_ROOT}/snapshot-oldresidue"
+# DATA_DIR is root-owned (0700) after the permfail restore above; the reset
+# must run as root, then mkdir returns it to the runner.
+run_as_test_root rm -rf -- "$DATA_DIR" "${TEST_ROOT}/snapshot-oldresidue"
 mkdir -p "$DATA_DIR" "${TEST_ROOT}/snapshot-oldresidue/data"
 printf 'JWT_SECRET=oldresidue-jwt-secret-000000000000000000000000\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nTRUSTED_PROXY_CIDRS=\n' \
     "$DATA_DIR" > "${DATA_DIR}/.env"
@@ -708,13 +719,20 @@ if (
 fi
 assert_eq '2' "$(cat "$restore_attempt_file")" 'failed restore must be retried by the exit-trap cleanup'
 assert_contains "${TEST_ROOT}/update-restore-retry.log" '数据快照恢复失败'
-cmp -s "${DATA_DIR}/meridian.db" "${TEST_ROOT}/restore-retry-db-before" \
+# The update's systemd path chowns DATA_DIR to the service user and .env to
+# root:meridian 0640, so a non-root runner cannot compare them directly.
+run_as_test_root cmp -s "${DATA_DIR}/meridian.db" "${TEST_ROOT}/restore-retry-db-before" \
     || { echo 'FAIL: live database was modified when restore failed' >&2; exit 1; }
-cmp -s "${DATA_DIR}/.env" "${TEST_ROOT}/restore-retry-env-before" \
+run_as_test_root cmp -s "${DATA_DIR}/.env" "${TEST_ROOT}/restore-retry-env-before" \
     || { echo 'FAIL: live .env was modified when restore failed' >&2; exit 1; }
 
 # Exercise the password transaction with a mock binary. The real command and
 # bcrypt behavior are covered by Go tests.
+# Recreate DATA_DIR as the runner's own directory: the previous systemd-mode
+# tests left it owned by the service user, and the mock binary runs as the
+# runner, not as root.
+run_as_test_root rm -rf -- "$DATA_DIR"
+mkdir -p "$DATA_DIR"
 printf 'old-database-state\n' > "${DATA_DIR}/meridian.db"
 printf 'JWT_SECRET=old-jwt-secret-000000000000000000000000000000\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nTRUSTED_PROXY_CIDRS=\n' \
     "$DATA_DIR" > "${DATA_DIR}/.env"
