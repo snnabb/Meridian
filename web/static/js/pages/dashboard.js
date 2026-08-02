@@ -205,8 +205,8 @@ async function loadDashboardData() {
   loadDashboardTable();
 }
 
-const uaClassMap = { infuse: 'pill-blue', web: 'pill-green', client: 'pill-orange', custom: 'pill-purple' };
-const uaNameMap = { infuse: 'Infuse', web: 'Web', client: '客户端', custom: '自定义' };
+const uaClassMap = { infuse: 'pill-blue', web: 'pill-green', client: 'pill-orange', custom: 'pill-purple', passthrough: 'pill-blue' };
+const uaNameMap = { infuse: 'Infuse', web: 'Web', client: '客户端', custom: '自定义', passthrough: '透传' };
 
 function formatBytes(bytes) {
   if (!bytes || bytes === 0) return '0 B';

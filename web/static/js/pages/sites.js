@@ -212,6 +212,7 @@ function showSiteModal(site) {
         <option value="web" ${isEdit && site.ua_mode === 'web' ? 'selected' : ''}>Web</option>
         <option value="client" ${isEdit && site.ua_mode === 'client' ? 'selected' : ''}>客户端</option>
         <option value="custom">自定义</option>
+        <option value="passthrough" ${isEdit && site.ua_mode === 'passthrough' ? 'selected' : ''}>透传（保留客户端身份）</option>
       </select>
     </div>
     <div class="form-group" id="m-custom-ua-group" hidden>

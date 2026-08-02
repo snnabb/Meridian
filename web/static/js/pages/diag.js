@@ -171,6 +171,21 @@ function renderHeadersCard(headers, staggerClass) {
   const profileError = headers.profile_error
     ? '<div class="diag-row"><span class="diag-key">身份配置</span><span class="diag-val bad diag-wrap">' + esc(headers.profile_error) + '</span></div>'
     : '';
+
+  let rows;
+  if (headers.passthrough) {
+    rows = `
+      <div class="diag-row"><span class="diag-key">UA 透传</span><span class="diag-val good diag-wrap">保留客户端原值</span></div>
+    `;
+  } else {
+    rows = `
+      <div class="diag-row"><span class="diag-key">UA 改写</span><span class="diag-val ${headers.ua_applied ? 'good' : 'bad'}">${headers.ua_applied ? '已启用' : '未启用'}</span></div>
+      <div class="diag-row"><span class="diag-key">当前 UA</span><span class="diag-val diag-wrap">${diagText(headers.current_ua)}</span></div>
+      <div class="diag-row"><span class="diag-key">Client 字段</span><span class="diag-val">${diagText(headers.client_field)}</span></div>
+      <div class="diag-row"><span class="diag-key">Version 字段</span><span class="diag-val">${diagText(headers.version_field)}</span></div>
+    `;
+  }
+
   return `
     <div class="diag-card fade-up ${staggerClass}">
       <div class="diag-head">
@@ -183,10 +198,7 @@ function renderHeadersCard(headers, staggerClass) {
         </div>
       </div>
       <div class="diag-rows">
-        <div class="diag-row"><span class="diag-key">UA 改写</span><span class="diag-val ${headers.ua_applied ? 'good' : 'bad'}">${headers.ua_applied ? '已启用' : '未启用'}</span></div>
-        <div class="diag-row"><span class="diag-key">当前 UA</span><span class="diag-val diag-wrap">${diagText(headers.current_ua)}</span></div>
-        <div class="diag-row"><span class="diag-key">Client 字段</span><span class="diag-val">${diagText(headers.client_field)}</span></div>
-        <div class="diag-row"><span class="diag-key">Version 字段</span><span class="diag-val">${diagText(headers.version_field)}</span></div>
+        ${rows}
         ${profileError}
       </div>
     </div>

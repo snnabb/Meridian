@@ -53,10 +53,23 @@ var uaProfiles = map[string]UAProfile{
 
 const (
 	customUAMode          = "custom"
+	passthroughUAMode     = "passthrough"
 	maxCustomUserAgentLen = 1024
 	maxCustomClientLen    = 128
 	maxCustomVersionLen   = 64
 )
+
+// UAHeaderPolicy is the explicit discriminator for how a site's inbound
+// identity headers are handled on the way upstream. Rewrite=true applies
+// Profile (the configured User-Agent plus Emby Client/Version identity);
+// Rewrite=false is passthrough, preserving the client's identity headers byte
+// for byte. Passthrough is never encoded as an empty UAProfile sentinel: the
+// policy itself carries the mode, and every header-preparation path branches
+// on this discriminator.
+type UAHeaderPolicy struct {
+	Rewrite bool
+	Profile UAProfile
+}
 
 func getUAProfile(mode string) UAProfile {
 	if p, ok := uaProfiles[strings.ToLower(mode)]; ok {
@@ -85,6 +98,11 @@ func validateCustomUAValue(field, value string, maxLen int, allowQuotes bool) er
 
 func normalizeUAConfig(mode, userAgent, client, version string) (string, string, string, string, error) {
 	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == passthroughUAMode {
+		// Passthrough carries no identity of its own: the client's headers are
+		// preserved verbatim, so any stored custom triplet is cleared.
+		return mode, "", "", "", nil
+	}
 	if mode != customUAMode {
 		if _, ok := uaProfiles[mode]; !ok {
 			return "", "", "", "", fmt.Errorf("unknown ua_mode")
@@ -107,15 +125,22 @@ func normalizeUAConfig(mode, userAgent, client, version string) (string, string,
 	return mode, userAgent, client, version, nil
 }
 
-func resolveSiteUAProfile(site Site) (UAProfile, error) {
+// resolveUAHeaderPolicy resolves a site's stored UA configuration into the
+// explicit header-handling policy used everywhere identity headers are
+// prepared: the HTTP proxy path, WebSocket upgrade, redirect follow, and
+// diagnostics.
+func resolveUAHeaderPolicy(site Site) (UAHeaderPolicy, error) {
 	mode, userAgent, client, version, err := normalizeUAConfig(site.UAMode, site.CustomUserAgent, site.CustomClient, site.CustomVersion)
 	if err != nil {
-		return UAProfile{}, err
+		return UAHeaderPolicy{}, err
+	}
+	if mode == passthroughUAMode {
+		return UAHeaderPolicy{}, nil
 	}
 	if mode == customUAMode {
-		return UAProfile{Name: "Custom", UserAgent: userAgent, Client: client, Version: version}, nil
+		return UAHeaderPolicy{Rewrite: true, Profile: UAProfile{Name: "Custom", UserAgent: userAgent, Client: client, Version: version}}, nil
 	}
-	return uaProfiles[mode], nil
+	return UAHeaderPolicy{Rewrite: true, Profile: uaProfiles[mode]}, nil
 }
 
 func mergeSiteUAConfig(old Site, requestedMode, requestedUserAgent, requestedClient, requestedVersion *string) (string, string, string, string, error) {
@@ -847,7 +872,7 @@ func (d *DB) GetTrafficLogs(siteID int64, hours int) ([]TrafficLog, error) {
 type redirectFollowTransport struct {
 	base          http.RoundTripper
 	playbackHosts map[string]bool
-	profile       UAProfile
+	policy        UAHeaderPolicy
 }
 
 func (t *redirectFollowTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -887,12 +912,13 @@ func (t *redirectFollowTransport) RoundTrip(req *http.Request) (*http.Response, 
 		if !sameRedirectAuthority(req.URL, locURL) {
 			// A redirect to a different scheme/host/port is a new security
 			// domain: the browser's cookies and the client's Emby access token
-			// must not follow the hop to a playback or CDN host. The UA profile
+			// must not follow the hop to a playback or CDN host. The UA policy
 			// is reapplied below, so identity rewriting stays consistent while
-			// secrets stay behind.
+			// secrets stay behind; passthrough keeps whatever non-secret
+			// identity the client sent.
 			stripSensitiveRedirectHeaders(newReq.Header)
 		}
-		applyUAProfileHeaders(newReq.Header, t.profile)
+		applyUAHeaderPolicy(newReq.Header, t.policy)
 		resp, err = t.base.RoundTrip(newReq)
 		if err != nil {
 			return nil, err
@@ -904,6 +930,8 @@ func (t *redirectFollowTransport) RoundTrip(req *http.Request) (*http.Response, 
 
 type embyAuthAttribute struct {
 	name       string
+	attrStart  int
+	attrEnd    int
 	valueStart int
 	valueEnd   int
 }
@@ -959,6 +987,8 @@ func parseEmbyAuthorizationAttributes(value string, offset int) ([]embyAuthAttri
 		}
 		attributes = append(attributes, embyAuthAttribute{
 			name:       name,
+			attrStart:  nameStart,
+			attrEnd:    offset + 1,
 			valueStart: valueStart,
 			valueEnd:   offset,
 		})
@@ -1077,6 +1107,7 @@ func rewriteEmbyAuthorizationHeaders(header http.Header, headerName string, prof
 // value carries (or may carry) an access token that could not be stripped, and
 // the caller must drop the entire header instead of forwarding it. Values
 // without any recognizable Token attribute are returned unchanged with true.
+// A value whose only attribute is the token is reduced to its bare scheme.
 func stripEmbyAuthorizationToken(value string) (string, bool) {
 	offset := 0
 	for offset < len(value) && isEmbyAuthWhitespace(value[offset]) {
@@ -1095,6 +1126,7 @@ func stripEmbyAuthorizationToken(value string) (string, bool) {
 		// Unknown scheme: it cannot be proven token-free, so fail closed.
 		return value, false
 	}
+	schemeEnd := offset
 	if offset < len(value) && !isEmbyAuthWhitespace(value[offset]) {
 		return value, false
 	}
@@ -1124,7 +1156,19 @@ func stripEmbyAuthorizationToken(value string) (string, bool) {
 		return value, true
 	}
 	attribute := attributes[tokenIndex]
-	return value[:attribute.valueStart] + value[attribute.valueEnd:], true
+	switch {
+	case tokenIndex == 0 && len(attributes) == 1:
+		// The only attribute is the token: leave the bare scheme.
+		return value[:schemeEnd] + value[attribute.attrEnd:], true
+	case tokenIndex == 0:
+		// The token is the first attribute: drop it together with the
+		// delimiter that followed it.
+		return value[:attribute.attrStart] + value[attributes[1].attrStart:], true
+	default:
+		// The token sits after other attributes: drop the delimiter before
+		// it together with the attribute itself.
+		return value[:attributes[tokenIndex-1].attrEnd] + value[attribute.attrEnd:], true
+	}
 }
 
 // stripSensitiveRedirectHeaders removes browser credentials and access tokens
@@ -1544,6 +1588,16 @@ func applyUAProfileHeaders(header http.Header, profile UAProfile) {
 	rewriteEmbyAuthorizationHeaders(header, "Authorization", profile)
 }
 
+// applyUAHeaderPolicy applies a resolved UAHeaderPolicy to outbound headers.
+// Rewrite mode sets the configured User-Agent and rewrites Emby Client/Version
+// identity; passthrough leaves every inbound identity header untouched.
+func applyUAHeaderPolicy(header http.Header, policy UAHeaderPolicy) {
+	if !policy.Rewrite {
+		return
+	}
+	applyUAProfileHeaders(header, policy.Profile)
+}
+
 func removeClientForwardingHeaders(header http.Header) {
 	for name := range header {
 		lowerName := strings.ToLower(name)
@@ -1572,13 +1626,23 @@ func setTrustedForwardingHeaders(header http.Header, inbound *http.Request) {
 	header.Set("X-Forwarded-Proto", forwardedProto)
 }
 
-func prepareUpstreamHeaders(header http.Header, inbound *http.Request, profile UAProfile) {
+func prepareUpstreamHeaders(header http.Header, inbound *http.Request, policy UAHeaderPolicy) {
 	setTrustedForwardingHeaders(header, inbound)
-	applyUAProfileHeaders(header, profile)
+	applyUAHeaderPolicy(header, policy)
 }
 
-func prepareWebSocketUpstreamHeaders(inbound *http.Request, target *url.URL, profile UAProfile) http.Header {
+func prepareWebSocketUpstreamHeaders(inbound *http.Request, target *url.URL, policy UAHeaderPolicy) http.Header {
 	header := inbound.Header.Clone()
+	// RFC 9110 hop-by-hop: every header named by the inbound Connection header
+	// is consumed by the first recipient and must not be forwarded. Delete them
+	// all before rebuilding the upgrade headers below.
+	for _, value := range inbound.Header.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			if token = strings.TrimSpace(token); token != "" {
+				header.Del(token)
+			}
+		}
+	}
 	for _, name := range []string{
 		// Content-Length must go with the other hop-by-hop headers: the upgrade
 		// path never reads r.Body, so letting a length through would tell the
@@ -1598,7 +1662,7 @@ func prepareWebSocketUpstreamHeaders(inbound *http.Request, target *url.URL, pro
 	header.Set("Connection", "Upgrade")
 	header.Set("Upgrade", "websocket")
 	header.Set("Host", target.Host)
-	prepareUpstreamHeaders(header, inbound, profile)
+	prepareUpstreamHeaders(header, inbound, policy)
 	return header
 }
 
@@ -1609,7 +1673,7 @@ func writeWebSocketGatewayError(conn net.Conn) {
 	_, _ = fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
 }
 
-func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, profile UAProfile, inst *ProxyInstance, speedLimitBytes int64) {
+func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, policy UAHeaderPolicy, inst *ProxyInstance, speedLimitBytes int64) {
 	// Nothing on this path reads r.Body, so a body would be left sitting in the
 	// hijacked buffer and relayed verbatim to the upstream.
 	if r.ContentLength != 0 || len(r.TransferEncoding) > 0 {
@@ -1669,7 +1733,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, pr
 		log.Printf("[WS] write request line: %v", err)
 		return
 	}
-	upstreamHeader := prepareWebSocketUpstreamHeaders(r, target, profile)
+	upstreamHeader := prepareWebSocketUpstreamHeaders(r, target, policy)
 	if err := upstreamHeader.Write(upstreamConn); err != nil {
 		log.Printf("[WS] write request headers: %v", err)
 		return
@@ -1782,7 +1846,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		}
 	}
 
-	profile, err := resolveSiteUAProfile(site)
+	policy, err := resolveUAHeaderPolicy(site)
 	if err != nil {
 		return fmt.Errorf("invalid UA profile: %w", err)
 	}
@@ -1806,7 +1870,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			}
 			applyUpstreamURL(proxyReq.Out.URL, upstream)
 			proxyReq.Out.Host = upstream.Host
-			prepareUpstreamHeaders(proxyReq.Out.Header, proxyReq.In, profile)
+			prepareUpstreamHeaders(proxyReq.Out.Header, proxyReq.In, policy)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("[%s] proxy error: %v", site.Name, err)
@@ -1820,7 +1884,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		proxy.Transport = &redirectFollowTransport{
 			base:          proxyTransport,
 			playbackHosts: playbackHostsSet,
-			profile:       profile,
+			policy:        policy,
 		}
 	}
 
@@ -1845,7 +1909,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			if isRedirectMode {
 				wsTarget = target
 			}
-			handleWebSocket(w, r, wsTarget, profile, inst, speedLimitBytes)
+			handleWebSocket(w, r, wsTarget, policy, inst, speedLimitBytes)
 			return
 		}
 
@@ -2276,6 +2340,9 @@ type DiagTLS struct {
 }
 
 type DiagHeaders struct {
+	// Passthrough is the explicit marker for ua_mode passthrough: the client's
+	// identity headers are preserved, so no configured identity is shown.
+	Passthrough  bool   `json:"passthrough"`
 	UAApplied    bool   `json:"ua_applied"`
 	CurrentUA    string `json:"current_ua"`
 	ClientField  string `json:"client_field"`
@@ -2656,7 +2723,7 @@ func displayTargetURL(raw string) string {
 }
 
 func diagnoseSite(site *Site, pm *ProxyManager) DiagResult {
-	profile, profileErr := resolveSiteUAProfile(*site)
+	policy, profileErr := resolveUAHeaderPolicy(*site)
 	primary, primaryKey := diagnoseUpstreamTarget(site.TargetURL, "metadata_api")
 	primary.Configured = true
 	primary.ShowHealth = true
@@ -2700,12 +2767,19 @@ func diagnoseSite(site *Site, pm *ProxyManager) DiagResult {
 		result.Headers = DiagHeaders{
 			ProfileError: "invalid stored UA configuration",
 		}
+	} else if !policy.Rewrite {
+		// Passthrough has no configured identity to show, and the real request
+		// headers must never be rendered in diagnostics output.
+		result.Headers = DiagHeaders{
+			Passthrough: true,
+			UAApplied:   false,
+		}
 	} else {
 		result.Headers = DiagHeaders{
 			UAApplied:    true,
-			CurrentUA:    profile.UserAgent,
-			ClientField:  profile.Client,
-			VersionField: profile.Version,
+			CurrentUA:    policy.Profile.UserAgent,
+			ClientField:  policy.Profile.Client,
+			VersionField: policy.Profile.Version,
 		}
 	}
 

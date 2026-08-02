@@ -177,6 +177,188 @@ func TestMergeSiteUAConfigUsesCompleteSnapshots(t *testing.T) {
 	}
 }
 
+func TestNormalizeUAPassthroughMode(t *testing.T) {
+	mode, userAgent, client, version, err := normalizeUAConfig(" PASSTHROUGH ", "stale", "stale", "stale")
+	if err != nil {
+		t.Fatalf("normalize passthrough config: %v", err)
+	}
+	if mode != passthroughUAMode || userAgent != "" || client != "" || version != "" {
+		t.Fatalf("passthrough config = %#v %#v %#v %#v, want mode only with a cleared custom triplet", mode, userAgent, client, version)
+	}
+
+	if _, _, _, _, err := normalizeUAConfig("bogus-mode", "", "", ""); err == nil {
+		t.Fatal("unknown ua_mode unexpectedly accepted")
+	}
+}
+
+func TestMergeSiteUAConfigPassthrough(t *testing.T) {
+	old := Site{
+		UAMode:          customUAMode,
+		CustomUserAgent: "Old UA",
+		CustomClient:    "Old Client",
+		CustomVersion:   "1.0",
+	}
+
+	// Switching custom -> passthrough clears the stored custom triplet.
+	mode, userAgent, client, version, err := mergeSiteUAConfig(old, stringPointer(passthroughUAMode), nil, nil, nil)
+	if err != nil {
+		t.Fatalf("switch to passthrough: %v", err)
+	}
+	if mode != passthroughUAMode || userAgent != "" || client != "" || version != "" {
+		t.Fatalf("passthrough switch = %#v %#v %#v %#v", mode, userAgent, client, version)
+	}
+
+	// Passthrough with an explicitly empty custom triplet is legal.
+	if _, _, _, _, err := mergeSiteUAConfig(old, stringPointer(passthroughUAMode), stringPointer(""), stringPointer(""), stringPointer("")); err != nil {
+		t.Fatalf("passthrough with empty custom fields: %v", err)
+	}
+
+	// Passthrough with a non-empty custom triplet is rejected like any other
+	// non-custom mode: the custom-switch rules do not regress.
+	if _, _, _, _, err := mergeSiteUAConfig(old, stringPointer(passthroughUAMode), stringPointer("New UA"), stringPointer("New Client"), stringPointer("2.0")); err == nil {
+		t.Fatal("passthrough with non-empty custom fields unexpectedly accepted")
+	}
+
+	// PUT omitting ua_mode preserves the stored passthrough mode and clears
+	// any stale triplet left in the row.
+	passthroughOld := Site{UAMode: passthroughUAMode, CustomUserAgent: "stale", CustomClient: "stale", CustomVersion: "stale"}
+	mode, userAgent, client, version, err = mergeSiteUAConfig(passthroughOld, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("preserve passthrough: %v", err)
+	}
+	if mode != passthroughUAMode || userAgent != "" || client != "" || version != "" {
+		t.Fatalf("preserved passthrough = %#v %#v %#v %#v", mode, userAgent, client, version)
+	}
+
+	// Passthrough -> custom with a full triplet is legal.
+	mode, userAgent, client, version, err = mergeSiteUAConfig(passthroughOld, stringPointer(customUAMode), stringPointer("New UA"), stringPointer("New Client"), stringPointer("2.0"))
+	if err != nil {
+		t.Fatalf("switch passthrough to custom: %v", err)
+	}
+	if mode != customUAMode || userAgent != "New UA" || client != "New Client" || version != "2.0" {
+		t.Fatalf("custom switch = %#v %#v %#v %#v", mode, userAgent, client, version)
+	}
+
+	// Passthrough -> preset.
+	if mode, _, _, _, err := mergeSiteUAConfig(passthroughOld, stringPointer("web"), nil, nil, nil); err != nil || mode != "web" {
+		t.Fatalf("passthrough to preset: mode=%q err=%v", mode, err)
+	}
+}
+
+func TestResolveUAHeaderPolicyDiscriminatesModes(t *testing.T) {
+	custom, err := resolveUAHeaderPolicy(Site{UAMode: customUAMode, CustomUserAgent: "Custom UA/1.0", CustomClient: "Custom Client", CustomVersion: "1.0.0"})
+	if err != nil {
+		t.Fatalf("resolve custom: %v", err)
+	}
+	if !custom.Rewrite || custom.Profile.UserAgent != "Custom UA/1.0" || custom.Profile.Client != "Custom Client" || custom.Profile.Version != "1.0.0" {
+		t.Fatalf("custom policy = %#v", custom)
+	}
+
+	preset, err := resolveUAHeaderPolicy(Site{UAMode: "web"})
+	if err != nil {
+		t.Fatalf("resolve preset: %v", err)
+	}
+	if !preset.Rewrite || preset.Profile != uaProfiles["web"] {
+		t.Fatalf("preset policy = %#v", preset)
+	}
+
+	// Passthrough is its own policy state, never an empty-UAProfile sentinel;
+	// stale custom fields in the row are cleared by normalization.
+	pass, err := resolveUAHeaderPolicy(Site{UAMode: passthroughUAMode, CustomUserAgent: "stale", CustomClient: "stale", CustomVersion: "stale"})
+	if err != nil {
+		t.Fatalf("resolve passthrough: %v", err)
+	}
+	if pass.Rewrite {
+		t.Fatalf("passthrough policy must not rewrite: %#v", pass)
+	}
+
+	if _, err := resolveUAHeaderPolicy(Site{UAMode: "bogus"}); err == nil {
+		t.Fatal("unknown mode unexpectedly resolved")
+	}
+}
+
+func TestApplyUAHeaderPolicyPassthroughPreservesIdentityHeaders(t *testing.T) {
+	authorization := `MediaBrowser Client="Client", Device="TV", DeviceId="d1", Version="1", Token="secret"`
+	header := http.Header{
+		"User-Agent":           []string{"ClientUA/9.9"},
+		"X-Emby-Authorization": []string{authorization},
+		"Authorization":        []string{"Bearer opaque"},
+	}
+	applyUAHeaderPolicy(header, UAHeaderPolicy{})
+	if got := header.Get("User-Agent"); got != "ClientUA/9.9" {
+		t.Fatalf("User-Agent = %q, want the client value preserved", got)
+	}
+	if got := header.Get("X-Emby-Authorization"); got != authorization {
+		t.Fatalf("X-Emby-Authorization = %q, want byte-identical passthrough", got)
+	}
+	if got := header.Get("Authorization"); got != "Bearer opaque" {
+		t.Fatalf("Authorization = %q, want byte-identical passthrough", got)
+	}
+
+	rewritten := http.Header{
+		"User-Agent":           []string{"ClientUA/9.9"},
+		"X-Emby-Authorization": []string{authorization},
+	}
+	applyUAHeaderPolicy(rewritten, UAHeaderPolicy{Rewrite: true, Profile: uaProfiles["client"]})
+	if got := rewritten.Get("User-Agent"); got != uaProfiles["client"].UserAgent {
+		t.Fatalf("rewrite User-Agent = %q, want %q", got, uaProfiles["client"].UserAgent)
+	}
+	if got := rewritten.Get("X-Emby-Authorization"); !strings.Contains(got, `Client="Emby Theater"`) || !strings.Contains(got, `Version="4.7.0"`) {
+		t.Fatalf("rewrite authorization = %q", got)
+	}
+}
+
+func TestHTTPPassthroughPreservesClientIdentityAndRebuildsForwarding(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "http://meridian.example:50001/System/Info", nil)
+	request.RemoteAddr = "198.51.100.26:12345"
+	request.Header.Set("User-Agent", "ClientUA/9.9")
+	request.Header.Set("X-Emby-Authorization", `MediaBrowser Client="Client", Device="TV", Version="1"`)
+	request.Header.Set("X-Forwarded-For", "203.0.113.8")
+
+	header := request.Header.Clone()
+	prepareUpstreamHeaders(header, request, UAHeaderPolicy{})
+
+	if got := header.Get("User-Agent"); got != "ClientUA/9.9" {
+		t.Fatalf("User-Agent = %q, want the client value preserved", got)
+	}
+	if got := header.Get("X-Emby-Authorization"); !strings.Contains(got, `Client="Client"`) || !strings.Contains(got, `Device="TV"`) {
+		t.Fatalf("X-Emby-Authorization = %q, want client identity preserved", got)
+	}
+	// X-Forwarded-* rebuilding is unchanged in passthrough mode.
+	if got := header.Get("X-Forwarded-For"); got != "198.51.100.26" {
+		t.Fatalf("X-Forwarded-For = %q, want rebuilt from the peer address", got)
+	}
+	if got := header.Get("X-Forwarded-Host"); got != "meridian.example:50001" {
+		t.Fatalf("X-Forwarded-Host = %q", got)
+	}
+	if got := header.Get("X-Forwarded-Proto"); got != "http" {
+		t.Fatalf("X-Forwarded-Proto = %q", got)
+	}
+}
+
+func TestPrepareWebSocketUpstreamHeadersRemovesConnectionNominatedHopByHop(t *testing.T) {
+	target, err := normalizeTargetURL("https://upstream.example.com")
+	if err != nil {
+		t.Fatalf("normalize target: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://meridian.example/socket", nil)
+	req.Header.Set("Connection", "Upgrade, X-Hop-By-Hop, keep-alive")
+	req.Header.Set("X-Hop-By-Hop", "secret")
+	req.Header.Set("Keep-Alive", "timeout=5")
+	req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+
+	header := prepareWebSocketUpstreamHeaders(req, target, UAHeaderPolicy{Rewrite: true, Profile: getUAProfile("infuse")})
+	if got := header.Get("X-Hop-By-Hop"); got != "" {
+		t.Fatalf("Connection-nominated X-Hop-By-Hop forwarded: %q", got)
+	}
+	if got := header.Get("Keep-Alive"); got != "" {
+		t.Fatalf("Connection-nominated Keep-Alive forwarded: %q", got)
+	}
+	if got := header.Get("Connection"); got != "Upgrade" {
+		t.Fatalf("Connection = %q, want the rebuilt Upgrade value", got)
+	}
+}
+
 func createLegacySiteDatabase(t *testing.T, dbPath string, withHourlyIndex bool) {
 	t.Helper()
 	legacy, err := sql.Open("sqlite", dbPath)
@@ -457,7 +639,7 @@ func TestRedirectModeTreatsExplicit443AsDefaultHTTPSPort(t *testing.T) {
 	transport := &redirectFollowTransport{
 		base:          base,
 		playbackHosts: map[string]bool{redirectHostKey(configured): true},
-		profile:       getUAProfile("infuse"),
+		policy:        UAHeaderPolicy{Rewrite: true, Profile: getUAProfile("infuse")},
 	}
 	req := httptest.NewRequest(http.MethodGet, "http://api.example.com/Videos/1/stream", nil)
 	resp, err := transport.RoundTrip(req)
@@ -486,7 +668,7 @@ func TestRedirectModeTreatsExplicit443AsDefaultHTTPSPort(t *testing.T) {
 		transport := &redirectFollowTransport{
 			base:          base,
 			playbackHosts: map[string]bool{redirectHostKey(configured): true},
-			profile:       getUAProfile("infuse"),
+			policy:        UAHeaderPolicy{Rewrite: true, Profile: getUAProfile("infuse")},
 		}
 		req := httptest.NewRequest(http.MethodGet, "http://api.example.com/Videos/1/stream", nil)
 		resp, err := transport.RoundTrip(req)
@@ -521,7 +703,7 @@ func TestRedirectModeTreatsExplicit443AsDefaultHTTPSPort(t *testing.T) {
 		transport := &redirectFollowTransport{
 			base:          base,
 			playbackHosts: map[string]bool{redirectHostKey(configured): true},
-			profile:       getUAProfile("infuse"),
+			policy:        UAHeaderPolicy{Rewrite: true, Profile: getUAProfile("infuse")},
 		}
 		req := httptest.NewRequest(http.MethodGet, "http://api.example.com/custom/play/path", nil)
 		resp, err := transport.RoundTrip(req)
@@ -556,7 +738,7 @@ func TestRedirectModeTreatsExplicit443AsDefaultHTTPSPort(t *testing.T) {
 		transport := &redirectFollowTransport{
 			base:          base,
 			playbackHosts: map[string]bool{redirectHostKey(configured): true},
-			profile:       getUAProfile("infuse"),
+			policy:        UAHeaderPolicy{Rewrite: true, Profile: getUAProfile("infuse")},
 		}
 		req := httptest.NewRequest(http.MethodGet, "https://api.example.com/custom/play/path", nil)
 		resp, err := transport.RoundTrip(req)
@@ -586,7 +768,7 @@ func TestRedirectModeTreatsExplicit443AsDefaultHTTPSPort(t *testing.T) {
 		transport := &redirectFollowTransport{
 			base:          base,
 			playbackHosts: map[string]bool{redirectHostKey(configured): true},
-			profile:       getUAProfile("infuse"),
+			policy:        UAHeaderPolicy{Rewrite: true, Profile: getUAProfile("infuse")},
 		}
 		req := httptest.NewRequest(http.MethodPost, "http://api.example.com/Users/AuthenticateByName", strings.NewReader(`{"Username":"test"}`))
 		resp, err := transport.RoundTrip(req)
@@ -605,7 +787,7 @@ func TestReverseProxyRebuildsForwardingHeadersAfterHopHeaderRemoval(t *testing.T
 	if err != nil {
 		t.Fatalf("normalize target: %v", err)
 	}
-	profile := getUAProfile("infuse")
+	policy := UAHeaderPolicy{Rewrite: true, Profile: getUAProfile("infuse")}
 	var captured *http.Request
 	proxy := &httputil.ReverseProxy{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -621,7 +803,7 @@ func TestReverseProxyRebuildsForwardingHeadersAfterHopHeaderRemoval(t *testing.T
 		Rewrite: func(proxyReq *httputil.ProxyRequest) {
 			applyUpstreamURL(proxyReq.Out.URL, target)
 			proxyReq.Out.Host = target.Host
-			prepareUpstreamHeaders(proxyReq.Out.Header, proxyReq.In, profile)
+			prepareUpstreamHeaders(proxyReq.Out.Header, proxyReq.In, policy)
 		},
 	}
 
@@ -650,8 +832,8 @@ func TestReverseProxyRebuildsForwardingHeadersAfterHopHeaderRemoval(t *testing.T
 	if captured.Host != target.Host {
 		t.Fatalf("outbound Host = %q, want %q", captured.Host, target.Host)
 	}
-	if got := captured.Header.Get("User-Agent"); got != profile.UserAgent {
-		t.Fatalf("outbound User-Agent = %q, want profile value %q", got, profile.UserAgent)
+	if got := captured.Header.Get("User-Agent"); got != policy.Profile.UserAgent {
+		t.Fatalf("outbound User-Agent = %q, want profile value %q", got, policy.Profile.UserAgent)
 	}
 	for name, want := range map[string]string{
 		"X-Forwarded-For":   "198.51.100.24",
@@ -675,7 +857,7 @@ func TestPrepareWebSocketUpstreamHeadersRebuildsForwardingHeaders(t *testing.T) 
 	if err != nil {
 		t.Fatalf("normalize target: %v", err)
 	}
-	profile := getUAProfile("infuse")
+	policy := UAHeaderPolicy{Rewrite: true, Profile: getUAProfile("infuse")}
 	req := httptest.NewRequest(http.MethodGet, "http://meridian.example:50001/socket", nil)
 	req.RemoteAddr = "198.51.100.25:54321"
 	req.Header.Set("Connection", "Upgrade, User-Agent")
@@ -687,7 +869,7 @@ func TestPrepareWebSocketUpstreamHeadersRebuildsForwardingHeaders(t *testing.T) 
 	req.Header.Set("X-Real-IP", "203.0.113.11")
 	req.Header.Set("Proxy-Connection", "keep-alive")
 
-	header := prepareWebSocketUpstreamHeaders(req, target, profile)
+	header := prepareWebSocketUpstreamHeaders(req, target, policy)
 	if got := req.Header.Get("Forwarded"); got == "" {
 		t.Fatal("preparing WebSocket headers mutated the inbound request")
 	}
@@ -695,7 +877,7 @@ func TestPrepareWebSocketUpstreamHeadersRebuildsForwardingHeaders(t *testing.T) 
 		"Connection":        "Upgrade",
 		"Upgrade":           "websocket",
 		"Host":              target.Host,
-		"User-Agent":        profile.UserAgent,
+		"User-Agent":        policy.Profile.UserAgent,
 		"X-Forwarded-For":   "198.51.100.25",
 		"X-Real-IP":         "198.51.100.25",
 		"X-Forwarded-Host":  "meridian.example:50001",
@@ -1878,20 +2060,20 @@ func TestApplyCustomUAProfileHeadersSafelyRewritesOnlyValidEmbyValues(t *testing
 }
 
 func TestCustomUAProfileIsConsistentAcrossHTTPWebSocketAndRedirects(t *testing.T) {
-	profile := UAProfile{
+	policy := UAHeaderPolicy{Rewrite: true, Profile: UAProfile{
 		Name:      "Custom",
 		UserAgent: "Meridian Test/1.0",
 		Client:    "Meridian Test",
 		Version:   "1.0.0",
-	}
+	}}
 	authorization := "MediaBrowser Device=\"TV\", DeviceId=\"device-1\", Client=\"old\", Version=\"old\""
 	assertIdentity := func(t *testing.T, header http.Header) {
 		t.Helper()
-		if got := header.Get("User-Agent"); got != profile.UserAgent {
-			t.Fatalf("User-Agent = %q, want %q", got, profile.UserAgent)
+		if got := header.Get("User-Agent"); got != policy.Profile.UserAgent {
+			t.Fatalf("User-Agent = %q, want %q", got, policy.Profile.UserAgent)
 		}
 		got := header.Get("X-Emby-Authorization")
-		for _, want := range []string{"Device=\"TV\"", "DeviceId=\"device-1\"", "Client=\"" + profile.Client + "\"", "Version=\"" + profile.Version + "\""} {
+		for _, want := range []string{"Device=\"TV\"", "DeviceId=\"device-1\"", "Client=\"" + policy.Profile.Client + "\"", "Version=\"" + policy.Profile.Version + "\""} {
 			if !strings.Contains(got, want) {
 				t.Fatalf("authorization = %q, missing %q", got, want)
 			}
@@ -1902,7 +2084,7 @@ func TestCustomUAProfileIsConsistentAcrossHTTPWebSocketAndRedirects(t *testing.T
 		request := httptest.NewRequest(http.MethodGet, "http://meridian.example/System/Info", nil)
 		request.Header.Set("X-Emby-Authorization", authorization)
 		header := request.Header.Clone()
-		prepareUpstreamHeaders(header, request, profile)
+		prepareUpstreamHeaders(header, request, policy)
 		assertIdentity(t, header)
 	})
 
@@ -1915,7 +2097,7 @@ func TestCustomUAProfileIsConsistentAcrossHTTPWebSocketAndRedirects(t *testing.T
 		request.Header.Set("Connection", "Upgrade")
 		request.Header.Set("Upgrade", "websocket")
 		request.Header.Set("X-Emby-Authorization", authorization)
-		header := prepareWebSocketUpstreamHeaders(request, target, profile)
+		header := prepareWebSocketUpstreamHeaders(request, target, policy)
 		assertIdentity(t, header)
 	})
 
@@ -1928,7 +2110,7 @@ func TestCustomUAProfileIsConsistentAcrossHTTPWebSocketAndRedirects(t *testing.T
 		var followedHeaders http.Header
 		transport := &redirectFollowTransport{
 			playbackHosts: map[string]bool{redirectHostKey(target): true},
-			profile:       profile,
+			policy:        policy,
 			base: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 				calls++
 				if calls == 1 {
@@ -1950,7 +2132,7 @@ func TestCustomUAProfileIsConsistentAcrossHTTPWebSocketAndRedirects(t *testing.T
 		}
 		request := httptest.NewRequest(http.MethodGet, "https://api.example.com/Videos/1/stream", nil)
 		request.Header.Set("X-Emby-Authorization", authorization)
-		applyUAProfileHeaders(request.Header, profile)
+		applyUAHeaderPolicy(request.Header, policy)
 		response, err := transport.RoundTrip(request)
 		if err != nil {
 			t.Fatalf("follow redirect: %v", err)
@@ -1973,7 +2155,7 @@ func TestRedirectFollowStripsSensitiveHeadersCrossOrigin(t *testing.T) {
 	calls := 0
 	transport := &redirectFollowTransport{
 		playbackHosts: map[string]bool{redirectHostKey(target): true},
-		profile:       profile,
+		policy:        UAHeaderPolicy{Rewrite: true, Profile: profile},
 		base: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 			calls++
 			if calls == 1 {
@@ -2025,10 +2207,11 @@ func TestRedirectFollowStripsSensitiveHeadersCrossOrigin(t *testing.T) {
 	if strings.Contains(emby, "emby-access-token") {
 		t.Fatalf("Emby access token forwarded across origin: %q", emby)
 	}
-	for _, want := range []string{`Client="Meridian Test"`, `Version="1.0.0"`, `Device="TV"`, `DeviceId="device-1"`} {
-		if !strings.Contains(emby, want) {
-			t.Fatalf("authorization = %q, missing %q", emby, want)
-		}
+	if strings.Contains(strings.ToLower(emby), "token=") {
+		t.Fatalf("Token attribute survives cross-origin hop: %q", emby)
+	}
+	if emby != `MediaBrowser Device="TV", DeviceId="device-1", Client="Meridian Test", Version="1.0.0"` {
+		t.Fatalf("identity fields altered: %q", emby)
 	}
 	if got := followedHeaders.Get("User-Agent"); got != profile.UserAgent {
 		t.Fatalf("User-Agent = %q, want %q", got, profile.UserAgent)
@@ -2045,7 +2228,7 @@ func TestRedirectFollowKeepsHeadersSameOrigin(t *testing.T) {
 	calls := 0
 	transport := &redirectFollowTransport{
 		playbackHosts: map[string]bool{redirectHostKey(target): true},
-		profile:       profile,
+		policy:        UAHeaderPolicy{Rewrite: true, Profile: profile},
 		base: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 			calls++
 			if calls == 1 {
@@ -2101,19 +2284,61 @@ func TestStripEmbyAuthorizationToken(t *testing.T) {
 		{
 			name:     "removes token and keeps identity",
 			value:    `MediaBrowser Client="App", Device="TV", DeviceId="d1", Token="secret", Version="1"`,
-			want:     `MediaBrowser Client="App", Device="TV", DeviceId="d1", Token="", Version="1"`,
+			want:     `MediaBrowser Client="App", Device="TV", DeviceId="d1", Version="1"`,
 			wantSafe: true,
 		},
 		{
 			name:     "emby scheme is stripped like mediabrowser",
 			value:    `Emby Device="TV", Token="secret"`,
-			want:     `Emby Device="TV", Token=""`,
+			want:     `Emby Device="TV"`,
+			wantSafe: true,
+		},
+		{
+			name:     "token as only attribute leaves bare scheme",
+			value:    `MediaBrowser Token="secret"`,
+			want:     `MediaBrowser`,
+			wantSafe: true,
+		},
+		{
+			name:     "token as first attribute drops delimiter",
+			value:    `MediaBrowser Token="secret", Client="App"`,
+			want:     `MediaBrowser Client="App"`,
+			wantSafe: true,
+		},
+		{
+			name:     "token as last attribute drops preceding delimiter",
+			value:    `MediaBrowser Client="App", Device="TV", Token="secret"`,
+			want:     `MediaBrowser Client="App", Device="TV"`,
 			wantSafe: true,
 		},
 		{
 			name:     "leading whitespace is preserved",
 			value:    `  MediaBrowser Token="secret"`,
-			want:     `  MediaBrowser Token=""`,
+			want:     `  MediaBrowser`,
+			wantSafe: true,
+		},
+		{
+			name:     "token name matching is case-insensitive",
+			value:    `MediaBrowser Client="App", tOkEn="secret", Version="1"`,
+			want:     `MediaBrowser Client="App", Version="1"`,
+			wantSafe: true,
+		},
+		{
+			name:     "irregular whitespace around token is absorbed",
+			value:    `MediaBrowser Token="secret"  ,  Client="App"`,
+			want:     `MediaBrowser Client="App"`,
+			wantSafe: true,
+		},
+		{
+			name:     "whitespace before token attribute is preserved",
+			value:    "MediaBrowser\tToken=\"secret\", Client=\"App\"",
+			want:     "MediaBrowser\tClient=\"App\"",
+			wantSafe: true,
+		},
+		{
+			name:     "token value with comma is still removed",
+			value:    `MediaBrowser Client="App", Token="a,b", Version="1"`,
+			want:     `MediaBrowser Client="App", Version="1"`,
 			wantSafe: true,
 		},
 		{
@@ -2141,9 +2366,21 @@ func TestStripEmbyAuthorizationToken(t *testing.T) {
 			wantSafe: false,
 		},
 		{
+			name:     "duplicate token with mixed case fails closed",
+			value:    `MediaBrowser Token="a", token="b", Client="App"`,
+			want:     `MediaBrowser Token="a", token="b", Client="App"`,
+			wantSafe: false,
+		},
+		{
 			name:     "unterminated attribute fails closed",
 			value:    `MediaBrowser Client="unterminated`,
 			want:     `MediaBrowser Client="unterminated`,
+			wantSafe: false,
+		},
+		{
+			name:     "unquoted token value fails closed",
+			value:    `MediaBrowser Client="App", Token=secret`,
+			want:     `MediaBrowser Client="App", Token=secret`,
 			wantSafe: false,
 		},
 		{
@@ -2161,6 +2398,9 @@ func TestStripEmbyAuthorizationToken(t *testing.T) {
 			}
 			if safe != tt.wantSafe {
 				t.Fatalf("safe = %v, want %v", safe, tt.wantSafe)
+			}
+			if safe && strings.Contains(strings.ToLower(got), "token=") {
+				t.Fatalf("stripped value still carries a Token attribute: %q", got)
 			}
 		})
 	}
@@ -2192,8 +2432,11 @@ func TestStripSensitiveRedirectHeadersRemovesDedicatedTokenHeaders(t *testing.T)
 	if strings.Contains(emby, "emby-access-token") {
 		t.Fatalf("Emby access token forwarded: %q", emby)
 	}
-	if !strings.Contains(emby, `Device="TV"`) {
-		t.Fatalf("identity fields lost: %q", emby)
+	if strings.Contains(strings.ToLower(emby), "token=") {
+		t.Fatalf("Token attribute survives stripping: %q", emby)
+	}
+	if emby != `MediaBrowser Device="TV", Client="old"` {
+		t.Fatalf("identity fields altered: %q", emby)
 	}
 	if got := header.Get("X-Forwarded-For"); got != "10.0.0.1" {
 		t.Fatalf("non-sensitive header dropped: %q", got)
@@ -2223,7 +2466,7 @@ func TestRedirectFollowDropsUnsafeEmbyAuthorizationCrossOrigin(t *testing.T) {
 	calls := 0
 	transport := &redirectFollowTransport{
 		playbackHosts: map[string]bool{redirectHostKey(target): true},
-		profile:       profile,
+		policy:        UAHeaderPolicy{Rewrite: true, Profile: profile},
 		base: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 			calls++
 			if calls == 1 {
@@ -2257,6 +2500,198 @@ func TestRedirectFollowDropsUnsafeEmbyAuthorizationCrossOrigin(t *testing.T) {
 	}
 	if got := followedHeaders.Values("X-Emby-Authorization"); len(got) != 0 {
 		t.Fatalf("unsafe X-Emby-Authorization forwarded across origin: %q", got)
+	}
+}
+
+func TestRedirectFollowPassthroughCrossOriginPreservesIdentityStripsSecrets(t *testing.T) {
+	target, err := normalizeTargetURL("https://media.example.com")
+	if err != nil {
+		t.Fatalf("normalize target: %v", err)
+	}
+	var followedHeaders http.Header
+	calls := 0
+	transport := &redirectFollowTransport{
+		playbackHosts: map[string]bool{redirectHostKey(target): true},
+		policy:        UAHeaderPolicy{},
+		base: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			calls++
+			if calls == 1 {
+				return &http.Response{
+					StatusCode: http.StatusFound,
+					Header:     http.Header{"Location": []string{"https://media.example.com/Videos/1/stream"}},
+					Body:       io.NopCloser(strings.NewReader("")),
+					Request:    request,
+				}, nil
+			}
+			followedHeaders = request.Header.Clone()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("ok")),
+				Request:    request,
+			}, nil
+		}),
+	}
+	request := httptest.NewRequest(http.MethodGet, "https://api.example.com/Videos/1/stream", nil)
+	request.Header.Set("User-Agent", "ClientUA/9.9")
+	request.Header.Set("Cookie", "session=secret-cookie")
+	request.Header.Set("Authorization", "Bearer opaque-bearer")
+	request.Header.Set("X-Emby-Authorization", `MediaBrowser Client="Client", Device="TV", DeviceId="d1", Token="emby-access-token", Version="1"`)
+	request.Header.Set("X-Emby-Token", "emby-access-token")
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		t.Fatalf("follow redirect: %v", err)
+	}
+	response.Body.Close()
+
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+	if got := followedHeaders.Get("Cookie"); got != "" {
+		t.Fatalf("Cookie forwarded across origin: %q", got)
+	}
+	if got := followedHeaders.Get("Authorization"); got != "" {
+		t.Fatalf("Authorization forwarded across origin: %q", got)
+	}
+	if got := followedHeaders.Get("X-Emby-Token"); got != "" {
+		t.Fatalf("X-Emby-Token forwarded across origin: %q", got)
+	}
+	emby := followedHeaders.Get("X-Emby-Authorization")
+	if strings.Contains(emby, "emby-access-token") {
+		t.Fatalf("Emby access token forwarded across origin: %q", emby)
+	}
+	if strings.Contains(strings.ToLower(emby), "token=") {
+		t.Fatalf("Token attribute survives cross-origin hop: %q", emby)
+	}
+	if emby != `MediaBrowser Client="Client", Device="TV", DeviceId="d1", Version="1"` {
+		t.Fatalf("identity fields altered: %q", emby)
+	}
+	// Passthrough keeps the client's own non-secret identity and UA.
+	if got := followedHeaders.Get("User-Agent"); got != "ClientUA/9.9" {
+		t.Fatalf("User-Agent = %q, want the client value preserved", got)
+	}
+}
+
+func TestRedirectFollowPassthroughSameOriginKeepsAuth(t *testing.T) {
+	target, err := normalizeTargetURL("https://media.example.com")
+	if err != nil {
+		t.Fatalf("normalize target: %v", err)
+	}
+	var followedHeaders http.Header
+	calls := 0
+	transport := &redirectFollowTransport{
+		playbackHosts: map[string]bool{redirectHostKey(target): true},
+		policy:        UAHeaderPolicy{},
+		base: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			calls++
+			if calls == 1 {
+				return &http.Response{
+					StatusCode: http.StatusFound,
+					Header:     http.Header{"Location": []string{"https://media.example.com/Videos/1/stream"}},
+					Body:       io.NopCloser(strings.NewReader("")),
+					Request:    request,
+				}, nil
+			}
+			followedHeaders = request.Header.Clone()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("ok")),
+				Request:    request,
+			}, nil
+		}),
+	}
+	request := httptest.NewRequest(http.MethodGet, "https://media.example.com/Videos/1/stream", nil)
+	request.Header.Set("User-Agent", "ClientUA/9.9")
+	request.Header.Set("Cookie", "session=secret-cookie")
+	request.Header.Set("Authorization", "Bearer opaque-bearer")
+	request.Header.Set("X-Emby-Authorization", `MediaBrowser Client="Client", Device="TV", Token="emby-access-token", Version="1"`)
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		t.Fatalf("follow redirect: %v", err)
+	}
+	response.Body.Close()
+
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+	if got := followedHeaders.Get("Cookie"); got != "session=secret-cookie" {
+		t.Fatalf("Cookie dropped on same-origin redirect: %q", got)
+	}
+	if got := followedHeaders.Get("Authorization"); got != "Bearer opaque-bearer" {
+		t.Fatalf("Authorization dropped on same-origin redirect: %q", got)
+	}
+	if got := followedHeaders.Get("User-Agent"); got != "ClientUA/9.9" {
+		t.Fatalf("User-Agent = %q, want the client value preserved", got)
+	}
+	emby := followedHeaders.Get("X-Emby-Authorization")
+	if !strings.Contains(emby, "emby-access-token") {
+		t.Fatalf("Emby token lost on same-origin redirect: %q", emby)
+	}
+	if !strings.Contains(emby, `Client="Client"`) {
+		t.Fatalf("Emby identity lost on same-origin redirect: %q", emby)
+	}
+}
+
+func TestRedirectFollowDropsUnsafeEmbyAuthorizationCrossOriginInPassthrough(t *testing.T) {
+	// Duplicate or malformed Token attributes cannot be stripped safely, so the
+	// whole X-Emby-Authorization header must be dropped on a cross-authority hop
+	// even in passthrough mode. The non-secret User-Agent still survives.
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{"duplicate token", `MediaBrowser Token="first", Token="second", Device="TV", Client="Client"`},
+		{"malformed token", `MediaBrowser Client="Client", Device="TV", Token="unterminated`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target, err := normalizeTargetURL("https://media.example.com")
+			if err != nil {
+				t.Fatalf("normalize target: %v", err)
+			}
+			var followedHeaders http.Header
+			calls := 0
+			transport := &redirectFollowTransport{
+				playbackHosts: map[string]bool{redirectHostKey(target): true},
+				policy:        UAHeaderPolicy{},
+				base: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+					calls++
+					if calls == 1 {
+						return &http.Response{
+							StatusCode: http.StatusFound,
+							Header:     http.Header{"Location": []string{"https://media.example.com/Videos/1/stream"}},
+							Body:       io.NopCloser(strings.NewReader("")),
+							Request:    request,
+						}, nil
+					}
+					followedHeaders = request.Header.Clone()
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader("ok")),
+						Request:    request,
+					}, nil
+				}),
+			}
+			request := httptest.NewRequest(http.MethodGet, "https://api.example.com/Videos/1/stream", nil)
+			request.Header.Set("User-Agent", "ClientUA/9.9")
+			request.Header.Set("X-Emby-Authorization", tc.value)
+			response, err := transport.RoundTrip(request)
+			if err != nil {
+				t.Fatalf("follow redirect: %v", err)
+			}
+			response.Body.Close()
+
+			if calls != 2 {
+				t.Fatalf("calls = %d, want 2", calls)
+			}
+			if got := followedHeaders.Values("X-Emby-Authorization"); len(got) != 0 {
+				t.Fatalf("unsafe X-Emby-Authorization forwarded across origin: %q", got)
+			}
+			if got := followedHeaders.Get("User-Agent"); got != "ClientUA/9.9" {
+				t.Fatalf("User-Agent = %q, want the client value preserved", got)
+			}
+		})
 	}
 }
 
@@ -4066,6 +4501,175 @@ func TestHandleSiteDiagUsesResolvedCustomUAProfile(t *testing.T) {
 	}
 	if got := mustStringValue(t, headers, "version_field"); got != "1.0.0" {
 		t.Fatalf("version_field = %q", got)
+	}
+}
+
+func TestHandleSitesCreateAndUpdatePassthroughMode(t *testing.T) {
+	app := newTestApp(t)
+	port := freePort(t)
+	releasePort(port)
+	createPayload, err := json.Marshal(map[string]interface{}{
+		"name":              "passthrough-site",
+		"listen_port":       port,
+		"target_url":        "http://127.0.0.1:8096",
+		"ua_mode":           "passthrough",
+		"custom_user_agent": "Stale UA",
+		"custom_client":     "Stale Client",
+		"custom_version":    "9.9",
+	})
+	if err != nil {
+		t.Fatalf("marshal create payload: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	app.handleSites(rr, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(createPayload)))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var created Site
+	if err := json.Unmarshal(rr.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created site: %v", err)
+	}
+	t.Cleanup(func() { app.pm.StopSite(created.ID) })
+	if created.UAMode != passthroughUAMode || created.CustomUserAgent != "" || created.CustomClient != "" || created.CustomVersion != "" {
+		t.Fatalf("created passthrough site = %#v, want cleared custom triplet", created)
+	}
+
+	// PUT switching passthrough -> custom stores the triplet.
+	customPayload, err := json.Marshal(map[string]interface{}{
+		"name":              created.Name,
+		"listen_port":       created.ListenPort,
+		"target_url":        created.TargetURL,
+		"ua_mode":           "custom",
+		"custom_user_agent": "New UA",
+		"custom_client":     "New Client",
+		"custom_version":    "2.0",
+	})
+	if err != nil {
+		t.Fatalf("marshal custom payload: %v", err)
+	}
+	rr = httptest.NewRecorder()
+	app.handleSiteByID(rr, httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(created.ID), bytes.NewReader(customPayload)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("custom update status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	reloaded, err := app.db.GetSite(created.ID)
+	if err != nil {
+		t.Fatalf("load custom site: %v", err)
+	}
+	if reloaded.UAMode != customUAMode || reloaded.CustomUserAgent != "New UA" || reloaded.CustomClient != "New Client" || reloaded.CustomVersion != "2.0" {
+		t.Fatalf("custom update = %#v", reloaded)
+	}
+
+	// PUT switching custom -> passthrough clears the triplet again.
+	passPayload, err := json.Marshal(map[string]interface{}{
+		"name":        reloaded.Name,
+		"listen_port": reloaded.ListenPort,
+		"target_url":  reloaded.TargetURL,
+		"ua_mode":     "passthrough",
+	})
+	if err != nil {
+		t.Fatalf("marshal passthrough payload: %v", err)
+	}
+	rr = httptest.NewRecorder()
+	app.handleSiteByID(rr, httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(created.ID), bytes.NewReader(passPayload)))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("passthrough update status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	reloaded, err = app.db.GetSite(created.ID)
+	if err != nil {
+		t.Fatalf("load passthrough site: %v", err)
+	}
+	if reloaded.UAMode != passthroughUAMode || reloaded.CustomUserAgent != "" || reloaded.CustomClient != "" || reloaded.CustomVersion != "" {
+		t.Fatalf("passthrough update = %#v, want cleared custom triplet", reloaded)
+	}
+}
+
+func TestHandleSitesRejectsUnknownUAMode(t *testing.T) {
+	app := newTestApp(t)
+	payload, err := json.Marshal(map[string]interface{}{
+		"name":        "bogus-mode",
+		"listen_port": freePort(t),
+		"target_url":  "http://127.0.0.1:8096",
+		"ua_mode":     "bogus",
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	app.handleSites(rr, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(payload)))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if sites, err := app.db.ListSites(); err != nil || len(sites) != 0 {
+		t.Fatalf("unknown-mode site was persisted: sites=%#v err=%v", sites, err)
+	}
+}
+
+func TestHandleSiteDiagMarksPassthroughWithoutExposingIdentity(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/System/Info/Public" {
+			w.Write([]byte("{\"Version\":\"4.9.0\"}"))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer upstream.Close()
+
+	app := newTestApp(t)
+	site, err := app.db.CreateSite("diag-passthrough", freePort(t), upstream.URL, "", "direct", "[]", passthroughUAMode, 0, 0)
+	if err != nil {
+		t.Fatalf("create passthrough site: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	app.handleSiteByID(rr, httptest.NewRequest(http.MethodGet, "/api/sites/"+jsonNumber64(site.ID)+"/diag", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("diag status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	headers := mustMapValue(t, decodeBody(t, rr), "headers")
+	if got := mustBoolValue(t, headers, "passthrough"); !got {
+		t.Fatalf("passthrough = %v, want true", got)
+	}
+	if got := mustBoolValue(t, headers, "ua_applied"); got {
+		t.Fatalf("ua_applied = %v, want false", got)
+	}
+	// Diagnostics must not render identity values for passthrough: there is no
+	// configured profile, and the real request headers are never shown.
+	if got := mustStringValue(t, headers, "current_ua"); got != "" {
+		t.Fatalf("current_ua = %q, want empty", got)
+	}
+	if got := mustStringValue(t, headers, "client_field"); got != "" {
+		t.Fatalf("client_field = %q, want empty", got)
+	}
+	if got := mustStringValue(t, headers, "version_field"); got != "" {
+		t.Fatalf("version_field = %q, want empty", got)
+	}
+}
+
+func TestHandleUAProfilesReturnsThreePresetsWithoutPassthrough(t *testing.T) {
+	app := newTestApp(t)
+	rr := httptest.NewRecorder()
+	app.handleUAProfiles(rr, httptest.NewRequest(http.MethodGet, "/api/ua-profiles", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var profiles []UAProfile
+	if err := json.Unmarshal(rr.Body.Bytes(), &profiles); err != nil {
+		t.Fatalf("decode profiles: %v body=%s", err, rr.Body.String())
+	}
+	if len(profiles) != 3 {
+		t.Fatalf("profiles = %#v, want exactly the three presets", profiles)
+	}
+	names := make(map[string]bool, len(profiles))
+	for _, p := range profiles {
+		names[p.Name] = true
+		if p.Name == "" || p.UserAgent == "" || p.Client == "" || p.Version == "" {
+			t.Fatalf("preset with empty identity fields: %#v", p)
+		}
+	}
+	for _, want := range []string{"Infuse", "Web", "Client"} {
+		if !names[want] {
+			t.Fatalf("presets missing %q: %#v", want, profiles)
+		}
 	}
 }
 

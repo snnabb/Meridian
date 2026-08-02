@@ -36,7 +36,7 @@ Meridian 把这些事情打包成一个单二进制程序，带管理界面，�
 |------|------|
 | **多站点反代** | 每个站点独立监听端口，独立配置上游地址 |
 | **双上游分流** | 网页/API 和播放/转码流量可分别指向不同上游 |
-| **UA 伪装** | 3 种预设（Infuse / Web / 客户端）或每站自定义身份；HTTP、WebSocket 与受限播放重定向统一改写 |
+| **UA 伪装** | 预设（Infuse / Web / 客户端）、自定义固定身份或透传保留客户端身份；HTTP、WebSocket 与受限播放重定向统一改写或透传 |
 | **流量管控** | 按站点统计流量、设置限速、设置配额 |
 | **WebSocket 代理** | 完整支持 Emby 的 WebSocket 通信 |
 | **SSE 实时推送** | 仪表盘数据通过 Server-Sent Events 实时更新 |
@@ -272,7 +272,12 @@ Meridian/
 
 ### UA 身份模式
 
-每个站点可选 Infuse、Web、客户端三个预设，或选择“自定义”并填写 `User-Agent`、Emby `Client`、`Version`。自定义值会在普通 HTTP、WebSocket 以及受配置白名单约束的播放重定向请求中保持一致；`Device` 与 `DeviceId` 会原样保留。为避免请求头注入和 Emby 授权头格式损坏，自定义值只接受受限长度的可打印 ASCII 字符，`Client` 和 `Version` 不接受引号或反斜杠。
+每个站点可选 Infuse、Web、客户端三个预设，或选择“自定义”固定身份，或选择“透传”保留客户端身份。
+
+- **自定义（固定身份）**：填写 `User-Agent`、Emby `Client`、`Version`，Meridian 会在普通 HTTP、WebSocket 以及受配置白名单约束的播放重定向请求中统一改写成这套固定值，所有请求保持一致；`Device` 与 `DeviceId` 会原样保留。为避免请求头注入和 Emby 授权头格式损坏，自定义值只接受受限长度的可打印 ASCII 字符，`Client` 和 `Version` 不接受引号或反斜杠。
+- **透传（每请求真实身份）**：Meridian 不生成也不改写任何 UA 身份，每个请求原样保留客户端自带的 `User-Agent` 与 Emby `Client`、`Version`、`Device`、`DeviceId` 后转发，适合多用户共用一个反代站点、需要按客户端区分身份的部署。
+
+两种模式的凭据安全边界一致：跨 authority 转发时 `Cookie`、`Authorization` 等凭据仍会被剥离，`X-Forwarded-*` 与 hop-by-hop 请求头清洗保持不变，透传不会绕过任何凭据清洗。
 
 ---
 

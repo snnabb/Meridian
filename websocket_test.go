@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"io"
@@ -89,14 +90,32 @@ func (u *fakeWSUpstream) waitFor(t *testing.T, marker string) {
 	t.Fatalf("upstream never received %q; got %q", marker, u.received())
 }
 
-func newWSProxyServer(t *testing.T, upstreamAddr string, inst *ProxyInstance, speedLimitBytes int64) *httptest.Server {
+// waitForRequest blocks until a complete HTTP request header block has arrived
+// and parses it with http.ReadRequest. Header names are case-insensitive on the
+// wire and net/http writes its canonical spelling (e.g. "Sec-Websocket-Key"), so
+// callers must look headers up by name rather than match literal header text.
+func (u *fakeWSUpstream) waitForRequest(t *testing.T) *http.Request {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		req, err := http.ReadRequest(bufio.NewReader(strings.NewReader(u.received())))
+		if err == nil {
+			return req
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("upstream never received a complete request; got %q", u.received())
+	return nil
+}
+
+func newWSProxyServer(t *testing.T, upstreamAddr string, inst *ProxyInstance, speedLimitBytes int64, policy UAHeaderPolicy) *httptest.Server {
 	t.Helper()
 	target, err := normalizeTargetURL("http://" + upstreamAddr)
 	if err != nil {
 		t.Fatalf("normalizeTargetURL: %v", err)
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		handleWebSocket(w, r, target, getUAProfile("infuse"), inst, speedLimitBytes)
+		handleWebSocket(w, r, target, policy, inst, speedLimitBytes)
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -122,7 +141,7 @@ func TestHandleWebSocketRefusesTunnelWhenUpstreamDoesNotSwitchProtocols(t *testi
 	// requests that skipped every forwarding-header sanitizer.
 	upstream := startFakeWSUpstream(t, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
 	inst := &ProxyInstance{server: &http.Server{}}
-	srv := newWSProxyServer(t, upstream.ln.Addr().String(), inst, 0)
+	srv := newWSProxyServer(t, upstream.ln.Addr().String(), inst, 0, UAHeaderPolicy{Rewrite: true, Profile: getUAProfile("infuse")})
 
 	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
 	if err != nil {
@@ -173,7 +192,7 @@ func TestHandleWebSocketRelaysSwitchAndMetersBothDirections(t *testing.T) {
 		"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"+
 		serverPayload)
 	inst := &ProxyInstance{server: &http.Server{}}
-	srv := newWSProxyServer(t, upstream.ln.Addr().String(), inst, 0)
+	srv := newWSProxyServer(t, upstream.ln.Addr().String(), inst, 0, UAHeaderPolicy{Rewrite: true, Profile: getUAProfile("infuse")})
 
 	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
 	if err != nil {
@@ -220,7 +239,7 @@ func TestHandleWebSocketRejectsUpgradeCarryingBody(t *testing.T) {
 	// Nothing on the upgrade path reads r.Body, so a body would be left in the
 	// hijacked buffer and relayed to the upstream verbatim.
 	inst := &ProxyInstance{server: &http.Server{}}
-	srv := newWSProxyServer(t, "127.0.0.1:9", inst, 0)
+	srv := newWSProxyServer(t, "127.0.0.1:9", inst, 0, UAHeaderPolicy{Rewrite: true, Profile: getUAProfile("infuse")})
 
 	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
 	if err != nil {
@@ -248,6 +267,92 @@ func TestHandleWebSocketRejectsUpgradeCarryingBody(t *testing.T) {
 	}
 	if !strings.Contains(string(buf[:n]), "400 Bad Request") {
 		t.Fatalf("client response = %q, want 400 Bad Request", string(buf[:n]))
+	}
+}
+
+func TestHandleWebSocketPassthroughPreservesClientIdentity(t *testing.T) {
+	const clientUA = "ClientUA/9.9"
+	const clientAuth = `MediaBrowser Client="Client", Device="TV", Version="1"`
+
+	for _, tc := range []struct {
+		name     string
+		policy   UAHeaderPolicy
+		wantUA   string
+		wantAuth string
+		absent   []string
+	}{
+		{
+			name:     "passthrough keeps client identity",
+			policy:   UAHeaderPolicy{},
+			wantUA:   clientUA,
+			wantAuth: clientAuth,
+			absent:   []string{"Infuse/7.8.1", `Client="Infuse"`},
+		},
+		{
+			name:     "rewrite applies configured identity",
+			policy:   UAHeaderPolicy{Rewrite: true, Profile: getUAProfile("infuse")},
+			wantUA:   "Infuse/7.8.1",
+			wantAuth: `MediaBrowser Client="Infuse", Device="TV", Version="7.8.1"`,
+			absent:   []string{clientUA, `Client="Client"`},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := startFakeWSUpstream(t, "HTTP/1.1 101 Switching Protocols\r\n"+
+				"Upgrade: websocket\r\n"+
+				"Connection: Upgrade\r\n"+
+				"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
+			inst := &ProxyInstance{server: &http.Server{}}
+			srv := newWSProxyServer(t, upstream.ln.Addr().String(), inst, 0, tc.policy)
+
+			conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+			if err != nil {
+				t.Fatalf("dial proxy: %v", err)
+			}
+			handshake := "GET /embywebsocket HTTP/1.1\r\n" +
+				"Host: proxy.test\r\n" +
+				"Upgrade: websocket\r\n" +
+				"Connection: Upgrade\r\n" +
+				"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+				"Sec-WebSocket-Version: 13\r\n" +
+				"User-Agent: " + clientUA + "\r\n" +
+				"X-Emby-Authorization: " + clientAuth + "\r\n\r\n"
+			if _, err := io.WriteString(conn, handshake); err != nil {
+				conn.Close()
+				t.Fatalf("write handshake: %v", err)
+			}
+			// Drain until the relayed 101 arrives, then close our side.
+			if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				conn.Close()
+				t.Fatalf("set client deadline: %v", err)
+			}
+			buf := make([]byte, 1024)
+			seen := ""
+			for !strings.Contains(seen, "101 Switching Protocols") {
+				n, err := conn.Read(buf)
+				if err != nil {
+					break
+				}
+				seen += string(buf[:n])
+			}
+			conn.Close()
+
+			req := upstream.waitForRequest(t)
+			received := upstream.received()
+			if got := req.Header.Get("Sec-WebSocket-Key"); got != "dGhlIHNhbXBsZSBub25jZQ==" {
+				t.Fatalf("upstream handshake Sec-WebSocket-Key = %q, want the client key; got: %q", got, received)
+			}
+			if got := req.Header.Get("User-Agent"); got != tc.wantUA {
+				t.Fatalf("upstream handshake User-Agent = %q, want %q; got: %q", got, tc.wantUA, received)
+			}
+			if got := req.Header.Get("X-Emby-Authorization"); got != tc.wantAuth {
+				t.Fatalf("upstream handshake X-Emby-Authorization = %q, want %q; got: %q", got, tc.wantAuth, received)
+			}
+			for _, marker := range tc.absent {
+				if strings.Contains(received, marker) {
+					t.Fatalf("upstream handshake carried %q: %q", marker, received)
+				}
+			}
+		})
 	}
 }
 
@@ -297,7 +402,7 @@ func TestPrepareWebSocketUpstreamHeadersDropsContentLength(t *testing.T) {
 	if err != nil {
 		t.Fatalf("normalizeTargetURL: %v", err)
 	}
-	header := prepareWebSocketUpstreamHeaders(req, target, getUAProfile("infuse"))
+	header := prepareWebSocketUpstreamHeaders(req, target, UAHeaderPolicy{Rewrite: true, Profile: getUAProfile("infuse")})
 	if got := header.Get("Content-Length"); got != "" {
 		t.Fatalf("Content-Length = %q, want it dropped before the upstream handshake", got)
 	}
