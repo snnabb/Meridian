@@ -238,6 +238,39 @@ restore_data_snapshot() {
     restore_data_permissions
 }
 
+restore_env_from_snapshot() {
+    # A failed full-directory restore must not leave pre-start configuration
+    # backfills (for example a newly generated encryption key) in the live
+    # environment. Restore just the exact pre-update .env atomically while the
+    # full snapshot remains pending for the exit-trap retry/manual recovery.
+    # This deliberately does not mark UPDATE_SNAPSHOT_RESTORED: database and
+    # other data files may still require the complete snapshot.
+    local snapshot_dir="$1" snapshot_env env_file
+    snapshot_env="${snapshot_dir}/data/.env"
+    env_file=$(env_file_path)
+    as_root test -f "$snapshot_env" || return 1
+    if as_root test -L "$snapshot_env"; then
+        return 1
+    fi
+    as_root test -d "$DATA_DIR" || return 1
+    if as_root test -L "$env_file"; then
+        return 1
+    fi
+    install_env_file "$snapshot_env"
+}
+
+restore_update_snapshot() {
+    local snapshot_dir="$1"
+    if restore_data_snapshot "$snapshot_dir"; then
+        UPDATE_SNAPSHOT_RESTORED=1
+        return 0
+    fi
+    if ! restore_env_from_snapshot "$snapshot_dir"; then
+        warn "完整数据快照恢复失败，且无法单独恢复更新前的 .env，请使用备份手动恢复: ${LAST_BACKUP_PATH:-<unknown>}"
+    fi
+    return 1
+}
+
 restore_data_permissions() {
     # Reapplies the ownership/mode contract of prepare_data_and_config after a
     # snapshot restore: the staged copy arrives as root:0700, which the
@@ -693,9 +726,7 @@ cleanup_update_transaction() {
         fi
         if [ -n "$UPDATE_SNAPSHOT_DIR" ] && [ -d "$UPDATE_SNAPSHOT_DIR" ] \
             && [ "$UPDATE_SNAPSHOT_RESTORED" != "1" ]; then
-            if restore_data_snapshot "$UPDATE_SNAPSHOT_DIR"; then
-                UPDATE_SNAPSHOT_RESTORED=1
-            else
+            if ! restore_update_snapshot "$UPDATE_SNAPSHOT_DIR"; then
                 warn "数据快照恢复失败，原数据目录未被删除，请使用备份手动恢复: ${LAST_BACKUP_PATH:-<unknown>}"
             fi
         fi
@@ -1291,9 +1322,7 @@ do_update() {
             warn "新版本健康检查失败，正在自动回滚..."
             restore_previous_binary || fail "回滚失败：缺少上一版本二进制，请手动恢复 ${LAST_BACKUP_PATH:-备份归档}"
             UPDATE_BINARY_CHANGED=0
-            if restore_data_snapshot "$UPDATE_SNAPSHOT_DIR"; then
-                UPDATE_SNAPSHOT_RESTORED=1
-            else
+            if ! restore_update_snapshot "$UPDATE_SNAPSHOT_DIR"; then
                 warn "数据快照恢复失败，原数据目录未被删除，请使用备份手动恢复: $LAST_BACKUP_PATH"
             fi
             as_root systemctl restart "$SERVICE_NAME"
@@ -1308,9 +1337,7 @@ do_update() {
             warn "新版本二进制无法执行，正在自动回滚..."
             restore_previous_binary || true
             UPDATE_BINARY_CHANGED=0
-            if restore_data_snapshot "$UPDATE_SNAPSHOT_DIR"; then
-                UPDATE_SNAPSHOT_RESTORED=1
-            else
+            if ! restore_update_snapshot "$UPDATE_SNAPSHOT_DIR"; then
                 warn "数据快照恢复失败，原数据目录未被删除，请使用备份手动恢复: $LAST_BACKUP_PATH"
             fi
             fail "新版本无法执行，已恢复上一版本及原数据配置"
