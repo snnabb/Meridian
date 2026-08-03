@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 # This file is a mock harness: the mock functions it defines are invoked
 # indirectly by the sourced install.sh, which ShellCheck cannot statically
 # trace, so every mock body would otherwise look unreachable.
@@ -302,6 +302,50 @@ fi
 assert_eq 'v9.9.9' "$(get_current_version)" 'first installed version'
 assert_file "${DATA_DIR}/.env"
 assert_eq '0.0.0.0' "$(read_env_value PANEL_BIND_ADDR)" 'fresh IP bind'
+upstream_header_key=$(read_env_value UPSTREAM_HEADER_KEY)
+if [ "${#upstream_header_key}" -lt 32 ]; then
+    echo 'FAIL: fresh install must generate UPSTREAM_HEADER_KEY' >&2
+    exit 1
+fi
+
+# Existing valid encryption keys are immutable; an explicitly empty legacy key
+# is repaired, while ambiguous or weak non-empty values fail without rewriting
+# the file.
+key_test_tmp=$(mktemp -d "${TEST_ROOT}/key-test.XXXXXX")
+ensure_upstream_header_key "$key_test_tmp"
+assert_eq "$upstream_header_key" "$(read_env_value UPSTREAM_HEADER_KEY)" 'valid upstream header key is preserved'
+
+awk -F= '$1 == "UPSTREAM_HEADER_KEY" { print "UPSTREAM_HEADER_KEY="; next } { print }' "${DATA_DIR}/.env" > "${key_test_tmp}/empty.env"
+mv "${key_test_tmp}/empty.env" "${DATA_DIR}/.env"
+ensure_upstream_header_key "$key_test_tmp"
+repaired_key=$(read_env_value UPSTREAM_HEADER_KEY)
+if [ "${#repaired_key}" -lt 32 ]; then
+    echo 'FAIL: empty UPSTREAM_HEADER_KEY was not repaired' >&2
+    exit 1
+fi
+
+awk -F= '$1 == "UPSTREAM_HEADER_KEY" { print "UPSTREAM_HEADER_KEY=too-short"; next } { print }' "${DATA_DIR}/.env" > "${key_test_tmp}/short.env"
+mv "${key_test_tmp}/short.env" "${DATA_DIR}/.env"
+short_key_hash=$(sha256_file "${DATA_DIR}/.env")
+if (ensure_upstream_header_key "$key_test_tmp") >"${TEST_ROOT}/short-key.log" 2>&1; then
+    echo 'FAIL: short non-empty UPSTREAM_HEADER_KEY was silently replaced' >&2
+    exit 1
+fi
+assert_eq "$short_key_hash" "$(sha256_file "${DATA_DIR}/.env")" 'short key failure preserves .env'
+
+printf 'UPSTREAM_HEADER_KEY=%s\n' "$repaired_key" >> "${DATA_DIR}/.env"
+duplicate_key_hash=$(sha256_file "${DATA_DIR}/.env")
+if (ensure_upstream_header_key "$key_test_tmp") >"${TEST_ROOT}/duplicate-key.log" 2>&1; then
+    echo 'FAIL: duplicate UPSTREAM_HEADER_KEY definitions were accepted' >&2
+    exit 1
+fi
+assert_eq "$duplicate_key_hash" "$(sha256_file "${DATA_DIR}/.env")" 'duplicate key failure preserves .env'
+
+awk -F= -v key="$repaired_key" '
+    $1 == "UPSTREAM_HEADER_KEY" { if (!seen++) print "UPSTREAM_HEADER_KEY=" key; next }
+    { print }
+' "${DATA_DIR}/.env" > "${key_test_tmp}/restored.env"
+mv "${key_test_tmp}/restored.env" "${DATA_DIR}/.env"
 
 MOCK_LATEST='v9.9.10'
 DOMAIN_MODE='ask'
@@ -339,6 +383,7 @@ if ! (do_update) >"${TEST_ROOT}/update-legacy-setup.log" 2>&1; then
     exit 1
 fi
 [ -n "$(read_env_value SETUP_TOKEN)" ] || { echo 'FAIL: legacy update did not backfill SETUP_TOKEN' >&2; exit 1; }
+[ -n "$(read_env_value UPSTREAM_HEADER_KEY)" ] || { echo 'FAIL: legacy update did not backfill UPSTREAM_HEADER_KEY' >&2; exit 1; }
 assert_contains "${TEST_ROOT}/update-legacy-setup.log" '初始化令牌'
 
 # A newer installed version must never be silently downgraded.

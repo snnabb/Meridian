@@ -40,17 +40,26 @@ jobs:
           go mod verify
           go test -race ./...
           go vet ./...
+          GOOS=windows GOARCH=amd64 go vet ./...
+          GOOS=darwin GOARCH=arm64 go vet ./...
           find web/static/js -name '*.js' -print0 | xargs -0 -n1 node --check
           node --test tests/*.test.js
           bash -n install.sh
           bash -n tests/install_test.sh
-          shellcheck install.sh tests/install_test.sh
+          bash -n tests/upstream_header_key_test.sh
+          shellcheck install.sh tests/install_test.sh tests/upstream_header_key_test.sh
+          bash tests/upstream_header_key_test.sh
           bash tests/install_test.sh
 
       - name: Vulnerability scan
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
           govulncheck ./...
+
+      - name: Security lint
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
+          gosec -quiet -severity medium -confidence medium ./...
 
       - name: Build
         run: go build -trimpath -buildvcs=false -o meridian .

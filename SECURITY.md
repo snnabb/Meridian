@@ -36,14 +36,16 @@
 
 - 未配置域名时管理面板默认监听 `0.0.0.0`；一键脚本启用面板域名后会改为 `127.0.0.1`，只信任回环代理并由 Nginx 提供 HTTPS
 - 管理面板本身不提供 HTTPS，需要外层反代处理 TLS 终止
-- 反代站点的监听端口同样绑定在所有接口上
+- 站点支持 `host`、`port`、`both` 三种入口模式；推荐的 `host` 模式只使用共享 Host 路由，不绑定保留的高端口，并强制要求面板回环绑定或非空 `TRUSTED_PROXY_CIDRS` 来源白名单。面板非回环绑定时，伪造正确 Host 的非可信 peer 仍会被拒绝；`port` 和显式高风险的 `both` 独立端口仍绑定所有接口
+- 设置 `PANEL_DOMAIN` 后，未知 Host 返回 `421` 而不是管理面板；未设置时保留直接 IP/任意 Host 的初始部署兼容行为
 - 安装器生成的 Nginx 配置只代理管理端口，不读取或代理站点回源、播放地址或站点监听端口
 - 管理 API 默认拒绝跨站浏览器请求；所有状态变更还要求同源 `Origin` 或 `Referer`，并发送 CSP、`X-Frame-Options`、`nosniff` 等响应头
 - 管理端和站点代理端都配置了请求头超时、空闲超时及请求头大小上限
 
 ### 数据
 
-- SQLite 数据库文件包含管理员密码哈希和站点配置
+- SQLite 数据库文件包含管理员密码哈希和站点配置；固定上游 Header 的名称以明文保存，值使用独立的 `UPSTREAM_HEADER_KEY` 通过 AES-GCM 加密
+- 管理 API 对固定上游 Header 采用只写语义，不回显明文或数据库密文。`UPSTREAM_HEADER_KEY` 不得与 `JWT_SECRET` 共用，且必须随数据库一起备份
 - **仅 Linux / macOS**：进程会使用 `0077` 文件掩码并将数据库、WAL、SHM 文件收紧为 `0600`
 - **Windows**：不提供等价保证。`os.Chmod` 在 Windows 上只能切换 `FILE_ATTRIBUTE_READONLY`，无法表达"仅所有者可读"的 DACL，因此程序不会尝试收紧权限，而是在启动日志中给出警告。数据库会沿用所在目录的继承权限——请自行限制该目录的访问权限，尤其不要放在 `C:\` 下直接新建的目录中（这类目录默认允许 `BUILTIN\Users` 读取）
 - 没有审计日志，操作不可追溯
@@ -54,6 +56,10 @@
 - 与上游 Emby 服务器的通信基于配置的 URL scheme（HTTP 或 HTTPS）
 - HTTPS/WSS 上游连接和 TLS 诊断都会校验证书链、有效期与主机名，并要求 TLS 1.2 或更高版本
 - 代理会保留上游返回的 CSP 和 `X-Frame-Options` 等安全响应头
+- 固定自定义 Header 只发送给主回源的精确 scheme、主机和有效端口；新密文的 AES-GCM 认证数据同时绑定 Header 名称和该 authority。修改主回源 authority 会在 HTTP 层和数据层清空未重新输入的旧 Header，独立播放回源及跨 authority 重定向也会删除这些 Header。Authorization、Cookie、Host、转发头和 hop-by-hop Header 不能由该功能覆盖
+- Meridian 管理会话 Cookie 会在所有站点 HTTP 与 WebSocket 请求出站前单独剥离，其他上游业务 Cookie 保留；畸形 Cookie Header 按失败关闭策略整头删除
+- 上游 HTTP 响应和 WebSocket 101 中名称精确为 `meridian_session` 的 `Set-Cookie` 会被删除，合法的 Emby/业务 Cookie 原样保留；无法安全解析的单条 `Set-Cookie` 按失败关闭策略丢弃
+- 直连客户端提供的转发头会全部重建；只有 peer 命中 `TRUSTED_PROXY_CIDRS` 时才采纳单一、合法的 `X-Real-IP` 与 `http`/`https` 协议值，不会把任意 `X-Forwarded-For` 链传给上游
 - 运行日志只保留上游的 scheme、主机和端口，不记录路径、查询参数或 URL 凭据
 
 ### 部署与供应链

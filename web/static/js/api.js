@@ -57,6 +57,7 @@ const API = {
   dashboard() { return this.request('GET', '/api/dashboard'); },
 
   // Sites
+  ingressCapabilities() { return this.request('GET', '/api/ingress-capabilities'); },
   listSites() { return this.request('GET', '/api/sites'); },
   createSite(data) { return this.request('POST', '/api/sites', data); },
   updateSite(id, data) { return this.request('PUT', '/api/sites/' + id, data); },

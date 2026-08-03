@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -115,7 +116,7 @@ func newWSProxyServer(t *testing.T, upstreamAddr string, inst *ProxyInstance, sp
 		t.Fatalf("normalizeTargetURL: %v", err)
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		handleWebSocket(w, r, target, policy, inst, speedLimitBytes)
+		handleWebSocket(w, r, target, target, policy, inst, speedLimitBytes)
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -189,7 +190,9 @@ func TestHandleWebSocketRelaysSwitchAndMetersBothDirections(t *testing.T) {
 	upstream := startFakeWSUpstream(t, "HTTP/1.1 101 Switching Protocols\r\n"+
 		"Upgrade: websocket\r\n"+
 		"Connection: Upgrade\r\n"+
-		"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"+
+		"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"+
+		"Set-Cookie: meridian_session=upstream-must-not-overwrite; Path=/\r\n"+
+		"Set-Cookie: emby_session=upstream-keep; Path=/\r\n\r\n"+
 		serverPayload)
 	inst := &ProxyInstance{server: &http.Server{}}
 	srv := newWSProxyServer(t, upstream.ln.Addr().String(), inst, 0, UAHeaderPolicy{Rewrite: true, Profile: getUAProfile("infuse")})
@@ -224,6 +227,12 @@ func TestHandleWebSocketRelaysSwitchAndMetersBothDirections(t *testing.T) {
 	if !strings.Contains(strings.ToLower(seen), "sec-websocket-accept:") {
 		t.Fatalf("handshake response dropped Sec-WebSocket-Accept: %q", seen)
 	}
+	if strings.Contains(seen, "upstream-must-not-overwrite") {
+		t.Fatalf("WebSocket handshake leaked management Set-Cookie: %q", seen)
+	}
+	if !strings.Contains(seen, "emby_session=upstream-keep") {
+		t.Fatalf("WebSocket handshake dropped upstream application cookie: %q", seen)
+	}
 
 	const clientPayload = "CLIENT-FRAMES"
 	if _, err := io.WriteString(conn, clientPayload); err != nil {
@@ -233,6 +242,39 @@ func TestHandleWebSocketRelaysSwitchAndMetersBothDirections(t *testing.T) {
 
 	waitForTunnelCounter(t, &inst.bytesOut, int64(len(serverPayload)), "bytesOut")
 	waitForTunnelCounter(t, &inst.bytesIn, int64(len(clientPayload)), "bytesIn")
+}
+
+func TestProxyInstanceShutdownClosesHijackedConnectionAndDrains(t *testing.T) {
+	instanceCtx, cancel := context.WithCancel(context.Background())
+	inst := &ProxyInstance{ctx: instanceCtx, cancel: cancel, hijackedConns: make(map[net.Conn]struct{})}
+	if !inst.beginRequest() {
+		t.Fatal("fresh instance rejected request")
+	}
+	proxyConn, peerConn := net.Pipe()
+	defer peerConn.Close()
+	if !inst.trackHijackedConn(proxyConn) {
+		t.Fatal("fresh instance rejected hijacked connection")
+	}
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		defer inst.endRequest()
+		defer inst.untrackHijackedConn(proxyConn)
+		_, _ = proxyConn.Read(make([]byte, 1))
+	}()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
+	defer shutdownCancel()
+	if err := inst.shutdown(shutdownCtx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	select {
+	case <-readDone:
+	case <-time.After(time.Second):
+		t.Fatal("hijacked connection did not close during shutdown")
+	}
+	if inst.trackHijackedConn(peerConn) {
+		t.Fatal("closing instance accepted a new hijacked connection")
+	}
 }
 
 func TestHandleWebSocketRejectsUpgradeCarryingBody(t *testing.T) {

@@ -45,7 +45,7 @@ function renderDashboard() {
       <div style="overflow-x:auto">
         <table>
           <thead><tr>
-            <th>站点</th><th>状态</th><th>回源地址</th><th>UA 模式</th><th>端口</th><th>已用流量</th>
+            <th>站点</th><th>状态</th><th>回源地址</th><th>UA 模式</th><th>入口</th><th>已用流量</th>
           </tr></thead>
           <tbody id="dash-table"></tbody>
         </table>
@@ -192,13 +192,20 @@ async function loadDashboardTable() {
         <td><span class="status-badge"><span class="status-led ${s.running ? 'on' : 'off'}"></span>${s.running ? '运行中' : '已停止'}</span></td>
         <td class="mono">${esc(s.target_url)}</td>
         <td><span class="pill ${uaClassMap[s.ua_mode] || 'pill-blue'}">${esc(uaNameMap[s.ua_mode] || s.ua_mode)}</span></td>
-        <td class="mono">:${s.listen_port}</td>
+		<td class="mono">${dashboardIngressLabel(s)}</td>
         <td>${formatBytes(s.traffic_used)}</td>
       </tr>
     `).join('');
   } catch (e) {
     console.error('Dashboard table load error:', e);
   }
+}
+
+function dashboardIngressLabel(site) {
+	const mode = String(site.ingress_mode || (site.public_host ? 'host' : 'port')).toLowerCase();
+	if (mode === 'host') return `Host: ${esc(site.public_host || '')}`;
+	if (mode === 'both') return `Host + :${site.listen_port}`;
+	return `:${site.listen_port}`;
 }
 
 async function loadDashboardData() {

@@ -61,6 +61,14 @@ test('diagnostics proxy card escapes listen port and keeps its placeholder', () 
   assert.ok(!html.includes(PAYLOAD), 'proxy.listen_port must not be interpolated raw');
 
   // Pinned so a later switch to diagText cannot silently turn 0 into "0".
-  assert.ok(renderProxyCard({ listen_port: 8096 }, 'stagger-6').includes('>8096<'));
-  assert.ok(renderProxyCard({ listen_port: 0 }, 'stagger-6').includes('>--<'));
+	assert.ok(renderProxyCard({ ingress_mode: 'port', port_listening: true, listen_port: 8096 }, 'stagger-6').includes('>:8096（监听中）<'));
+	assert.ok(renderProxyCard({ ingress_mode: 'port', listen_port: 0 }, 'stagger-6').includes('>:--（未监听）<'));
+});
+
+test('diagnostics proxy card escapes an unknown ingress mode', () => {
+  const { renderProxyCard } = loadScripts('api.js', 'pages/diag.js');
+
+  const html = renderProxyCard({ ingress_mode: PAYLOAD, listen_port: 8096 }, 'stagger-6');
+  assert.ok(!html.includes(PAYLOAD), 'unknown ingress_mode must not be interpolated raw');
+  assert.ok(html.includes('&lt;img src=x onerror=alert(1)&gt;'), 'unknown ingress_mode must be escaped');
 });

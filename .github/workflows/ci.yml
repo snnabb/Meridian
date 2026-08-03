@@ -57,7 +57,9 @@ jobs:
           node --test tests/*.test.js
           bash -n install.sh
           bash -n tests/install_test.sh
-          shellcheck install.sh tests/install_test.sh
+          bash -n tests/upstream_header_key_test.sh
+          shellcheck install.sh tests/install_test.sh tests/upstream_header_key_test.sh
+          bash tests/upstream_header_key_test.sh
           bash tests/install_test.sh
 
       - name: Build

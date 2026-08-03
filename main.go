@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -58,6 +60,9 @@ const (
 	maxCustomClientLen    = 128
 	maxCustomVersionLen   = 64
 )
+
+var errUnsafeHostOnlyIngress = errors.New("host-only ingress requires loopback PANEL_BIND_ADDR or a non-empty TRUSTED_PROXY_CIDRS source allowlist; use port/both only with the documented risk controls")
+var errProxyManagerShuttingDown = errors.New("proxy manager is shutting down")
 
 // UAHeaderPolicy is the explicit discriminator for how a site's inbound
 // identity headers are handled on the way upstream. Rewrite=true applies
@@ -177,6 +182,303 @@ func mergeSiteUAConfig(old Site, requestedMode, requestedUserAgent, requestedCli
 		return "", "", "", "", fmt.Errorf("custom ua_mode requires User-Agent, Client, and Version")
 	}
 	return normalizeUAConfig(normalizedMode, userAgent, client, version)
+}
+
+const (
+	maxUpstreamHeaders     = 16
+	maxUpstreamHeaderName  = 64
+	maxUpstreamHeaderValue = 1024
+	maxPlaybackAddresses   = 128
+	maxTargetURLLength     = 2048
+	ingressModePort        = "port"
+	ingressModeHost        = "host"
+	ingressModeBoth        = "both"
+	dynamicRoutePrefix     = "/_meridian/d/"
+)
+
+// UpstreamHeaderView is the write-only representation returned by the API.
+// Header values are never serialized back to a browser.
+type UpstreamHeaderView struct {
+	Name       string `json:"name"`
+	Configured bool   `json:"configured"`
+}
+
+// UpstreamHeaderInput is a full-snapshot API input. On update, an omitted or
+// empty value preserves the existing encrypted value for the same header name.
+// Omitting the header row from the snapshot removes it.
+type UpstreamHeaderInput struct {
+	Name  string  `json:"name"`
+	Value *string `json:"value,omitempty"`
+}
+
+type storedUpstreamHeader struct {
+	Name       string `json:"name"`
+	Ciphertext string `json:"ciphertext"`
+}
+
+type upstreamHeaderPolicy struct {
+	authority string
+	values    http.Header
+}
+
+func isHTTPTokenByte(value byte) bool {
+	if value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9' {
+		return true
+	}
+	return strings.ContainsRune("!#$%&'*+-.^_`|~", rune(value))
+}
+
+func normalizeUpstreamHeaderName(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > maxUpstreamHeaderName {
+		return "", fmt.Errorf("upstream header name must be 1-%d bytes", maxUpstreamHeaderName)
+	}
+	for i := 0; i < len(value); i++ {
+		if !isHTTPTokenByte(value[i]) {
+			return "", fmt.Errorf("upstream header name contains invalid characters")
+		}
+	}
+	name := http.CanonicalHeaderKey(value)
+	lower := strings.ToLower(name)
+	if isManagedForwardingHeaderName(lower) {
+		return "", fmt.Errorf("upstream header %s is managed by Meridian and cannot be overridden", name)
+	}
+	switch lower {
+	case "authorization", "connection", "content-length", "cookie", "host",
+		"keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection",
+		"te", "trailer", "transfer-encoding", "upgrade", "user-agent",
+		"x-emby-authorization", "x-emby-token", "x-mediabrowser-token":
+		return "", fmt.Errorf("upstream header %s is managed by Meridian and cannot be overridden", name)
+	}
+	if strings.HasPrefix(lower, "sec-websocket-") {
+		return "", fmt.Errorf("upstream header %s is managed by Meridian and cannot be overridden", name)
+	}
+	return name, nil
+}
+
+func normalizeUpstreamHeaderValue(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > maxUpstreamHeaderValue {
+		return "", fmt.Errorf("upstream header value must be 1-%d bytes", maxUpstreamHeaderValue)
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < 0x20 || value[i] > 0x7e {
+			return "", fmt.Errorf("upstream header value must contain printable ASCII characters only")
+		}
+	}
+	return value, nil
+}
+
+func resolveUpstreamHeaderKey(value string) ([]byte, error) {
+	if value == "" {
+		return nil, nil
+	}
+	if strings.ContainsAny(value, " \t\r\n\v\f") {
+		return nil, fmt.Errorf("UPSTREAM_HEADER_KEY must not contain whitespace")
+	}
+	if len(value) < 32 {
+		return nil, fmt.Errorf("UPSTREAM_HEADER_KEY must be at least 32 bytes")
+	}
+	sum := sha256.Sum256([]byte(value))
+	key := make([]byte, len(sum))
+	copy(key, sum[:])
+	return key, nil
+}
+
+func encryptUpstreamHeaderValue(name, value, authority string, key []byte) (string, error) {
+	if len(key) != 32 {
+		return "", fmt.Errorf("UPSTREAM_HEADER_KEY is required to configure upstream headers")
+	}
+	if authority == "" {
+		return "", fmt.Errorf("a valid target authority is required to configure upstream headers")
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", fmt.Errorf("generate upstream header nonce: %w", err)
+	}
+	aad := []byte("meridian-upstream-header:v2:" + strings.ToLower(name) + "\x00" + authority)
+	sealed := gcm.Seal(nil, nonce, []byte(value), aad)
+	payload := append(append([]byte{}, nonce...), sealed...)
+	return "v2:" + base64.RawURLEncoding.EncodeToString(payload), nil
+}
+
+func decryptUpstreamHeaderValue(name, ciphertext, authority string, key []byte) (string, error) {
+	if len(key) != 32 {
+		return "", fmt.Errorf("UPSTREAM_HEADER_KEY is required for configured upstream headers")
+	}
+	if !strings.HasPrefix(ciphertext, "v2:") {
+		return "", fmt.Errorf("unsupported upstream header ciphertext version")
+	}
+	if authority == "" {
+		return "", fmt.Errorf("a valid target authority is required for configured upstream headers")
+	}
+	aad := []byte("meridian-upstream-header:v2:" + strings.ToLower(name) + "\x00" + authority)
+	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(ciphertext, "v2:"))
+	if err != nil {
+		return "", fmt.Errorf("decode upstream header ciphertext: %w", err)
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	if len(payload) < gcm.NonceSize()+gcm.Overhead() {
+		return "", fmt.Errorf("upstream header ciphertext is truncated")
+	}
+	nonce, sealed := payload[:gcm.NonceSize()], payload[gcm.NonceSize():]
+	plain, err := gcm.Open(nil, nonce, sealed, aad)
+	if err != nil {
+		return "", fmt.Errorf("decrypt upstream header value: %w", err)
+	}
+	return string(plain), nil
+}
+
+func parseStoredUpstreamHeaders(raw string) ([]storedUpstreamHeader, error) {
+	if strings.TrimSpace(raw) == "" {
+		return []storedUpstreamHeader{}, nil
+	}
+	var headers []storedUpstreamHeader
+	if err := json.Unmarshal([]byte(raw), &headers); err != nil {
+		return nil, fmt.Errorf("invalid stored upstream_headers: %w", err)
+	}
+	if len(headers) > maxUpstreamHeaders {
+		return nil, fmt.Errorf("stored upstream_headers exceeds %d entries", maxUpstreamHeaders)
+	}
+	seen := make(map[string]bool, len(headers))
+	for i := range headers {
+		name, err := normalizeUpstreamHeaderName(headers[i].Name)
+		if err != nil {
+			return nil, fmt.Errorf("invalid stored upstream header: %w", err)
+		}
+		key := strings.ToLower(name)
+		if seen[key] {
+			return nil, fmt.Errorf("duplicate stored upstream header %s", name)
+		}
+		seen[key] = true
+		headers[i].Name = name
+		if !strings.HasPrefix(headers[i].Ciphertext, "v2:") {
+			return nil, fmt.Errorf("invalid stored ciphertext for upstream header %s", name)
+		}
+	}
+	if headers == nil {
+		headers = []storedUpstreamHeader{}
+	}
+	return headers, nil
+}
+
+func upstreamHeaderViews(raw string) ([]UpstreamHeaderView, error) {
+	stored, err := parseStoredUpstreamHeaders(raw)
+	if err != nil {
+		return nil, err
+	}
+	views := make([]UpstreamHeaderView, len(stored))
+	for i, header := range stored {
+		views[i] = UpstreamHeaderView{Name: header.Name, Configured: true}
+	}
+	return views, nil
+}
+
+func mergeUpstreamHeaders(existingRaw string, requested []UpstreamHeaderInput, key []byte, targetURL string) (string, error) {
+	if len(requested) > maxUpstreamHeaders {
+		return "", fmt.Errorf("upstream_headers must contain at most %d entries", maxUpstreamHeaders)
+	}
+	existing, err := parseStoredUpstreamHeaders(existingRaw)
+	if err != nil {
+		return "", err
+	}
+	existingByName := make(map[string]storedUpstreamHeader, len(existing))
+	for _, header := range existing {
+		existingByName[strings.ToLower(header.Name)] = header
+	}
+	target, err := normalizeTargetURL(targetURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid target_url: %w", err)
+	}
+	authority := redirectHostKey(target)
+
+	merged := make([]storedUpstreamHeader, 0, len(requested))
+	seen := make(map[string]bool, len(requested))
+	for _, input := range requested {
+		name, err := normalizeUpstreamHeaderName(input.Name)
+		if err != nil {
+			return "", err
+		}
+		nameKey := strings.ToLower(name)
+		if seen[nameKey] {
+			return "", fmt.Errorf("duplicate upstream header %s", name)
+		}
+		seen[nameKey] = true
+
+		value := ""
+		if input.Value != nil {
+			value = strings.TrimSpace(*input.Value)
+		}
+		if value == "" {
+			old, ok := existingByName[nameKey]
+			if !ok {
+				return "", fmt.Errorf("a value is required for new upstream header %s", name)
+			}
+			merged = append(merged, storedUpstreamHeader{Name: name, Ciphertext: old.Ciphertext})
+			continue
+		}
+		value, err = normalizeUpstreamHeaderValue(value)
+		if err != nil {
+			return "", fmt.Errorf("invalid value for upstream header %s: %w", name, err)
+		}
+		ciphertext, err := encryptUpstreamHeaderValue(name, value, authority, key)
+		if err != nil {
+			return "", err
+		}
+		merged = append(merged, storedUpstreamHeader{Name: name, Ciphertext: ciphertext})
+	}
+	raw, err := json.Marshal(merged)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+func resolveUpstreamHeaderPolicy(raw string, key []byte, target *url.URL) (upstreamHeaderPolicy, error) {
+	stored, err := parseStoredUpstreamHeaders(raw)
+	if err != nil {
+		return upstreamHeaderPolicy{}, err
+	}
+	policy := upstreamHeaderPolicy{authority: redirectHostKey(target), values: make(http.Header, len(stored))}
+	for _, header := range stored {
+		value, err := decryptUpstreamHeaderValue(header.Name, header.Ciphertext, policy.authority, key)
+		if err != nil {
+			return upstreamHeaderPolicy{}, fmt.Errorf("resolve upstream header %s: %w", header.Name, err)
+		}
+		value, err = normalizeUpstreamHeaderValue(value)
+		if err != nil {
+			return upstreamHeaderPolicy{}, fmt.Errorf("resolve upstream header %s: %w", header.Name, err)
+		}
+		policy.values.Set(header.Name, value)
+	}
+	return policy, nil
+}
+
+func (p upstreamHeaderPolicy) apply(header http.Header, target *url.URL) {
+	for name := range p.values {
+		header.Del(name)
+	}
+	if target == nil || redirectHostKey(target) != p.authority {
+		return
+	}
+	for name, values := range p.values {
+		header[name] = append([]string(nil), values...)
+	}
 }
 
 var jwtSecret []byte
@@ -380,6 +682,19 @@ func isSQLiteBusyError(err error) bool {
 	}
 }
 
+func isSQLiteUniqueConstraintError(err error) bool {
+	var sqliteErr *sqlite.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	switch sqliteErr.Code() {
+	case sqlite3.SQLITE_CONSTRAINT_UNIQUE, sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY:
+		return true
+	default:
+		return false
+	}
+}
+
 func (d *DB) migrateOnce() error {
 	ctx := context.Background()
 	conn, err := d.db.Conn(ctx)
@@ -405,11 +720,13 @@ func (d *DB) migrateOnce() error {
 		password_hash TEXT NOT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
-	CREATE TABLE IF NOT EXISTS sites (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		name TEXT NOT NULL,
-		listen_port INTEGER NOT NULL UNIQUE,
-		target_url TEXT NOT NULL,
+		CREATE TABLE IF NOT EXISTS sites (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL,
+			listen_port INTEGER NOT NULL UNIQUE,
+			public_host TEXT NOT NULL DEFAULT '',
+			ingress_mode TEXT NOT NULL DEFAULT 'port',
+			target_url TEXT NOT NULL,
 		playback_target_url TEXT NOT NULL DEFAULT '',
 		playback_mode TEXT NOT NULL DEFAULT 'direct',
 		stream_hosts TEXT NOT NULL DEFAULT '[]',
@@ -417,6 +734,7 @@ func (d *DB) migrateOnce() error {
 		custom_user_agent TEXT NOT NULL DEFAULT '',
 		custom_client TEXT NOT NULL DEFAULT '',
 		custom_version TEXT NOT NULL DEFAULT '',
+		upstream_headers TEXT NOT NULL DEFAULT '[]',
 		enabled INTEGER DEFAULT 1,
 		traffic_quota BIGINT DEFAULT 0,
 		traffic_used BIGINT DEFAULT 0,
@@ -446,6 +764,9 @@ func (d *DB) migrateOnce() error {
 		{"custom_user_agent", "ALTER TABLE sites ADD COLUMN custom_user_agent TEXT NOT NULL DEFAULT ''"},
 		{"custom_client", "ALTER TABLE sites ADD COLUMN custom_client TEXT NOT NULL DEFAULT ''"},
 		{"custom_version", "ALTER TABLE sites ADD COLUMN custom_version TEXT NOT NULL DEFAULT ''"},
+		{"public_host", "ALTER TABLE sites ADD COLUMN public_host TEXT NOT NULL DEFAULT ''"},
+		{"ingress_mode", "ALTER TABLE sites ADD COLUMN ingress_mode TEXT NOT NULL DEFAULT 'port'"},
+		{"upstream_headers", "ALTER TABLE sites ADD COLUMN upstream_headers TEXT NOT NULL DEFAULT '[]'"},
 	} {
 		exists, err := sqliteColumnExists(ctx, conn, migration.column)
 		if err != nil {
@@ -456,6 +777,15 @@ func (d *DB) migrateOnce() error {
 				return err
 			}
 		}
+	}
+	// public_host was introduced before ingress_mode on the unreleased Issue #28
+	// branch. Migrate those rows to the secure host-only behavior instead of
+	// silently retaining a public high-port listener.
+	if _, err := conn.ExecContext(ctx, "UPDATE sites SET ingress_mode='host' WHERE public_host <> '' AND ingress_mode='port'"); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "CREATE UNIQUE INDEX IF NOT EXISTS idx_sites_public_host ON sites(public_host COLLATE NOCASE) WHERE public_host <> ''"); err != nil {
+		return err
 	}
 
 	var hasHourlyIndex int
@@ -502,23 +832,53 @@ func sqliteColumnExists(ctx context.Context, conn *sql.Conn, column string) (boo
 }
 
 type Site struct {
-	ID                int64  `json:"id"`
-	Name              string `json:"name"`
-	ListenPort        int    `json:"listen_port"`
-	TargetURL         string `json:"target_url"`
-	PlaybackTargetURL string `json:"playback_target_url"`
-	PlaybackMode      string `json:"playback_mode"`
-	StreamHosts       string `json:"stream_hosts"`
-	UAMode            string `json:"ua_mode"`
-	CustomUserAgent   string `json:"custom_user_agent"`
-	CustomClient      string `json:"custom_client"`
-	CustomVersion     string `json:"custom_version"`
-	Enabled           bool   `json:"enabled"`
-	TrafficQuota      int64  `json:"traffic_quota"`
-	TrafficUsed       int64  `json:"traffic_used"`
-	SpeedLimit        int    `json:"speed_limit"`
-	CreatedAt         string `json:"created_at"`
-	UpdatedAt         string `json:"updated_at"`
+	ID                    int64                `json:"id"`
+	Name                  string               `json:"name"`
+	ListenPort            int                  `json:"listen_port"`
+	PublicHost            string               `json:"public_host"`
+	IngressMode           string               `json:"ingress_mode"`
+	TargetURL             string               `json:"target_url"`
+	PlaybackTargetURL     string               `json:"playback_target_url"`
+	PlaybackMode          string               `json:"playback_mode"`
+	StreamHosts           string               `json:"-"`
+	StreamHostList        []string             `json:"stream_hosts"`
+	UAMode                string               `json:"ua_mode"`
+	CustomUserAgent       string               `json:"custom_user_agent"`
+	CustomClient          string               `json:"custom_client"`
+	CustomVersion         string               `json:"custom_version"`
+	StoredUpstreamHeaders string               `json:"-"`
+	UpstreamHeaders       []UpstreamHeaderView `json:"upstream_headers"`
+	Enabled               bool                 `json:"enabled"`
+	TrafficQuota          int64                `json:"traffic_quota"`
+	TrafficUsed           int64                `json:"traffic_used"`
+	SpeedLimit            int                  `json:"speed_limit"`
+	CreatedAt             string               `json:"created_at"`
+	UpdatedAt             string               `json:"updated_at"`
+}
+
+func hydrateSiteConfiguration(site *Site) error {
+	publicHost, err := normalizePublicHost(site.PublicHost)
+	if err != nil {
+		return err
+	}
+	site.PublicHost = publicHost
+	ingressMode, err := normalizeIngressMode(site.IngressMode, site.PublicHost)
+	if err != nil {
+		return err
+	}
+	site.IngressMode = ingressMode
+	if err := json.Unmarshal([]byte(site.StreamHosts), &site.StreamHostList); err != nil {
+		return fmt.Errorf("invalid stored stream_hosts: %w", err)
+	}
+	if site.StreamHostList == nil {
+		site.StreamHostList = []string{}
+	}
+	views, err := upstreamHeaderViews(site.StoredUpstreamHeaders)
+	if err != nil {
+		return err
+	}
+	site.UpstreamHeaders = views
+	return nil
 }
 
 type TrafficLog struct {
@@ -674,7 +1034,7 @@ func (d *DB) ResetAdminPassword(password string) error {
 }
 
 func (d *DB) ListSites() ([]Site, error) {
-	rows, err := d.db.Query("SELECT id, name, listen_port, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites ORDER BY id")
+	rows, err := d.db.Query("SELECT id, name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -683,8 +1043,11 @@ func (d *DB) ListSites() ([]Site, error) {
 	for rows.Next() {
 		var s Site
 		var enabled int
-		if err := rows.Scan(&s.ID, &s.Name, &s.ListenPort, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.Name, &s.ListenPort, &s.PublicHost, &s.IngressMode, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.StoredUpstreamHeaders, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt); err != nil {
 			return nil, err
+		}
+		if err := hydrateSiteConfiguration(&s); err != nil {
+			return nil, fmt.Errorf("site %d: %w", s.ID, err)
 		}
 		s.Enabled = enabled == 1
 		sites = append(sites, s)
@@ -701,12 +1064,15 @@ func (d *DB) ListSites() ([]Site, error) {
 func (d *DB) GetSite(id int64) (*Site, error) {
 	var s Site
 	var enabled int
-	err := d.db.QueryRow("SELECT id, name, listen_port, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites WHERE id=?", id).
-		Scan(&s.ID, &s.Name, &s.ListenPort, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt)
+	err := d.db.QueryRow("SELECT id, name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites WHERE id=?", id).
+		Scan(&s.ID, &s.Name, &s.ListenPort, &s.PublicHost, &s.IngressMode, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.StoredUpstreamHeaders, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
 	s.Enabled = enabled == 1
+	if err := hydrateSiteConfiguration(&s); err != nil {
+		return nil, fmt.Errorf("site %d: %w", s.ID, err)
+	}
 	return &s, nil
 }
 
@@ -735,9 +1101,21 @@ func (d *DB) CreateSiteRecord(site Site) (*Site, error) {
 	if site.StreamHosts == "" {
 		site.StreamHosts = "[]"
 	}
+	if site.StoredUpstreamHeaders == "" {
+		site.StoredUpstreamHeaders = "[]"
+	}
+	publicHost, err := normalizePublicHost(site.PublicHost)
+	if err != nil {
+		return nil, err
+	}
+	site.PublicHost = publicHost
+	site.IngressMode, err = normalizeIngressMode(site.IngressMode, site.PublicHost)
+	if err != nil {
+		return nil, err
+	}
 	res, err := d.db.Exec(
-		"INSERT INTO sites (name, listen_port, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, traffic_quota, speed_limit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-		site.Name, site.ListenPort, site.TargetURL, site.PlaybackTargetURL, site.PlaybackMode, site.StreamHosts, site.UAMode, site.CustomUserAgent, site.CustomClient, site.CustomVersion, site.TrafficQuota, site.SpeedLimit,
+		"INSERT INTO sites (name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, traffic_quota, speed_limit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		site.Name, site.ListenPort, site.PublicHost, site.IngressMode, site.TargetURL, site.PlaybackTargetURL, site.PlaybackMode, site.StreamHosts, site.UAMode, site.CustomUserAgent, site.CustomClient, site.CustomVersion, site.StoredUpstreamHeaders, site.TrafficQuota, site.SpeedLimit,
 	)
 	if err != nil {
 		return nil, err
@@ -754,32 +1132,76 @@ func (d *DB) UpdateSite(id int64, name string, port int, targetURL, playbackTarg
 }
 
 func (d *DB) UpdateSiteWithCustomUA(id int64, name string, port int, targetURL, playbackTargetURL, playbackMode, streamHosts, uaMode, customUserAgent, customClient, customVersion string, quota int64, speedLimit int) error {
-	return d.UpdateSiteRecord(Site{
-		ID:                id,
-		Name:              name,
-		ListenPort:        port,
-		TargetURL:         targetURL,
-		PlaybackTargetURL: playbackTargetURL,
-		PlaybackMode:      playbackMode,
-		StreamHosts:       streamHosts,
-		UAMode:            uaMode,
-		CustomUserAgent:   customUserAgent,
-		CustomClient:      customClient,
-		CustomVersion:     customVersion,
-		TrafficQuota:      quota,
-		SpeedLimit:        speedLimit,
-	})
+	site, err := d.GetSite(id)
+	if err != nil {
+		return err
+	}
+	site.Name = name
+	site.ListenPort = port
+	site.TargetURL = targetURL
+	site.PlaybackTargetURL = playbackTargetURL
+	site.PlaybackMode = playbackMode
+	site.StreamHosts = streamHosts
+	site.UAMode = uaMode
+	site.CustomUserAgent = customUserAgent
+	site.CustomClient = customClient
+	site.CustomVersion = customVersion
+	site.TrafficQuota = quota
+	site.SpeedLimit = speedLimit
+	return d.UpdateSiteRecord(*site)
 }
 
 func (d *DB) UpdateSiteRecord(site Site) error {
 	if site.StreamHosts == "" {
 		site.StreamHosts = "[]"
 	}
-	_, err := d.db.Exec(
-		"UPDATE sites SET name=?, listen_port=?, target_url=?, playback_target_url=?, playback_mode=?, stream_hosts=?, ua_mode=?, custom_user_agent=?, custom_client=?, custom_version=?, traffic_quota=?, speed_limit=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-		site.Name, site.ListenPort, site.TargetURL, site.PlaybackTargetURL, site.PlaybackMode, site.StreamHosts, site.UAMode, site.CustomUserAgent, site.CustomClient, site.CustomVersion, site.TrafficQuota, site.SpeedLimit, site.ID,
+	if site.StoredUpstreamHeaders == "" {
+		site.StoredUpstreamHeaders = "[]"
+	}
+	publicHost, err := normalizePublicHost(site.PublicHost)
+	if err != nil {
+		return err
+	}
+	site.PublicHost = publicHost
+	site.IngressMode, err = normalizeIngressMode(site.IngressMode, site.PublicHost)
+	if err != nil {
+		return err
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var currentTargetURL, currentHeaders string
+	queryErr := tx.QueryRow("SELECT target_url, upstream_headers FROM sites WHERE id=?", site.ID).Scan(&currentTargetURL, &currentHeaders)
+	if queryErr != nil && !errors.Is(queryErr, sql.ErrNoRows) {
+		return queryErr
+	}
+	if queryErr == nil {
+		currentTarget, currentErr := normalizeTargetURL(currentTargetURL)
+		newTarget, newErr := normalizeTargetURL(site.TargetURL)
+		if currentErr != nil {
+			return fmt.Errorf("stored target_url is invalid: %w", currentErr)
+		}
+		if newErr != nil {
+			return fmt.Errorf("invalid target_url: %w", newErr)
+		}
+		if !sameRedirectAuthority(currentTarget, newTarget) && site.StoredUpstreamHeaders == currentHeaders {
+			// Data-layer callers must not accidentally carry an origin secret to
+			// a different scheme/host/port. The HTTP API may supply freshly
+			// encrypted v2 values for the new authority; unchanged ciphertext is
+			// always cleared here, even if a caller bypasses the handler checks.
+			site.StoredUpstreamHeaders = "[]"
+		}
+	}
+	_, err = tx.Exec(
+		"UPDATE sites SET name=?, listen_port=?, public_host=?, ingress_mode=?, target_url=?, playback_target_url=?, playback_mode=?, stream_hosts=?, ua_mode=?, custom_user_agent=?, custom_client=?, custom_version=?, upstream_headers=?, traffic_quota=?, speed_limit=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+		site.Name, site.ListenPort, site.PublicHost, site.IngressMode, site.TargetURL, site.PlaybackTargetURL, site.PlaybackMode, site.StreamHosts, site.UAMode, site.CustomUserAgent, site.CustomClient, site.CustomVersion, site.StoredUpstreamHeaders, site.TrafficQuota, site.SpeedLimit, site.ID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (d *DB) DeleteSite(id int64) error {
@@ -805,6 +1227,25 @@ func (d *DB) ToggleSite(id int64) (bool, error) {
 	newVal := 1 - enabled
 	_, err := d.db.Exec("UPDATE sites SET enabled=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", newVal, id)
 	return newVal == 1, err
+}
+
+func (d *DB) SetSiteEnabled(id int64, enabled bool) error {
+	value := 0
+	if enabled {
+		value = 1
+	}
+	result, err := d.db.Exec("UPDATE sites SET enabled=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", value, id)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return fmt.Errorf("updated %d site rows, want 1", rows)
+	}
+	return nil
 }
 
 func (d *DB) AddTraffic(siteID, bytesIn, bytesOut int64) {
@@ -870,9 +1311,52 @@ func (d *DB) GetTrafficLogs(siteID int64, hours int) ([]TrafficLog, error) {
 }
 
 type redirectFollowTransport struct {
-	base          http.RoundTripper
-	playbackHosts map[string]bool
-	policy        UAHeaderPolicy
+	base                 http.RoundTripper
+	playbackHosts        map[string]bool
+	policy               UAHeaderPolicy
+	upstreamHeaderPolicy upstreamHeaderPolicy
+}
+
+func crossAuthorityHeaders(source http.Header, additionalAllowed ...string) http.Header {
+	// Cross-authority redirects go to a distinct trust domain. Rebuild from the
+	// small set needed for media negotiation/resume plus Meridian-normalized
+	// client identity; arbitrary application headers may be API keys or bearer
+	// credentials even when their names are not known in advance.
+	allowed := []string{
+		"Accept", "Accept-Encoding", "Cache-Control", "If-Modified-Since",
+		"If-None-Match", "If-Range", "Pragma", "Range", "User-Agent",
+		"X-Emby-Authorization", "X-Forwarded-For", "X-Forwarded-Host",
+		"X-Forwarded-Proto", "X-Real-IP",
+	}
+	allowed = append(allowed, additionalAllowed...)
+	header := make(http.Header, len(allowed))
+	for _, name := range allowed {
+		if values := source.Values(name); len(values) > 0 {
+			header[http.CanonicalHeaderKey(name)] = append([]string(nil), values...)
+		}
+	}
+	stripSensitiveRedirectHeaders(header)
+	return header
+}
+
+func crossAuthorityRedirectHeaders(source http.Header) http.Header {
+	return crossAuthorityHeaders(source)
+}
+
+func crossAuthorityWebSocketHeaders(source http.Header) http.Header {
+	header := crossAuthorityHeaders(
+		source,
+		"Origin",
+		"Sec-WebSocket-Extensions",
+		"Sec-WebSocket-Key",
+		"Sec-WebSocket-Protocol",
+		"Sec-WebSocket-Version",
+	)
+	// These hop-by-hop fields are generated by Meridian, not copied from the
+	// client. Rebuild them after the cross-authority allowlist has run.
+	header.Set("Connection", "Upgrade")
+	header.Set("Upgrade", "websocket")
+	return header
 }
 
 func (t *redirectFollowTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -897,16 +1381,13 @@ func (t *redirectFollowTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		locURL = req.URL.ResolveReference(locURL)
 		locURL.Scheme = strings.ToLower(locURL.Scheme)
-		if (locURL.Scheme != "http" && locURL.Scheme != "https") || !t.playbackHosts[redirectHostKey(locURL)] {
+		if (locURL.Scheme != "http" && locURL.Scheme != "https") || locURL.User != nil || !t.playbackHosts[redirectHostKey(locURL)] {
 			break
 		}
 		resp.Body.Close()
 		newReq, err := http.NewRequestWithContext(req.Context(), req.Method, locURL.String(), nil)
 		if err != nil {
 			break
-		}
-		for k, v := range req.Header {
-			newReq.Header[k] = v
 		}
 		newReq.Host = locURL.Host
 		if !sameRedirectAuthority(req.URL, locURL) {
@@ -916,9 +1397,12 @@ func (t *redirectFollowTransport) RoundTrip(req *http.Request) (*http.Response, 
 			// is reapplied below, so identity rewriting stays consistent while
 			// secrets stay behind; passthrough keeps whatever non-secret
 			// identity the client sent.
-			stripSensitiveRedirectHeaders(newReq.Header)
+			newReq.Header = crossAuthorityRedirectHeaders(req.Header)
+		} else {
+			newReq.Header = req.Header.Clone()
 		}
 		applyUAHeaderPolicy(newReq.Header, t.policy)
+		t.upstreamHeaderPolicy.apply(newReq.Header, locURL)
 		resp, err = t.base.RoundTrip(newReq)
 		if err != nil {
 			return nil, err
@@ -1201,9 +1685,22 @@ func stripSensitiveRedirectHeaders(header http.Header) {
 
 type ProxyInstance struct {
 	Site      Site
+	handler   http.Handler
 	server    *http.Server
 	listener  net.Listener
+	transport *http.Transport
 	startedAt time.Time
+	ctx       context.Context
+	cancel    context.CancelFunc
+	// lifecycleMu closes the gate before activeRequests.Wait begins, so no Add
+	// can race a drain. Hijacked WebSocket connections are tracked separately
+	// because net/http no longer owns them after Hijack.
+	lifecycleMu     sync.Mutex
+	closing         bool
+	activeRequests  sync.WaitGroup
+	hijackedConns   map[net.Conn]struct{}
+	portServing     atomic.Bool
+	portServeFailed atomic.Bool
 	// trafficMu serializes this instance's traffic state transitions: flush,
 	// single-site history snapshot and the live overlay in global snapshots.
 	// Lock order is pm.mu -> trafficMu; helpers that take trafficMu (e.g.
@@ -1213,19 +1710,264 @@ type ProxyInstance struct {
 	bytesOut         atomic.Int64
 	reqCount         atomic.Int64
 	persistedTraffic atomic.Int64
+	trustedProxies   []*net.IPNet
 }
 
 type ProxyManager struct {
-	mu       sync.RWMutex
-	proxies  map[int64]*ProxyInstance
-	database *DB
+	mu                  sync.RWMutex
+	lifecycleMu         sync.Mutex
+	proxies             map[int64]*ProxyInstance
+	publicHosts         map[string]int64
+	publicHostModes     map[string]string
+	upstreamHeaderKey   []byte
+	trustedProxies      []*net.IPNet
+	hostOnlyIngressSafe bool
+	shutdownStarted     atomic.Bool
+	database            *DB
 }
 
-func NewProxyManager(db *DB) *ProxyManager {
-	return &ProxyManager{
-		proxies:  make(map[int64]*ProxyInstance),
-		database: db,
+// siteIngressClosedError means StopSite passed the irreversible boundary: new
+// requests are rejected and listeners are closed, but draining and/or the final
+// traffic checkpoint did not finish. Callers must not leave the DB row enabled
+// as if the proxy were still serving.
+type siteIngressClosedError struct {
+	siteID   int64
+	drainErr error
+	flushErr error
+}
+
+func (e *siteIngressClosedError) Error() string {
+	switch {
+	case e.drainErr != nil && e.flushErr != nil:
+		return fmt.Sprintf("site %d ingress closed; drain failed: %v; final traffic flush failed: %v", e.siteID, e.drainErr, e.flushErr)
+	case e.drainErr != nil:
+		return fmt.Sprintf("site %d ingress closed; drain failed: %v", e.siteID, e.drainErr)
+	default:
+		return fmt.Sprintf("site %d ingress closed; final traffic flush failed: %v", e.siteID, e.flushErr)
 	}
+}
+
+func isSiteIngressClosedError(err error) bool {
+	var closedErr *siteIngressClosedError
+	return errors.As(err, &closedErr)
+}
+
+func (inst *ProxyInstance) beginRequest() bool {
+	inst.lifecycleMu.Lock()
+	defer inst.lifecycleMu.Unlock()
+	if inst.closing {
+		return false
+	}
+	inst.activeRequests.Add(1)
+	return true
+}
+
+func (inst *ProxyInstance) endRequest() {
+	inst.activeRequests.Done()
+}
+
+func (inst *ProxyInstance) isAccepting() bool {
+	inst.lifecycleMu.Lock()
+	defer inst.lifecycleMu.Unlock()
+	return !inst.closing
+}
+
+// isOperational distinguishes an open lifecycle gate from a usable ingress.
+// Host-capable instances remain reachable through the shared panel listener;
+// port-only instances are operational only while their dedicated Serve loop is
+// actually alive.
+func (inst *ProxyInstance) isOperational() bool {
+	if !inst.isAccepting() {
+		return false
+	}
+	return ingressUsesHost(inst.Site.IngressMode) || !inst.portServeFailed.Load()
+}
+
+func (inst *ProxyInstance) trackHijackedConn(conn net.Conn) bool {
+	inst.lifecycleMu.Lock()
+	defer inst.lifecycleMu.Unlock()
+	if inst.closing {
+		return false
+	}
+	if inst.hijackedConns == nil {
+		inst.hijackedConns = make(map[net.Conn]struct{})
+	}
+	inst.hijackedConns[conn] = struct{}{}
+	return true
+}
+
+func (inst *ProxyInstance) untrackHijackedConn(conn net.Conn) {
+	inst.lifecycleMu.Lock()
+	delete(inst.hijackedConns, conn)
+	inst.lifecycleMu.Unlock()
+}
+
+func (inst *ProxyInstance) shutdown(ctx context.Context) error {
+	inst.lifecycleMu.Lock()
+	if !inst.closing {
+		inst.closing = true
+		if inst.cancel != nil {
+			inst.cancel()
+		}
+	}
+	connections := make([]net.Conn, 0, len(inst.hijackedConns))
+	for conn := range inst.hijackedConns {
+		connections = append(connections, conn)
+	}
+	inst.lifecycleMu.Unlock()
+
+	if inst.listener != nil {
+		_ = inst.listener.Close()
+	}
+	if inst.server != nil {
+		_ = inst.server.Close()
+	}
+	if inst.transport != nil {
+		inst.transport.CloseIdleConnections()
+	}
+	for _, conn := range connections {
+		_ = conn.Close()
+	}
+
+	drained := make(chan struct{})
+	go func() {
+		inst.activeRequests.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func NewProxyManager(db *DB, upstreamHeaderKey []byte) *ProxyManager {
+	pm := &ProxyManager{
+		proxies:         make(map[int64]*ProxyInstance),
+		publicHosts:     make(map[string]int64),
+		publicHostModes: make(map[string]string),
+		database:        db,
+	}
+	pm.upstreamHeaderKey = append([]byte(nil), upstreamHeaderKey...)
+	return pm
+}
+
+func (pm *ProxyManager) SetTrustedProxies(networks []*net.IPNet) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.trustedProxies = append([]*net.IPNet(nil), networks...)
+}
+
+func (pm *ProxyManager) SetHostOnlyIngressSafe(safe bool) {
+	pm.mu.Lock()
+	pm.hostOnlyIngressSafe = safe
+	pm.mu.Unlock()
+}
+
+func (pm *ProxyManager) HostOnlyIngressSafe() bool {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return pm.hostOnlyIngressSafe
+}
+
+func (pm *ProxyManager) UpstreamHeadersAvailable() bool {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return len(pm.upstreamHeaderKey) == 32
+}
+
+func (pm *ProxyManager) validateIngressSafety(mode string) error {
+	if mode != ingressModeHost {
+		return nil
+	}
+	pm.mu.RLock()
+	safe := pm.hostOnlyIngressSafe
+	pm.mu.RUnlock()
+	if !safe {
+		return errUnsafeHostOnlyIngress
+	}
+	return nil
+}
+
+func (pm *ProxyManager) registerSiteHostLocked(site Site) error {
+	desiredHost := ""
+	if ingressUsesHost(site.IngressMode) {
+		desiredHost = site.PublicHost
+		if existing, ok := pm.publicHosts[desiredHost]; ok && existing != site.ID {
+			return fmt.Errorf("public_host %s is already assigned to another site", desiredHost)
+		}
+	}
+	for host, id := range pm.publicHosts {
+		if id == site.ID && host != desiredHost {
+			delete(pm.publicHosts, host)
+			delete(pm.publicHostModes, host)
+		}
+	}
+	if desiredHost == "" {
+		return nil
+	}
+	pm.publicHosts[desiredHost] = site.ID
+	pm.publicHostModes[desiredHost] = site.IngressMode
+	return nil
+}
+
+func (pm *ProxyManager) RegisterSiteHost(site Site) error {
+	pm.lifecycleMu.Lock()
+	defer pm.lifecycleMu.Unlock()
+	if pm.shutdownStarted.Load() {
+		return errProxyManagerShuttingDown
+	}
+	publicHost, err := normalizePublicHost(site.PublicHost)
+	if err != nil {
+		return err
+	}
+	site.PublicHost = publicHost
+	site.IngressMode, err = normalizeIngressMode(site.IngressMode, site.PublicHost)
+	if err != nil {
+		return err
+	}
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	return pm.registerSiteHostLocked(site)
+}
+
+func (pm *ProxyManager) UnregisterSiteHost(siteID int64) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	for host, id := range pm.publicHosts {
+		if id == siteID {
+			delete(pm.publicHosts, host)
+			delete(pm.publicHostModes, host)
+		}
+	}
+}
+
+func (pm *ProxyManager) PublicHostHandler(host string) (http.Handler, bool) {
+	handler, configured, _ := pm.PublicHostRoute(host)
+	return handler, configured
+}
+
+func (pm *ProxyManager) PublicHostRoute(host string) (http.Handler, bool, string) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	id, configured := pm.publicHosts[host]
+	if !configured {
+		return nil, false, ""
+	}
+	mode := pm.publicHostModes[host]
+	inst := pm.proxies[id]
+	if inst == nil {
+		return nil, true, mode
+	}
+	return inst.handler, true, mode
+}
+
+func (pm *ProxyManager) PublicHostSiteID(host string) (int64, bool) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	id, ok := pm.publicHosts[host]
+	return id, ok
 }
 
 // metered response writer
@@ -1389,14 +2131,19 @@ func headerHasToken(header http.Header, name, token string) bool {
 // A bare "Upgrade: websocket" header is not enough to qualify: routing an
 // ordinary request into the hijacked tunnel would skip the metering and
 // speed-limit wrappers that the normal proxy path installs, and would relay raw
-// bytes to an upstream that never agreed to switch protocols. Requests that fail
-// this check fall through to httputil.ReverseProxy, which negotiates protocol
-// switches on its own.
+// bytes to an upstream that never agreed to switch protocols. Any request with
+// upgrade intent that fails this check is rejected before ReverseProxy, because
+// its generic 101 tunnel would bypass Meridian's traffic accounting and limits.
 func isWebSocketUpgrade(r *http.Request) bool {
 	return r.Method == http.MethodGet &&
 		strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
 		headerHasToken(r.Header, "Connection", "upgrade") &&
 		r.Header.Get("Sec-WebSocket-Key") != ""
+}
+
+func hasUpgradeIntent(r *http.Request) bool {
+	return strings.TrimSpace(r.Header.Get("Upgrade")) != "" ||
+		headerHasToken(r.Header, "Connection", "upgrade")
 }
 
 func normalizeTargetURL(addr string) (*url.URL, error) {
@@ -1518,6 +2265,86 @@ func applyUpstreamURL(requestURL, upstream *url.URL) {
 	}
 }
 
+func normalizePublicHost(value string) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return "", nil
+	}
+	value = strings.TrimSuffix(value, ".")
+	if value == "" || len(value) > 253 || !strings.Contains(value, ".") {
+		return "", fmt.Errorf("public_host must be a fully-qualified DNS name")
+	}
+	if strings.ContainsAny(value, "/:*[]") || net.ParseIP(value) != nil {
+		return "", fmt.Errorf("public_host must not contain a scheme, path, port, wildcard, or IP address")
+	}
+	for _, label := range strings.Split(value, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return "", fmt.Errorf("public_host contains an invalid DNS label")
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+				return "", fmt.Errorf("public_host must use ASCII DNS labels; encode international names as punycode")
+			}
+		}
+	}
+	return value, nil
+}
+
+func normalizeIngressMode(value, publicHost string) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(value))
+	if mode == "" {
+		if publicHost != "" {
+			mode = ingressModeHost
+		} else {
+			mode = ingressModePort
+		}
+	}
+	switch mode {
+	case ingressModePort:
+		if publicHost != "" {
+			return "", fmt.Errorf("public_host must be empty when ingress_mode is port")
+		}
+	case ingressModeHost, ingressModeBoth:
+		if publicHost == "" {
+			return "", fmt.Errorf("public_host is required when ingress_mode is %s", mode)
+		}
+	default:
+		return "", fmt.Errorf("ingress_mode must be port, host, or both")
+	}
+	return mode, nil
+}
+
+func ingressUsesPort(mode string) bool {
+	return mode == ingressModePort || mode == ingressModeBoth
+}
+
+func ingressUsesHost(mode string) bool {
+	return mode == ingressModeHost || mode == ingressModeBoth
+}
+
+func isReservedDynamicRoute(requestPath string) bool {
+	return requestPath == strings.TrimSuffix(dynamicRoutePrefix, "/") || strings.HasPrefix(requestPath, dynamicRoutePrefix)
+}
+
+func requestPublicHost(hostport string) string {
+	hostport = strings.TrimSpace(hostport)
+	if hostport == "" || strings.HasPrefix(hostport, "[") {
+		return ""
+	}
+	host := hostport
+	if parsedHost, _, err := net.SplitHostPort(hostport); err == nil {
+		host = parsedHost
+	} else if strings.Contains(hostport, ":") {
+		return ""
+	}
+	normalized, err := normalizePublicHost(host)
+	if err != nil {
+		return ""
+	}
+	return normalized
+}
+
 func validateSiteSettings(name string, listenPort int, targetURL, playbackTargetURL, playbackMode string, streamHosts []string, uaMode, customUserAgent, customClient, customVersion string, quota int64, speedLimit int) error {
 	name = strings.TrimSpace(name)
 	if name == "" || len(name) > 100 || strings.ContainsAny(name, "\r\n") {
@@ -1526,10 +2353,16 @@ func validateSiteSettings(name string, listenPort int, targetURL, playbackTarget
 	if listenPort < 1 || listenPort > 65535 {
 		return fmt.Errorf("listen_port must be between 1 and 65535")
 	}
+	if len(targetURL) > maxTargetURLLength {
+		return fmt.Errorf("target_url must not exceed %d bytes", maxTargetURLLength)
+	}
 	if _, err := normalizeTargetURL(targetURL); err != nil {
 		return fmt.Errorf("invalid target_url: %w", err)
 	}
 	if strings.TrimSpace(playbackTargetURL) != "" {
+		if len(playbackTargetURL) > maxTargetURLLength {
+			return fmt.Errorf("playback_target_url must not exceed %d bytes", maxTargetURLLength)
+		}
 		if _, err := normalizeTargetURL(playbackTargetURL); err != nil {
 			return fmt.Errorf("invalid playback_target_url: %w", err)
 		}
@@ -1546,10 +2379,17 @@ func validateSiteSettings(name string, listenPort int, targetURL, playbackTarget
 	if speedLimit > maxSpeedLimitMbps {
 		return fmt.Errorf("speed_limit must not exceed %d Mbps", maxSpeedLimitMbps)
 	}
-	if len(streamHosts) > 128 {
-		return fmt.Errorf("stream_hosts must contain at most 128 entries")
+	playbackAddressCount := len(streamHosts)
+	if strings.TrimSpace(playbackTargetURL) != "" {
+		playbackAddressCount++
+	}
+	if playbackAddressCount > maxPlaybackAddresses {
+		return fmt.Errorf("playback addresses must contain at most %d entries", maxPlaybackAddresses)
 	}
 	for _, host := range streamHosts {
+		if len(host) > maxTargetURLLength {
+			return fmt.Errorf("stream host must not exceed %d bytes", maxTargetURLLength)
+		}
 		if _, err := normalizeTargetURL(host); err != nil {
 			return fmt.Errorf("invalid stream host %q: %w", host, err)
 		}
@@ -1582,6 +2422,43 @@ func upstreamTargetForRequest(r *http.Request, apiTarget, playbackTarget *url.UR
 	return apiTarget
 }
 
+// resolvePlaybackConfiguration is the single interpretation of the persisted
+// playback fields used by both runtime routing and diagnostics. The first
+// stream_hosts entry becomes the effective playback target only when the
+// dedicated playback_target_url is empty; every configured authority remains
+// an allowed redirect destination.
+func resolvePlaybackConfiguration(playbackTargetURL, streamHostsRaw string) (*url.URL, map[string]bool, error) {
+	var playbackTarget *url.URL
+	var err error
+	if strings.TrimSpace(playbackTargetURL) != "" {
+		playbackTarget, err = normalizeTargetURL(playbackTargetURL)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid playback target URL: %w", err)
+		}
+	}
+	var extraHosts []string
+	if strings.TrimSpace(streamHostsRaw) != "" {
+		if err := json.Unmarshal([]byte(streamHostsRaw), &extraHosts); err != nil {
+			return nil, nil, fmt.Errorf("invalid stream_hosts: %w", err)
+		}
+	}
+	playbackHosts := make(map[string]bool, len(extraHosts)+1)
+	if playbackTarget != nil {
+		playbackHosts[redirectHostKey(playbackTarget)] = true
+	}
+	for _, raw := range extraHosts {
+		parsed, err := normalizeTargetURL(raw)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid stream host %q: %w", raw, err)
+		}
+		playbackHosts[redirectHostKey(parsed)] = true
+		if playbackTarget == nil {
+			playbackTarget = parsed
+		}
+	}
+	return playbackTarget, playbackHosts, nil
+}
+
 func applyUAProfileHeaders(header http.Header, profile UAProfile) {
 	header.Set("User-Agent", profile.UserAgent)
 	rewriteEmbyAuthorizationHeaders(header, "X-Emby-Authorization", profile)
@@ -1598,40 +2475,135 @@ func applyUAHeaderPolicy(header http.Header, policy UAHeaderPolicy) {
 	applyUAProfileHeaders(header, policy.Profile)
 }
 
+func isManagedForwardingHeaderName(name string) bool {
+	lowerName := strings.ToLower(name)
+	if lowerName == "forwarded" || lowerName == "x-real-ip" || strings.HasPrefix(lowerName, "x-forwarded-") {
+		return true
+	}
+	switch lowerName {
+	case "cf-connecting-ip", "cf-connecting-ipv6", "fastly-client-ip", "fly-client-ip",
+		"true-client-ip", "x-appengine-user-ip", "x-azure-clientip", "x-client-ip",
+		"x-cluster-client-ip", "x-envoy-external-address", "x-original-forwarded-for":
+		return true
+	default:
+		return false
+	}
+}
+
 func removeClientForwardingHeaders(header http.Header) {
 	for name := range header {
-		lowerName := strings.ToLower(name)
-		if lowerName == "forwarded" || lowerName == "x-real-ip" || strings.HasPrefix(lowerName, "x-forwarded-") {
+		if isManagedForwardingHeaderName(name) {
 			delete(header, name)
 		}
 	}
 }
 
-func setTrustedForwardingHeaders(header http.Header, inbound *http.Request) {
+func singleForwardedHeaderValue(header http.Header, name string) (string, bool) {
+	values := header.Values(name)
+	if len(values) != 1 {
+		return "", false
+	}
+	value := strings.TrimSpace(values[0])
+	if value == "" || strings.Contains(value, ",") {
+		return "", false
+	}
+	return value, true
+}
+
+func setTrustedForwardingHeaders(header http.Header, inbound *http.Request, trustedProxies ...[]*net.IPNet) {
 	removeClientForwardingHeaders(header)
 	if inbound == nil {
 		return
 	}
-	if peerIP := remoteAddressIP(inbound.RemoteAddr); peerIP != nil {
-		header.Set("X-Forwarded-For", peerIP.String())
-		header.Set("X-Real-IP", peerIP.String())
+	var configured []*net.IPNet
+	if len(trustedProxies) > 0 {
+		configured = trustedProxies[0]
 	}
-	if inbound.Host != "" {
-		header.Set("X-Forwarded-Host", inbound.Host)
-	}
+	peerIP := remoteAddressIP(inbound.RemoteAddr)
+	clientIP := peerIP
 	forwardedProto := "http"
 	if inbound.TLS != nil {
 		forwardedProto = "https"
 	}
+	if isTrustedProxy(peerIP, configured) {
+		// Trust only the single value a configured edge proxy normalized. Never
+		// relay an arbitrary inbound X-Forwarded-For chain to the upstream.
+		if value, ok := singleForwardedHeaderValue(inbound.Header, "X-Real-IP"); ok {
+			if forwardedIP := net.ParseIP(value); forwardedIP != nil {
+				clientIP = forwardedIP
+			}
+		}
+		if candidateProto, ok := singleForwardedHeaderValue(inbound.Header, "X-Forwarded-Proto"); ok {
+			if strings.EqualFold(candidateProto, "http") || strings.EqualFold(candidateProto, "https") {
+				forwardedProto = strings.ToLower(candidateProto)
+			}
+		}
+	}
+	if clientIP != nil {
+		header.Set("X-Forwarded-For", clientIP.String())
+		header.Set("X-Real-IP", clientIP.String())
+	}
 	header.Set("X-Forwarded-Proto", forwardedProto)
 }
 
-func prepareUpstreamHeaders(header http.Header, inbound *http.Request, policy UAHeaderPolicy) {
-	setTrustedForwardingHeaders(header, inbound)
+type publicHostIngressContextKey struct{}
+
+func applySiteForwardedHost(header http.Header, inbound *http.Request, site Site) {
+	header.Del("X-Forwarded-Host")
+	if inbound == nil || !ingressUsesHost(site.IngressMode) {
+		return
+	}
+	sharedIngress, _ := inbound.Context().Value(publicHostIngressContextKey{}).(bool)
+	if sharedIngress && requestPublicHost(inbound.Host) == site.PublicHost {
+		header.Set("X-Forwarded-Host", site.PublicHost)
+	}
+}
+
+// stripCookieByName removes Meridian's management session before any site
+// request leaves the process. Browser cookies are scoped by host, not port, so
+// a panel session could otherwise ride along to a site listener on the same
+// host. Malformed Cookie input is dropped in full rather than risk retaining a
+// disguised management credential.
+func stripCookieByName(header http.Header, name string) {
+	var rawValues []string
+	for key, values := range header {
+		if strings.EqualFold(key, "Cookie") {
+			rawValues = append(rawValues, values...)
+			delete(header, key)
+		}
+	}
+	if len(rawValues) == 0 {
+		return
+	}
+
+	kept := make([]string, 0)
+	for _, raw := range rawValues {
+		cookies, err := http.ParseCookie(raw)
+		if err != nil {
+			return
+		}
+		for _, cookie := range cookies {
+			if cookie.Name != name {
+				kept = append(kept, cookie.String())
+			}
+		}
+	}
+	if len(kept) > 0 {
+		header.Set("Cookie", strings.Join(kept, "; "))
+	}
+}
+
+func prepareUpstreamHeaders(header http.Header, inbound *http.Request, policy UAHeaderPolicy, trustedProxies ...[]*net.IPNet) {
+	stripCookieByName(header, sessionCookieName)
+	setTrustedForwardingHeaders(header, inbound, trustedProxies...)
 	applyUAHeaderPolicy(header, policy)
 }
 
-func prepareWebSocketUpstreamHeaders(inbound *http.Request, target *url.URL, policy UAHeaderPolicy) http.Header {
+func prepareWebSocketUpstreamHeaders(inbound *http.Request, target *url.URL, policy UAHeaderPolicy, upstreamPolicies ...upstreamHeaderPolicy) http.Header {
+	return prepareWebSocketUpstreamHeadersWithTrustedProxies(inbound, target, policy, nil, upstreamPolicies...)
+}
+
+func prepareWebSocketUpstreamHeadersWithTrustedProxies(inbound *http.Request, target *url.URL, policy UAHeaderPolicy, trustedProxies []*net.IPNet, upstreamPolicies ...upstreamHeaderPolicy) http.Header {
 	header := inbound.Header.Clone()
 	// RFC 9110 hop-by-hop: every header named by the inbound Connection header
 	// is consumed by the first recipient and must not be forwarded. Delete them
@@ -1662,8 +2634,27 @@ func prepareWebSocketUpstreamHeaders(inbound *http.Request, target *url.URL, pol
 	header.Set("Connection", "Upgrade")
 	header.Set("Upgrade", "websocket")
 	header.Set("Host", target.Host)
-	prepareUpstreamHeaders(header, inbound, policy)
+	prepareUpstreamHeaders(header, inbound, policy, trustedProxies)
+	if len(upstreamPolicies) > 0 {
+		upstreamPolicies[0].apply(header, target)
+	}
 	return header
+}
+
+// stripPanelSessionSetCookies prevents an upstream site from overwriting the
+// management session on a sibling port/route. Preserve valid application
+// cookies verbatim; malformed individual values fail closed because browser
+// parsers may otherwise interpret them more permissively than net/http.
+func stripPanelSessionSetCookies(header http.Header) {
+	values := header.Values("Set-Cookie")
+	header.Del("Set-Cookie")
+	for _, value := range values {
+		cookie, err := http.ParseSetCookie(value)
+		if err != nil || cookie.Name == sessionCookieName {
+			continue
+		}
+		header.Add("Set-Cookie", value)
+	}
 }
 
 // writeWebSocketGatewayError answers a hijacked client directly, since the
@@ -1673,7 +2664,7 @@ func writeWebSocketGatewayError(conn net.Conn) {
 	_, _ = fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
 }
 
-func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, policy UAHeaderPolicy, inst *ProxyInstance, speedLimitBytes int64) {
+func handleWebSocket(w http.ResponseWriter, r *http.Request, target, primaryTarget *url.URL, policy UAHeaderPolicy, inst *ProxyInstance, speedLimitBytes int64, upstreamPolicies ...upstreamHeaderPolicy) {
 	// Nothing on this path reads r.Body, so a body would be left sitting in the
 	// hijacked buffer and relayed verbatim to the upstream.
 	if r.ContentLength != 0 || len(r.TransferEncoding) > 0 {
@@ -1696,6 +2687,10 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, po
 		return
 	}
 	defer clientConn.Close()
+	if !inst.trackHijackedConn(clientConn) {
+		return
+	}
+	defer inst.untrackHijackedConn(clientConn)
 
 	// Connect to upstream
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
@@ -1733,7 +2728,15 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, po
 		log.Printf("[WS] write request line: %v", err)
 		return
 	}
-	upstreamHeader := prepareWebSocketUpstreamHeaders(r, target, policy)
+	upstreamHeader := prepareWebSocketUpstreamHeadersWithTrustedProxies(r, target, policy, inst.trustedProxies, upstreamPolicies...)
+	if primaryTarget != nil && !sameRedirectAuthority(primaryTarget, target) {
+		// A separately configured playback/CDN authority is a different trust
+		// domain. Preserve only WebSocket negotiation fields and normalized client
+		// identity; browser/API credentials must stay with the main origin.
+		upstreamHeader = crossAuthorityWebSocketHeaders(upstreamHeader)
+		upstreamHeader.Set("Host", target.Host)
+	}
+	applySiteForwardedHost(upstreamHeader, r, inst.Site)
 	if err := upstreamHeader.Write(upstreamConn); err != nil {
 		log.Printf("[WS] write request headers: %v", err)
 		return
@@ -1780,6 +2783,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, po
 		writeWebSocketGatewayError(clientConn)
 		return
 	}
+	stripPanelSessionSetCookies(resp.Header)
 
 	// Relay the switch verbatim; the client needs Sec-WebSocket-Accept.
 	if _, err := io.WriteString(clientConn, "HTTP/1.1 101 Switching Protocols\r\n"); err != nil {
@@ -1808,49 +2812,66 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, po
 		_, _ = io.Copy(&tunnelWriter{dst: clientConn, counter: &inst.bytesOut, bytesPerSec: speedLimitBytes, start: time.Now()}, upstreamReader)
 		done <- struct{}{}
 	}()
+	// The first closed direction must tear down its counterpart, then both copy
+	// goroutines must finish before the request leaves activeRequests. Otherwise
+	// shutdown can perform its final traffic flush while the second goroutine is
+	// still incrementing the old instance's counters.
+	<-done
+	_ = clientConn.Close()
+	_ = upstreamConn.Close()
 	<-done
 }
 
 func (pm *ProxyManager) StartSite(site Site) error {
+	pm.lifecycleMu.Lock()
+	defer pm.lifecycleMu.Unlock()
+	if pm.shutdownStarted.Load() {
+		return errProxyManagerShuttingDown
+	}
+	publicHost, err := normalizePublicHost(site.PublicHost)
+	if err != nil {
+		return fmt.Errorf("invalid public host: %w", err)
+	}
+	site.PublicHost = publicHost
+	site.IngressMode, err = normalizeIngressMode(site.IngressMode, site.PublicHost)
+	if err != nil {
+		return fmt.Errorf("invalid ingress configuration: %w", err)
+	}
+	if err := pm.validateIngressSafety(site.IngressMode); err != nil {
+		return err
+	}
 	target, err := normalizeTargetURL(site.TargetURL)
 	if err != nil {
 		return fmt.Errorf("invalid target URL: %w", err)
 	}
-	var playbackTarget *url.URL
-	if strings.TrimSpace(site.PlaybackTargetURL) != "" {
-		playbackTarget, err = normalizeTargetURL(site.PlaybackTargetURL)
-		if err != nil {
-			return fmt.Errorf("invalid playback target URL: %w", err)
-		}
-	}
-
-	// Build playback hosts set from playback_target_url + stream_hosts
-	playbackHostsSet := make(map[string]bool)
-	if playbackTarget != nil {
-		playbackHostsSet[redirectHostKey(playbackTarget)] = true
-	}
-	var extraHosts []string
-	if strings.TrimSpace(site.StreamHosts) != "" {
-		if err := json.Unmarshal([]byte(site.StreamHosts), &extraHosts); err != nil {
-			return fmt.Errorf("invalid stream_hosts: %w", err)
-		}
-	}
-	for _, raw := range extraHosts {
-		parsed, err := normalizeTargetURL(raw)
-		if err != nil {
-			return fmt.Errorf("invalid stream host %q: %w", raw, err)
-		}
-		playbackHostsSet[redirectHostKey(parsed)] = true
-		if playbackTarget == nil {
-			playbackTarget = parsed
-		}
+	playbackTarget, playbackHostsSet, err := resolvePlaybackConfiguration(site.PlaybackTargetURL, site.StreamHosts)
+	if err != nil {
+		return err
 	}
 
 	policy, err := resolveUAHeaderPolicy(site)
 	if err != nil {
 		return fmt.Errorf("invalid UA profile: %w", err)
 	}
-	inst := &ProxyInstance{Site: site, startedAt: time.Now()}
+	configuredHeaders, err := resolveUpstreamHeaderPolicy(site.StoredUpstreamHeaders, pm.upstreamHeaderKey, target)
+	if err != nil {
+		return fmt.Errorf("invalid upstream headers: %w", err)
+	}
+	instanceCtx, instanceCancel := context.WithCancel(context.Background())
+	inst := &ProxyInstance{
+		Site:           site,
+		startedAt:      time.Now(),
+		ctx:            instanceCtx,
+		cancel:         instanceCancel,
+		hijackedConns:  make(map[net.Conn]struct{}),
+		trustedProxies: append([]*net.IPNet(nil), pm.trustedProxies...),
+	}
+	installed := false
+	defer func() {
+		if !installed {
+			instanceCancel()
+		}
+	}()
 	inst.persistedTraffic.Store(site.TrafficUsed)
 
 	isRedirectMode := playbackTarget != nil && site.PlaybackMode == "redirect"
@@ -1858,6 +2879,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	proxyTransport.TLSClientConfig = secureTLSConfig("")
 	proxyTransport.ResponseHeaderTimeout = 30 * time.Second
 	proxyTransport.MaxIdleConnsPerHost = 32
+	inst.transport = proxyTransport
 
 	proxy := &httputil.ReverseProxy{
 		Transport: proxyTransport,
@@ -1870,7 +2892,19 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			}
 			applyUpstreamURL(proxyReq.Out.URL, upstream)
 			proxyReq.Out.Host = upstream.Host
-			prepareUpstreamHeaders(proxyReq.Out.Header, proxyReq.In, policy)
+			prepareUpstreamHeaders(proxyReq.Out.Header, proxyReq.In, policy, inst.trustedProxies)
+			if !sameRedirectAuthority(target, upstream) {
+				// Direct playback can target a separate CDN. Treat that authority like
+				// a cross-origin redirect and rebuild from a narrow allowlist so client
+				// cookies, bearer tokens, and arbitrary secret headers cannot follow it.
+				proxyReq.Out.Header = crossAuthorityRedirectHeaders(proxyReq.Out.Header)
+			}
+			applySiteForwardedHost(proxyReq.Out.Header, proxyReq.In, site)
+			configuredHeaders.apply(proxyReq.Out.Header, upstream)
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			stripPanelSessionSetCookies(resp.Header)
+			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("[%s] proxy error: %v", site.Name, err)
@@ -1882,9 +2916,10 @@ func (pm *ProxyManager) StartSite(site Site) error {
 
 	if isRedirectMode {
 		proxy.Transport = &redirectFollowTransport{
-			base:          proxyTransport,
-			playbackHosts: playbackHostsSet,
-			policy:        policy,
+			base:                 proxyTransport,
+			playbackHosts:        playbackHostsSet,
+			policy:               policy,
+			upstreamHeaderPolicy: configuredHeaders,
 		}
 	}
 
@@ -1892,7 +2927,28 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	speedLimitBytes := int64(site.SpeedLimit) * 125000 // Mbps -> bytes/sec
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !inst.beginRequest() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":"site is stopping"}`))
+			return
+		}
+		defer inst.endRequest()
+		requestCtx, requestCancel := context.WithCancel(r.Context())
+		stopInstanceCancel := context.AfterFunc(inst.ctx, requestCancel)
+		defer func() {
+			stopInstanceCancel()
+			requestCancel()
+		}()
+		r = r.WithContext(requestCtx)
 		inst.reqCount.Add(1)
+		if isReservedDynamicRoute(r.URL.Path) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusGone)
+			_, _ = w.Write([]byte(`{"error":"dynamic route is no longer valid"}`))
+			return
+		}
 
 		if site.TrafficQuota > 0 {
 			currentUsed := inst.persistedTraffic.Load() + inst.bytesIn.Load() + inst.bytesOut.Load()
@@ -1904,12 +2960,18 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			}
 		}
 
-		if isWebSocketUpgrade(r) {
+		if hasUpgradeIntent(r) {
+			if !isWebSocketUpgrade(r) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"invalid websocket upgrade"}`))
+				return
+			}
 			wsTarget := upstreamTargetForRequest(r, target, playbackTarget)
 			if isRedirectMode {
 				wsTarget = target
 			}
-			handleWebSocket(w, r, wsTarget, policy, inst, speedLimitBytes)
+			handleWebSocket(w, r, wsTarget, target, policy, inst, speedLimitBytes, configuredHeaders)
 			return
 		}
 
@@ -1931,56 +2993,92 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		proxy.ServeHTTP(rw, r) // #nosec G704 -- forwarding to the administrator-configured, validated upstream is the product's purpose.
 	})
 
-	listenAddr := fmt.Sprintf(":%d", site.ListenPort)
-	listener, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		return fmt.Errorf("listen %s: %w", listenAddr, err)
+	inst.handler = handler
+	var listener net.Listener
+	var server *http.Server
+	if ingressUsesPort(site.IngressMode) {
+		listenAddr := fmt.Sprintf(":%d", site.ListenPort)
+		listener, err = net.Listen("tcp", listenAddr)
+		if err != nil {
+			return fmt.Errorf("listen %s: %w", listenAddr, err)
+		}
+		listener = limitListener(listener, 2048)
+		server = &http.Server{
+			Handler:           handler,
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       0,
+			WriteTimeout:      0,
+			IdleTimeout:       120 * time.Second,
+			MaxHeaderBytes:    64 << 10,
+		}
+		inst.server = server
+		inst.listener = listener
 	}
-	listener = limitListener(listener, 2048)
-
-	server := &http.Server{
-		Handler:           handler,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       0,
-		WriteTimeout:      0,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    64 << 10,
+	closeNewListener := func() {
+		if listener != nil {
+			_ = listener.Close()
+		}
 	}
-
-	inst.server = server
-	inst.listener = listener
 
 	pm.mu.Lock()
-	if existing, ok := pm.proxies[site.ID]; ok {
-		// Flush before dropping the instance, the way StopSite does. This branch is
-		// reached when a running site's listen_port changes, which is the one
-		// update path handleSiteByID does not pre-stop, so without this everything
-		// counted since the last 60s tick vanishes from traffic_logs and
-		// sites.traffic_used.
-		if err := pm.flushProxyTraffic(existing); err != nil {
-			// Fail closed: keep the old instance and its pending bytes, release
-			// the new instance's freshly bound listener, and leave the proxies
-			// map untouched. The Serve goroutine below never starts, so closing
-			// the raw listener is enough.
+	if ingressUsesHost(site.IngressMode) {
+		if assignedID, ok := pm.publicHosts[site.PublicHost]; ok && assignedID != site.ID {
 			pm.mu.Unlock()
-			_ = listener.Close()
+			closeNewListener()
+			return fmt.Errorf("public_host %s is already assigned to another site", site.PublicHost)
+		}
+	}
+	existing := pm.proxies[site.ID]
+	pm.mu.Unlock()
+	if existing != nil {
+		// Verify persistence before stopping the old instance. lifecycleMu pins the
+		// selected instance while trafficMu serializes this flush, so the global
+		// routing lock need not be held across a potentially slow SQLite write.
+		if err := pm.flushProxyTraffic(existing); err != nil {
+			closeNewListener()
 			return fmt.Errorf("flush traffic of the instance being replaced: %w", err)
 		}
-		// That flush moved bytes into the row `site` was read from, so carry the
-		// authoritative total forward instead of the snapshot taken before it.
+	}
+
+	if existing != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		shutdownErr := existing.shutdown(shutdownCtx)
+		shutdownCancel()
+		if shutdownErr != nil {
+			closeNewListener()
+			return fmt.Errorf("drain the instance being replaced: %w", shutdownErr)
+		}
+		// Account for bytes produced after the pre-stop flush. If this fails, keep
+		// the closed instance in the map with its counters so a retry can persist
+		// them rather than silently orphaning traffic.
+		if err := pm.flushProxyTraffic(existing); err != nil {
+			closeNewListener()
+			return fmt.Errorf("final traffic flush of the instance being replaced: %w", err)
+		}
 		if flushed := existing.Site.TrafficUsed; flushed > inst.persistedTraffic.Load() {
 			inst.persistedTraffic.Store(flushed)
+			inst.Site.TrafficUsed = flushed
 		}
-		if existing.server != nil {
-			existing.server.Close()
-		}
-		delete(pm.proxies, site.ID)
+	}
+
+	pm.mu.Lock()
+	if err := pm.registerSiteHostLocked(site); err != nil {
+		pm.mu.Unlock()
+		closeNewListener()
+		return err
 	}
 	pm.proxies[site.ID] = inst
 	pm.mu.Unlock()
+	installed = true
 
+	upstreamLogTarget := redactUpstreamURL(target)
+	if server == nil {
+		log.Printf("[%s] shared-host proxy %s -> %s (UA: %s)", site.Name, site.PublicHost, upstreamLogTarget, site.UAMode)
+		return nil
+	}
+	inst.portServing.Store(true)
 	go func() {
-		upstreamLogTarget := redactUpstreamURL(target)
+		defer inst.portServing.Store(false)
 		if len(playbackHostsSet) > 0 {
 			hosts := make([]string, 0, len(playbackHostsSet))
 			for h := range playbackHostsSet {
@@ -1990,8 +3088,17 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		} else {
 			log.Printf("[%s] proxy :%d -> %s (UA: %s)", site.Name, site.ListenPort, upstreamLogTarget, site.UAMode)
 		}
-		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
-			log.Printf("[%s] server error: %v", site.Name, err)
+		err := server.Serve(listener)
+		if inst.isAccepting() {
+			// A Serve loop that disappears while the lifecycle gate is still open
+			// makes a port-only site unavailable even though its instance remains in
+			// the map. Record that state for API/runtime diagnostics.
+			inst.portServeFailed.Store(true)
+			if err != nil && err != http.ErrServerClosed {
+				log.Printf("[%s] server error: %v", site.Name, err)
+			} else {
+				log.Printf("[%s] server stopped unexpectedly", site.Name)
+			}
 		}
 	}()
 
@@ -1999,30 +3106,48 @@ func (pm *ProxyManager) StartSite(site Site) error {
 }
 
 func (pm *ProxyManager) StopSite(id int64) error {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
+	pm.lifecycleMu.Lock()
+	defer pm.lifecycleMu.Unlock()
+	pm.mu.RLock()
 	inst, ok := pm.proxies[id]
+	pm.mu.RUnlock()
 	if !ok {
 		return nil
 	}
-	// Flush before dropping the instance so pending bytes reach the DB. If the
-	// flush fails the instance stays running with its pending bytes intact and
-	// the caller must abort (or retry) so instance and DB remain consistent.
+	// Check persistence before closing any listener or request context. A DB
+	// failure therefore leaves a fully usable instance that can be retried.
+	// lifecycleMu pins inst, and trafficMu protects its counters without blocking
+	// shared-host routing on pm.mu.
+	ingressAlreadyClosed := !inst.isAccepting()
 	if err := pm.flushProxyTraffic(inst); err != nil {
+		if ingressAlreadyClosed {
+			return &siteIngressClosedError{siteID: id, flushErr: err}
+		}
 		return err
 	}
-	if inst.server != nil {
-		inst.server.Close()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	shutdownErr := inst.shutdown(shutdownCtx)
+	shutdownCancel()
+	finalFlushErr := pm.flushProxyTraffic(inst)
+	if shutdownErr != nil || finalFlushErr != nil {
+		// Keep the stopped instance and its pending counters addressable so a
+		// subsequent StopSite/GracefulShutdown can retry the final persistence.
+		return &siteIngressClosedError{siteID: id, drainErr: shutdownErr, flushErr: finalFlushErr}
 	}
-	delete(pm.proxies, id)
+	pm.mu.Lock()
+	if pm.proxies[id] == inst {
+		delete(pm.proxies, id)
+	}
+	pm.mu.Unlock()
 	return nil
 }
 
 func (pm *ProxyManager) IsRunning(id int64) bool {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
-	_, ok := pm.proxies[id]
-	return ok
+	inst, ok := pm.proxies[id]
+	return ok && inst.isOperational()
 }
 
 func (pm *ProxyManager) StartAllEnabled() (int, error) {
@@ -2030,9 +3155,17 @@ func (pm *ProxyManager) StartAllEnabled() (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	for _, site := range sites {
+		if err := pm.RegisterSiteHost(site); err != nil {
+			return 0, err
+		}
+	}
 	for _, s := range sites {
 		if s.Enabled {
 			if err := pm.StartSite(s); err != nil {
+				if errors.Is(err, errUnsafeHostOnlyIngress) {
+					return len(sites), fmt.Errorf("site %q: %w", s.Name, err)
+				}
 				log.Printf("[%s] failed to start: %v", s.Name, err)
 			}
 		}
@@ -2045,8 +3178,12 @@ func (pm *ProxyManager) StartAllEnabled() (int, error) {
 // counters and is logged here, so the next tick retries the same bytes.
 func (pm *ProxyManager) FlushTraffic() {
 	pm.mu.RLock()
-	defer pm.mu.RUnlock()
+	instances := make([]*ProxyInstance, 0, len(pm.proxies))
 	for _, inst := range pm.proxies {
+		instances = append(instances, inst)
+	}
+	pm.mu.RUnlock()
+	for _, inst := range instances {
 		if err := pm.flushProxyTraffic(inst); err != nil {
 			log.Printf("[%s] failed to flush traffic: %v", inst.Site.Name, err)
 		}
@@ -2054,10 +3191,10 @@ func (pm *ProxyManager) FlushTraffic() {
 }
 
 // flushProxyTraffic persists inst's pending bytes into the DB and moves them
-// into the persisted baseline. The caller must hold pm.mu (read or write);
-// inst.trafficMu is acquired here. On failure the pending counters are fully
-// restored so the next flush retries the same bytes. Never call this from
-// code that already holds inst.trafficMu (no nested re-entry).
+// into the persisted baseline. The caller must pin inst through lifecycleMu, a
+// pm.mu snapshot, or another stable reference; inst.trafficMu is acquired here.
+// On failure the pending counters are fully restored so the next flush retries
+// the same bytes. Never call this while already holding inst.trafficMu.
 func (pm *ProxyManager) flushProxyTraffic(inst *ProxyInstance) error {
 	inst.trafficMu.Lock()
 	defer inst.trafficMu.Unlock()
@@ -2156,8 +3293,8 @@ func (pm *ProxyManager) SiteTrafficHistory(site Site, hours int) (*TrafficHistor
 	}
 
 	pm.mu.RLock()
-	inst, running := pm.proxies[site.ID]
-	if !running {
+	inst, present := pm.proxies[site.ID]
+	if !present {
 		pm.mu.RUnlock()
 		logs, err := pm.database.GetTrafficLogs(site.ID, hours)
 		if err != nil {
@@ -2175,7 +3312,7 @@ func (pm *ProxyManager) SiteTrafficHistory(site Site, hours int) (*TrafficHistor
 	if err != nil {
 		return nil, err
 	}
-	snap.Running = true
+	snap.Running = inst.isOperational()
 	snap.PersistedTraffic = inst.persistedTraffic.Load()
 	snap.BytesIn = inst.bytesIn.Load()
 	snap.BytesOut = inst.bytesOut.Load()
@@ -2194,7 +3331,7 @@ func (pm *ProxyManager) SiteTrafficHistory(site Site, hours int) (*TrafficHistor
 func (pm *ProxyManager) overlaySiteTrafficLocked(s Site, st *SiteTraffic) {
 	if inst, ok := pm.proxies[s.ID]; ok {
 		inst.trafficMu.Lock()
-		st.Running = true
+		st.Running = inst.isOperational()
 		st.PersistedTraffic = inst.persistedTraffic.Load()
 		st.BytesIn = inst.bytesIn.Load()
 		st.BytesOut = inst.bytesOut.Load()
@@ -2241,7 +3378,11 @@ func (pm *ProxyManager) TrafficSnapshot() (*TrafficSnapshot, error) {
 	}
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
-	snap.RunningSites = len(pm.proxies)
+	for _, inst := range pm.proxies {
+		if inst.isOperational() {
+			snap.RunningSites++
+		}
+	}
 	for _, s := range sites {
 		st := SiteTraffic{
 			ID:               s.ID,
@@ -2265,28 +3406,85 @@ func (pm *ProxyManager) TrafficSnapshot() (*TrafficSnapshot, error) {
 func (pm *ProxyManager) GetRunningCount() int {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
-	return len(pm.proxies)
+	running := 0
+	for _, inst := range pm.proxies {
+		if inst.isOperational() {
+			running++
+		}
+	}
+	return running
 }
 
-func (pm *ProxyManager) GetSiteRuntime(id int64) (requests int64, startedAt time.Time, running bool) {
+func (pm *ProxyManager) GetSiteRuntime(id int64) (requests int64, startedAt time.Time, running, portListening bool) {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	inst, ok := pm.proxies[id]
 	if !ok {
-		return 0, time.Time{}, false
+		return 0, time.Time{}, false, false
 	}
-	return inst.reqCount.Load(), inst.startedAt, true
+	return inst.reqCount.Load(), inst.startedAt, inst.isOperational(), inst.portServing.Load()
 }
 
 // GracefulShutdown stops all proxies gracefully
 func (pm *ProxyManager) GracefulShutdown(ctx context.Context) {
-	pm.FlushTraffic()
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
+	pm.lifecycleMu.Lock()
+	defer pm.lifecycleMu.Unlock()
+	pm.shutdownStarted.Store(true)
+	pm.mu.RLock()
+	instances := make(map[int64]*ProxyInstance, len(pm.proxies))
 	for id, inst := range pm.proxies {
+		instances[id] = inst
+	}
+	pm.mu.RUnlock()
+
+	type shutdownResult struct {
+		id   int64
+		inst *ProxyInstance
+		err  error
+	}
+	results := make(chan shutdownResult, len(instances))
+	for id, inst := range instances {
 		log.Printf("[%s] shutting down...", inst.Site.Name)
-		inst.server.Shutdown(ctx)
-		delete(pm.proxies, id)
+		go func(id int64, inst *ProxyInstance) {
+			// shutdown closes the request gate and every listener/connection before
+			// waiting, so launching all instances in parallel stops every ingress
+			// promptly instead of spending the shared deadline site by site.
+			results <- shutdownResult{id: id, inst: inst, err: inst.shutdown(ctx)}
+		}(id, inst)
+	}
+
+	// Capture an early best-effort checkpoint after all shutdowns have started.
+	// The final pass below always runs, even when one or more drains time out.
+	for _, inst := range instances {
+		if err := pm.flushProxyTraffic(inst); err != nil {
+			log.Printf("[%s] pre-shutdown traffic flush failed: %v", inst.Site.Name, err)
+		}
+	}
+
+	drainErrors := make(map[int64]error, len(instances))
+	for range instances {
+		result := <-results
+		drainErrors[result.id] = result.err
+		if result.err != nil {
+			log.Printf("[%s] shutdown drain failed: %v", result.inst.Site.Name, result.err)
+		}
+	}
+
+	for id, inst := range instances {
+		if err := pm.flushProxyTraffic(inst); err != nil {
+			log.Printf("[%s] final shutdown traffic flush failed: %v", inst.Site.Name, err)
+			continue
+		}
+		if drainErrors[id] != nil {
+			// Keep a timed-out instance addressable: a caller that does not exit the
+			// process may retry and persist counters produced by a late request.
+			continue
+		}
+		pm.mu.Lock()
+		if pm.proxies[id] == inst {
+			delete(pm.proxies, id)
+		}
+		pm.mu.Unlock()
 	}
 }
 
@@ -2351,10 +3549,13 @@ type DiagHeaders struct {
 }
 
 type DiagProxy struct {
-	Running    bool   `json:"running"`
-	ListenPort int    `json:"listen_port"`
-	TotalReqs  int64  `json:"total_requests"`
-	Uptime     string `json:"uptime,omitempty"`
+	Running       bool   `json:"running"`
+	IngressMode   string `json:"ingress_mode"`
+	PublicHost    string `json:"public_host,omitempty"`
+	PortListening bool   `json:"port_listening"`
+	ListenPort    int    `json:"listen_port"`
+	TotalReqs     int64  `json:"total_requests"`
+	Uptime        string `json:"uptime,omitempty"`
 }
 
 func tlsIssuerName(cert *x509.Certificate) string {
@@ -2729,7 +3930,11 @@ func diagnoseSite(site *Site, pm *ProxyManager) DiagResult {
 	primary.ShowHealth = true
 	primary.ShowTLS = primary.TLS.Enabled
 
-	playbackRaw := strings.TrimSpace(site.PlaybackTargetURL)
+	playbackTarget, _, playbackConfigErr := resolvePlaybackConfiguration(site.PlaybackTargetURL, site.StreamHosts)
+	playbackRaw := ""
+	if playbackTarget != nil {
+		playbackRaw = playbackTarget.String()
+	}
 	playback := primary
 	playback.ConfiguredURL = ""
 	playback.Configured = false
@@ -2738,7 +3943,15 @@ func diagnoseSite(site *Site, pm *ProxyManager) DiagResult {
 	playback.ShowHealth = false
 	playback.ShowTLS = false
 
-	if playbackRaw != "" {
+	if playbackConfigErr != nil {
+		playback = DiagUpstream{
+			Configured:    true,
+			UsingFallback: false,
+			SameAsPrimary: false,
+			ShowHealth:    true,
+			Health:        DiagHealth{Status: "offline", Error: playbackConfigErr.Error()},
+		}
+	} else if playbackRaw != "" {
 		var playbackKey string
 		playback, playbackKey = diagnoseUpstreamTarget(playbackRaw, "playback_path")
 		playback.Configured = true
@@ -2784,7 +3997,7 @@ func diagnoseSite(site *Site, pm *ProxyManager) DiagResult {
 	}
 
 	// Proxy status
-	totalRequests, startedAt, running := pm.GetSiteRuntime(site.ID)
+	totalRequests, startedAt, running, portListening := pm.GetSiteRuntime(site.ID)
 	uptime := ""
 	if running && !startedAt.IsZero() {
 		duration := time.Since(startedAt).Round(time.Second)
@@ -2794,28 +4007,99 @@ func diagnoseSite(site *Site, pm *ProxyManager) DiagResult {
 		uptime = duration.String()
 	}
 	result.Proxy = DiagProxy{
-		Running:    running,
-		ListenPort: site.ListenPort,
-		TotalReqs:  totalRequests,
-		Uptime:     uptime,
+		Running:       running,
+		IngressMode:   site.IngressMode,
+		PublicHost:    site.PublicHost,
+		PortListening: portListening,
+		ListenPort:    site.ListenPort,
+		TotalReqs:     totalRequests,
+		Uptime:        uptime,
 	}
 
 	return result
 }
 
 type App struct {
-	db               *DB
-	pm               *ProxyManager
-	siteLifecycleMu  sync.Mutex
-	setupTokenMu     sync.Mutex
-	setupToken       string
-	loginLimiter     *loginRateLimiter
-	loginLimiterOnce sync.Once
-	trustedProxies   []*net.IPNet
+	db                *DB
+	pm                *ProxyManager
+	siteLifecycleMu   sync.Mutex
+	setupTokenMu      sync.Mutex
+	setupToken        string
+	loginLimiter      *loginRateLimiter
+	loginLimiterOnce  sync.Once
+	trustedProxies    []*net.IPNet
+	panelHost         string
+	panelBindLoopback bool
+}
+
+func isLoopbackHealthProbe(r *http.Request) bool {
+	if r == nil || r.Method != http.MethodGet || r.URL.Path != "/api/auth/check" {
+		return false
+	}
+	for name := range r.Header {
+		// A real local health probe arrives directly. If an edge proxy supplied
+		// client-forwarding identity, a loopback transport peer alone must not
+		// bypass strict PANEL_DOMAIN routing.
+		if isManagedForwardingHeaderName(name) {
+			return false
+		}
+	}
+	peerIP := remoteAddressIP(r.RemoteAddr)
+	if peerIP == nil || !peerIP.IsLoopback() {
+		return false
+	}
+	host := strings.TrimSpace(r.Host)
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	} else if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	} else if strings.Count(host, ":") > 1 {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	hostIP := net.ParseIP(host)
+	return hostIP != nil && hostIP.IsLoopback()
+}
+
+func (a *App) publicHostRouter(panel http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := requestPublicHost(r.Host)
+		if host != "" {
+			handler, configured, mode := a.pm.PublicHostRoute(host)
+			if configured {
+				if mode == ingressModeHost && !a.panelBindLoopback && !isTrustedProxy(remoteAddressIP(r.RemoteAddr), a.trustedProxies) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusForbidden)
+					_, _ = w.Write([]byte(`{"error":"host-only ingress requires a configured proxy source"}`))
+					return
+				}
+				if handler == nil {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_, _ = w.Write([]byte(`{"error":"site unavailable"}`))
+					return
+				}
+				r = r.WithContext(context.WithValue(r.Context(), publicHostIngressContextKey{}, true))
+				handler.ServeHTTP(w, r)
+				return
+			}
+		}
+		if a.panelHost == "" || host == a.panelHost || isLoopbackHealthProbe(r) {
+			panel.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMisdirectedRequest)
+		_, _ = w.Write([]byte(`{"error":"unrecognized host"}`))
+	})
 }
 
 const (
-	maxJSONBodyBytes = 64 << 10
+	// 128 playback URLs at the per-entry limit plus site metadata fit below
+	// this ceiling. Individual fields and list counts remain separately bounded.
+	maxJSONBodyBytes = 512 << 10
 	// speedLimitBytes multiplies this field by 125000, so an unbounded value
 	// wraps int64 and silently disables the limit instead of tightening it.
 	// 1000000 matches the max the site form already enforces.
@@ -2972,11 +4256,12 @@ func isTrustedProxy(ip net.IP, networks []*net.IPNet) bool {
 func requestClientKey(r *http.Request, trustedProxies []*net.IPNet) string {
 	peerIP := remoteAddressIP(r.RemoteAddr)
 	if isTrustedProxy(peerIP, trustedProxies) {
-		if forwarded := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); forwarded != nil {
-			return forwarded.String()
-		}
-		for _, raw := range strings.Split(r.Header.Get("X-Forwarded-For"), ",") {
-			if forwarded := net.ParseIP(strings.TrimSpace(raw)); forwarded != nil {
+		// The trusted edge must normalize the client address into a single
+		// X-Real-IP value. Never select from X-Forwarded-For: common
+		// $proxy_add_x_forwarded_for configurations retain attacker-supplied
+		// left-most values and would let clients rotate the login limiter key.
+		if value, ok := singleForwardedHeaderValue(r.Header, "X-Real-IP"); ok {
+			if forwarded := net.ParseIP(value); forwarded != nil {
 				return forwarded.String()
 			}
 		}
@@ -3074,6 +4359,20 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+func panelBodyReadDeadline(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil && (r.ContentLength != 0 || len(r.TransferEncoding) > 0) {
+			controller := http.NewResponseController(w)
+			// Keep the deadline through net/http's post-handler request-body drain.
+			// Clearing it when the handler returns lets a slow client keep dripping an
+			// unread body indefinitely. The server installs the next request/idle
+			// deadline before reusing a healthy keep-alive connection.
+			_ = controller.SetReadDeadline(time.Now().Add(30 * time.Second))
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func staticHandler(staticFS fs.FS) http.Handler {
 	fileServer := http.FileServer(http.FS(staticFS))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3118,8 +4417,8 @@ func requestIsHTTPS(r *http.Request, trustedProxies []*net.IPNet) bool {
 	if !isTrustedProxy(remoteAddressIP(r.RemoteAddr), trustedProxies) {
 		return false
 	}
-	forwardedProto := strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]
-	return strings.EqualFold(strings.TrimSpace(forwardedProto), "https")
+	forwardedProto, ok := singleForwardedHeaderValue(r.Header, "X-Forwarded-Proto")
+	return ok && strings.EqualFold(forwardedProto, "https")
 }
 
 func (a *App) setSessionCookie(w http.ResponseWriter, r *http.Request, token string) {
@@ -3152,11 +4451,20 @@ func (a *App) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
 }
 
 func sessionIdentity(r *http.Request) (int64, string, error) {
-	cookie, err := r.Cookie(sessionCookieName)
-	if err != nil || cookie.Value == "" {
-		return 0, "", errors.New("missing session")
+	for _, cookie := range r.Cookies() {
+		if cookie.Name != sessionCookieName || cookie.Value == "" {
+			continue
+		}
+		userID, username, err := validateToken(cookie.Value)
+		if err == nil {
+			// Accept the signed management value even if an untrusted sibling
+			// origin managed to prepend an invalid same-name cookie. The attacker
+			// cannot forge a second valid token, so this avoids cookie-shadowing
+			// logout/DoS without weakening authentication.
+			return userID, username, nil
+		}
 	}
-	return validateToken(cookie.Value)
+	return 0, "", errors.New("missing or invalid session")
 }
 
 func (a *App) csrfMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -3347,6 +4655,22 @@ func (a *App) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	a.jsonOK(w, snap)
 }
 
+// GET /api/ingress-capabilities exposes only coarse deployment state so the
+// site form can avoid proposing host-only mode when the backend must reject it.
+func (a *App) handleIngressCapabilities(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	a.jsonOK(w, map[string]interface{}{
+		"host_only_available":        a.pm.HostOnlyIngressSafe(),
+		"panel_bind_loopback":        a.panelBindLoopback,
+		"trusted_proxy_configured":   len(a.trustedProxies) > 0,
+		"upstream_headers_available": a.pm.UpstreamHeadersAvailable(),
+		"max_playback_addresses":     maxPlaybackAddresses,
+	})
+}
+
 // GET/POST /api/sites
 func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -3376,18 +4700,21 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 
 	case "POST":
 		var req struct {
-			Name              string   `json:"name"`
-			ListenPort        int      `json:"listen_port"`
-			TargetURL         string   `json:"target_url"`
-			PlaybackTargetURL string   `json:"playback_target_url"`
-			PlaybackMode      string   `json:"playback_mode"`
-			StreamHosts       []string `json:"stream_hosts"`
-			UAMode            string   `json:"ua_mode"`
-			CustomUserAgent   string   `json:"custom_user_agent"`
-			CustomClient      string   `json:"custom_client"`
-			CustomVersion     string   `json:"custom_version"`
-			Quota             int64    `json:"traffic_quota"`
-			SpeedLimit        int      `json:"speed_limit"`
+			Name              string                `json:"name"`
+			ListenPort        int                   `json:"listen_port"`
+			PublicHost        string                `json:"public_host"`
+			IngressMode       string                `json:"ingress_mode"`
+			TargetURL         string                `json:"target_url"`
+			PlaybackTargetURL string                `json:"playback_target_url"`
+			PlaybackMode      string                `json:"playback_mode"`
+			StreamHosts       []string              `json:"stream_hosts"`
+			UAMode            string                `json:"ua_mode"`
+			CustomUserAgent   string                `json:"custom_user_agent"`
+			CustomClient      string                `json:"custom_client"`
+			CustomVersion     string                `json:"custom_version"`
+			UpstreamHeaders   []UpstreamHeaderInput `json:"upstream_headers"`
+			Quota             int64                 `json:"traffic_quota"`
+			SpeedLimit        int                   `json:"speed_limit"`
 		}
 		if err := decodeJSONBody(w, r, &req); err != nil {
 			a.jsonErr(w, 400, "invalid request")
@@ -3405,6 +4732,25 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Name = strings.TrimSpace(req.Name)
 		req.PlaybackMode = strings.ToLower(strings.TrimSpace(req.PlaybackMode))
+		publicHost, err := normalizePublicHost(req.PublicHost)
+		if err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if publicHost != "" && publicHost == a.panelHost {
+			a.jsonErr(w, http.StatusBadRequest, "public_host must differ from PANEL_DOMAIN")
+			return
+		}
+		req.PublicHost = publicHost
+		req.IngressMode, err = normalizeIngressMode(req.IngressMode, req.PublicHost)
+		if err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := a.pm.validateIngressSafety(req.IngressMode); err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		normalizedMode, customUserAgent, customClient, customVersion, err := normalizeUAConfig(req.UAMode, req.CustomUserAgent, req.CustomClient, req.CustomVersion)
 		if err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
@@ -3422,24 +4768,43 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 		if req.StreamHosts == nil {
 			streamHostsJSON = []byte("[]")
 		}
+		storedHeaders, err := mergeUpstreamHeaders("[]", req.UpstreamHeaders, a.pm.upstreamHeaderKey, req.TargetURL)
+		if err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		a.siteLifecycleMu.Lock()
 		defer a.siteLifecycleMu.Unlock()
+		if req.PublicHost != "" {
+			if _, exists := a.pm.PublicHostSiteID(req.PublicHost); exists {
+				a.jsonErr(w, http.StatusBadRequest, "public_host is already assigned to another site")
+				return
+			}
+		}
 		site, err := a.db.CreateSiteRecord(Site{
-			Name:              req.Name,
-			ListenPort:        req.ListenPort,
-			TargetURL:         req.TargetURL,
-			PlaybackTargetURL: req.PlaybackTargetURL,
-			PlaybackMode:      req.PlaybackMode,
-			StreamHosts:       string(streamHostsJSON),
-			UAMode:            req.UAMode,
-			CustomUserAgent:   req.CustomUserAgent,
-			CustomClient:      req.CustomClient,
-			CustomVersion:     req.CustomVersion,
-			TrafficQuota:      req.Quota,
-			SpeedLimit:        req.SpeedLimit,
+			Name:                  req.Name,
+			ListenPort:            req.ListenPort,
+			PublicHost:            req.PublicHost,
+			IngressMode:           req.IngressMode,
+			TargetURL:             req.TargetURL,
+			PlaybackTargetURL:     req.PlaybackTargetURL,
+			PlaybackMode:          req.PlaybackMode,
+			StreamHosts:           string(streamHostsJSON),
+			UAMode:                req.UAMode,
+			CustomUserAgent:       req.CustomUserAgent,
+			CustomClient:          req.CustomClient,
+			CustomVersion:         req.CustomVersion,
+			StoredUpstreamHeaders: storedHeaders,
+			TrafficQuota:          req.Quota,
+			SpeedLimit:            req.SpeedLimit,
 		})
 		if err != nil {
-			a.jsonErr(w, 500, err.Error())
+			if isSQLiteUniqueConstraintError(err) {
+				a.jsonErr(w, http.StatusBadRequest, "listen_port or public_host is already assigned")
+				return
+			}
+			log.Printf("create site record: %v", err)
+			a.jsonErr(w, http.StatusInternalServerError, "create site failed")
 			return
 		}
 		// Auto start
@@ -3449,6 +4814,7 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 					a.jsonErr(w, 500, fmt.Sprintf("start site: %v; rollback create: %v", err, deleteErr))
 					return
 				}
+				a.pm.UnregisterSiteHost(site.ID)
 				a.jsonErr(w, 500, err.Error())
 				return
 			}
@@ -3485,14 +4851,21 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if site.Enabled {
-			// Turning off: stop (and flush) before flipping the flag, so a failed
-			// flush aborts with the instance still running and the flag still on
-			// - instance and DB stay consistent.
-			if err := a.pm.StopSite(id); err != nil {
-				a.jsonErr(w, 500, err.Error())
+			// A pre-close failure leaves the running instance usable and aborts the
+			// toggle. A post-close failure is different: the listener is already gone,
+			// so persist disabled and surface cleanup_pending instead of leaving an
+			// enabled-but-offline row.
+			stopErr := a.pm.StopSite(id)
+			cleanupPending := isSiteIngressClosedError(stopErr)
+			if stopErr != nil && !cleanupPending {
+				a.jsonErr(w, http.StatusInternalServerError, stopErr.Error())
 				return
 			}
-			if _, err := a.db.ToggleSite(id); err != nil {
+			if err := a.db.SetSiteEnabled(id, false); err != nil {
+				if cleanupPending {
+					a.jsonErr(w, http.StatusInternalServerError, fmt.Sprintf("%v; site ingress is closed but disabling the record failed: %v", stopErr, err))
+					return
+				}
 				// The instance is stopped but the flag stayed on: restart it so the
 				// DB and the running set stay consistent.
 				if restarted, getErr := a.db.GetSite(id); getErr == nil {
@@ -3504,17 +4877,21 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 				a.jsonErr(w, 500, fmt.Sprintf("toggle off: %v; site stopped but flag update failed", err))
 				return
 			}
-			a.jsonOK(w, map[string]interface{}{"enabled": false})
+			result := map[string]interface{}{"enabled": false, "cleanup_pending": cleanupPending}
+			if cleanupPending {
+				result["warning"] = stopErr.Error()
+			}
+			a.jsonOK(w, result)
 			return
 		}
 		// Turning on: flip the flag first so a failed start can roll it back.
-		if _, err := a.db.ToggleSite(id); err != nil {
+		if err := a.db.SetSiteEnabled(id, true); err != nil {
 			a.jsonErr(w, 500, err.Error())
 			return
 		}
 		site, err = a.db.GetSite(id)
 		if err != nil {
-			if _, revertErr := a.db.ToggleSite(id); revertErr != nil {
+			if revertErr := a.db.SetSiteEnabled(id, false); revertErr != nil {
 				a.jsonErr(w, 500, fmt.Sprintf("load site: %v; rollback toggle: %v", err, revertErr))
 				return
 			}
@@ -3522,7 +4899,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := a.pm.StartSite(*site); err != nil {
-			if _, revertErr := a.db.ToggleSite(id); revertErr != nil {
+			if revertErr := a.db.SetSiteEnabled(id, false); revertErr != nil {
 				a.jsonErr(w, 500, fmt.Sprintf("start site: %v; rollback toggle: %v", err, revertErr))
 				return
 			}
@@ -3549,18 +4926,21 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var req struct {
-			Name              string    `json:"name"`
-			ListenPort        int       `json:"listen_port"`
-			TargetURL         string    `json:"target_url"`
-			PlaybackTargetURL *string   `json:"playback_target_url"`
-			PlaybackMode      *string   `json:"playback_mode"`
-			StreamHosts       *[]string `json:"stream_hosts"`
-			UAMode            *string   `json:"ua_mode"`
-			CustomUserAgent   *string   `json:"custom_user_agent"`
-			CustomClient      *string   `json:"custom_client"`
-			CustomVersion     *string   `json:"custom_version"`
-			Quota             *int64    `json:"traffic_quota"`
-			SpeedLimit        *int      `json:"speed_limit"`
+			Name              string                 `json:"name"`
+			ListenPort        int                    `json:"listen_port"`
+			PublicHost        *string                `json:"public_host"`
+			IngressMode       *string                `json:"ingress_mode"`
+			TargetURL         string                 `json:"target_url"`
+			PlaybackTargetURL *string                `json:"playback_target_url"`
+			PlaybackMode      *string                `json:"playback_mode"`
+			StreamHosts       *[]string              `json:"stream_hosts"`
+			UAMode            *string                `json:"ua_mode"`
+			CustomUserAgent   *string                `json:"custom_user_agent"`
+			CustomClient      *string                `json:"custom_client"`
+			CustomVersion     *string                `json:"custom_version"`
+			UpstreamHeaders   *[]UpstreamHeaderInput `json:"upstream_headers"`
+			Quota             *int64                 `json:"traffic_quota"`
+			SpeedLimit        *int                   `json:"speed_limit"`
 		}
 		if err := decodeJSONBody(w, r, &req); err != nil {
 			a.jsonErr(w, 400, "invalid request")
@@ -3587,6 +4967,65 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		if req.Quota != nil {
 			quota = *req.Quota
 		}
+		publicHost := oldSite.PublicHost
+		if req.PublicHost != nil {
+			publicHost, err = normalizePublicHost(*req.PublicHost)
+			if err != nil {
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+		if publicHost != "" && publicHost == a.panelHost {
+			a.jsonErr(w, http.StatusBadRequest, "public_host must differ from PANEL_DOMAIN")
+			return
+		}
+		ingressMode := oldSite.IngressMode
+		if req.IngressMode != nil {
+			ingressMode = *req.IngressMode
+		} else if req.PublicHost != nil {
+			// Backward-compatible updates that know only public_host inherit the
+			// secure behavior: adding a host chooses host-only; removing it
+			// chooses the legacy dedicated-port entry.
+			if publicHost == "" {
+				ingressMode = ingressModePort
+			} else if oldSite.PublicHost == "" {
+				ingressMode = ingressModeHost
+			}
+		}
+		ingressMode, err = normalizeIngressMode(ingressMode, publicHost)
+		if err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := a.pm.validateIngressSafety(ingressMode); err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		oldTarget, oldTargetErr := normalizeTargetURL(oldSite.TargetURL)
+		newTarget, newTargetErr := normalizeTargetURL(req.TargetURL)
+		if newTargetErr != nil {
+			a.jsonErr(w, http.StatusBadRequest, fmt.Sprintf("invalid target_url: %v", newTargetErr))
+			return
+		}
+		if oldTargetErr != nil {
+			a.jsonErr(w, http.StatusInternalServerError, "stored target_url is invalid")
+			return
+		}
+		storedHeaders := oldSite.StoredUpstreamHeaders
+		headerMergeBase := oldSite.StoredUpstreamHeaders
+		if !sameRedirectAuthority(oldTarget, newTarget) {
+			// Fixed upstream headers are origin secrets. Never carry ciphertext
+			// across an authority change, even when the client omits this field.
+			storedHeaders = "[]"
+			headerMergeBase = "[]"
+		}
+		if req.UpstreamHeaders != nil {
+			storedHeaders, err = mergeUpstreamHeaders(headerMergeBase, *req.UpstreamHeaders, a.pm.upstreamHeaderKey, req.TargetURL)
+			if err != nil {
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
 		uaMode, customUserAgent, customClient, customVersion, uaErr := mergeSiteUAConfig(*oldSite, req.UAMode, req.CustomUserAgent, req.CustomClient, req.CustomVersion)
 		if uaErr != nil {
 			a.jsonErr(w, http.StatusBadRequest, uaErr.Error())
@@ -3602,6 +5041,8 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		candidate := *oldSite
 		candidate.Name = req.Name
 		candidate.ListenPort = req.ListenPort
+		candidate.PublicHost = publicHost
+		candidate.IngressMode = ingressMode
 		candidate.TargetURL = req.TargetURL
 		candidate.PlaybackTargetURL = playbackTargetURL
 		candidate.PlaybackMode = playbackMode
@@ -3610,39 +5051,57 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		candidate.CustomUserAgent = customUserAgent
 		candidate.CustomClient = customClient
 		candidate.CustomVersion = customVersion
+		candidate.StoredUpstreamHeaders = storedHeaders
 		candidate.TrafficQuota = quota
 		candidate.SpeedLimit = speedLimit
 		if err := validateSiteSettings(candidate.Name, candidate.ListenPort, candidate.TargetURL, candidate.PlaybackTargetURL, candidate.PlaybackMode, streamHostList, candidate.UAMode, candidate.CustomUserAgent, candidate.CustomClient, candidate.CustomVersion, candidate.TrafficQuota, candidate.SpeedLimit); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		needsPreStop := oldSite.Enabled && oldSite.ListenPort == candidate.ListenPort && a.pm.IsRunning(id)
+		if candidate.PublicHost != "" {
+			if assignedID, exists := a.pm.PublicHostSiteID(candidate.PublicHost); exists && assignedID != candidate.ID {
+				a.jsonErr(w, http.StatusBadRequest, "public_host is already assigned to another site")
+				return
+			}
+		}
+		needsPreStop := oldSite.Enabled && ingressUsesPort(oldSite.IngressMode) && ingressUsesPort(candidate.IngressMode) && oldSite.ListenPort == candidate.ListenPort && a.pm.IsRunning(id)
 		if needsPreStop {
-			// Stop (and flush) before the DB update, so a failed flush aborts with
-			// the old config still in the DB and the old instance still running -
-			// instance and DB stay consistent.
-			if err := a.pm.StopSite(id); err != nil {
-				a.jsonErr(w, 500, err.Error())
+			// Stop before replacing a listener on the same port. A post-close drain
+			// or final-checkpoint failure cannot restore that listener, so fail closed
+			// by disabling the old record and let an operator retry cleanup/update.
+			if stopErr := a.pm.StopSite(id); stopErr != nil {
+				if isSiteIngressClosedError(stopErr) {
+					if disableErr := a.db.SetSiteEnabled(id, false); disableErr != nil {
+						a.jsonErr(w, http.StatusInternalServerError, fmt.Sprintf("%v; old ingress is closed and disabling the record failed: %v", stopErr, disableErr))
+						return
+					}
+					a.jsonErr(w, http.StatusServiceUnavailable, fmt.Sprintf("update aborted; site disabled; cleanup pending: %v", stopErr))
+					return
+				}
+				a.jsonErr(w, http.StatusInternalServerError, stopErr.Error())
 				return
 			}
 		}
 		if err := a.db.UpdateSiteRecord(candidate); err != nil {
-			if needsPreStop {
-				// The instance is stopped; bring it back from a fresh read (which
-				// includes the flushed traffic) so the DB flag and the running set
-				// stay consistent. If even the reload fails, say so explicitly:
-				// the enabled row must never silently sit without an instance.
-				restored, getErr := a.db.GetSite(id)
-				if getErr != nil {
-					a.jsonErr(w, 500, fmt.Sprintf("update site: %v; site stopped and reload failed: %v", err, getErr))
-					return
-				}
+			// A pre-stop is the normal reason the old runtime is absent here, but
+			// recover from any enabled/non-operational state rather than keying the
+			// invariant to one specific replacement path.
+			restored, getErr := a.db.GetSite(id)
+			if getErr != nil {
+				a.jsonErr(w, 500, fmt.Sprintf("update site: %v; reload current site: %v", err, getErr))
+				return
+			}
+			if restored.Enabled && !a.pm.IsRunning(id) {
 				if restartErr := a.pm.StartSite(*restored); restartErr != nil {
 					a.jsonErr(w, 500, fmt.Sprintf("update site: %v; restore instance: %v", err, restartErr))
 					return
 				}
 			}
-			a.jsonErr(w, 500, err.Error())
+			if isSQLiteUniqueConstraintError(err) {
+				a.jsonErr(w, http.StatusBadRequest, "listen_port or public_host is already assigned")
+				return
+			}
+			a.jsonErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		site, err := a.db.GetSite(id)
@@ -3661,7 +5120,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 				a.jsonErr(w, 500, fmt.Sprintf("reload updated site: %v; reload rollback site: %v", err, getErr))
 				return
 			}
-			if needsPreStop {
+			if restoredSite.Enabled && !a.pm.IsRunning(id) {
 				if restartErr := a.pm.StartSite(*restoredSite); restartErr != nil {
 					a.jsonErr(w, 500, fmt.Sprintf("reload updated site: %v; restored configuration is enabled but proxy is not running: %v", err, restartErr))
 					return
@@ -3681,7 +5140,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 					a.jsonErr(w, 500, fmt.Sprintf("start updated site: %v; reload rollback site: %v", err, getErr))
 					return
 				}
-				if needsPreStop {
+				if restoredSite.Enabled && !a.pm.IsRunning(id) {
 					if restartErr := a.pm.StartSite(*restoredSite); restartErr != nil {
 						a.jsonErr(w, 500, fmt.Sprintf("start updated site: %v; restored configuration is enabled but proxy is not running: %v", err, restartErr))
 						return
@@ -3690,16 +5149,31 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 				a.jsonErr(w, 500, err.Error())
 				return
 			}
+		} else if err := a.pm.RegisterSiteHost(*site); err != nil {
+			if rollbackErr := a.db.UpdateSiteRecord(*oldSite); rollbackErr != nil {
+				a.jsonErr(w, 500, fmt.Sprintf("register updated public host: %v; rollback update: %v", err, rollbackErr))
+				return
+			}
+			a.jsonErr(w, 500, err.Error())
+			return
 		}
 		a.jsonOK(w, site)
 
 	case action == "" && r.Method == "DELETE":
 		a.siteLifecycleMu.Lock()
 		defer a.siteLifecycleMu.Unlock()
-		// Only delete the DB row after the instance stopped cleanly (flush
-		// succeeded); a failed flush aborts with the instance and row intact.
-		if err := a.pm.StopSite(id); err != nil {
-			a.jsonErr(w, 500, err.Error())
+		// Only delete after a clean stop. If ingress already closed but drain or
+		// final persistence failed, retain a disabled row as the retry handle.
+		if stopErr := a.pm.StopSite(id); stopErr != nil {
+			if isSiteIngressClosedError(stopErr) {
+				if disableErr := a.db.SetSiteEnabled(id, false); disableErr != nil {
+					a.jsonErr(w, http.StatusInternalServerError, fmt.Sprintf("%v; ingress is closed and disabling the record failed: %v", stopErr, disableErr))
+					return
+				}
+				a.jsonErr(w, http.StatusServiceUnavailable, fmt.Sprintf("delete deferred; site disabled; cleanup pending: %v", stopErr))
+				return
+			}
+			a.jsonErr(w, http.StatusInternalServerError, stopErr.Error())
 			return
 		}
 		if err := a.db.DeleteSite(id); err != nil {
@@ -3721,6 +5195,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, 500, err.Error())
 			return
 		}
+		a.pm.UnregisterSiteHost(id)
 		a.jsonOK(w, map[string]string{"status": "deleted"})
 
 	default:
@@ -3995,6 +5470,15 @@ func main() {
 			}
 		}
 	}
+	addr, err := panelListenAddress(os.Getenv("PANEL_BIND_ADDR"), port)
+	if err != nil {
+		log.Fatalf("invalid panel listen address: %v", err)
+	}
+	panelBindHost, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		log.Fatalf("invalid panel listen address: %v", err)
+	}
+	panelBindIP := net.ParseIP(panelBindHost)
 
 	db, err := openDB(dbPath)
 	if err != nil {
@@ -4010,7 +5494,17 @@ func main() {
 		log.Fatalf("initial setup unavailable: %v", err)
 	}
 
-	pm := NewProxyManager(db)
+	upstreamHeaderKey, err := resolveUpstreamHeaderKey(os.Getenv("UPSTREAM_HEADER_KEY"))
+	if err != nil {
+		log.Fatalf("invalid upstream header key: %v", err)
+	}
+	trustedProxies, err := parseTrustedProxyCIDRs(os.Getenv("TRUSTED_PROXY_CIDRS"))
+	if err != nil {
+		log.Fatalf("invalid trusted proxy configuration: %v", err)
+	}
+	pm := NewProxyManager(db, upstreamHeaderKey)
+	pm.SetTrustedProxies(trustedProxies)
+	pm.SetHostOnlyIngressSafe((panelBindIP != nil && panelBindIP.IsLoopback()) || len(trustedProxies) > 0)
 	loadedSiteCount, err := pm.StartAllEnabled()
 	if err != nil {
 		log.Fatalf("failed to load sites: %v", err)
@@ -4033,16 +5527,23 @@ func main() {
 		}
 	}()
 
-	trustedProxies, err := parseTrustedProxyCIDRs(os.Getenv("TRUSTED_PROXY_CIDRS"))
+	panelHost, err := normalizePublicHost(os.Getenv("PANEL_DOMAIN"))
 	if err != nil {
-		log.Fatalf("invalid trusted proxy configuration: %v", err)
+		log.Fatalf("invalid PANEL_DOMAIN: %v", err)
+	}
+	if panelHost != "" {
+		if _, configured := pm.PublicHostHandler(panelHost); configured {
+			log.Fatalf("PANEL_DOMAIN %s conflicts with a site's public_host", panelHost)
+		}
 	}
 	app := &App{
-		db:             db,
-		pm:             pm,
-		setupToken:     setupToken,
-		loginLimiter:   newLoginRateLimiter(),
-		trustedProxies: trustedProxies,
+		db:                db,
+		pm:                pm,
+		setupToken:        setupToken,
+		loginLimiter:      newLoginRateLimiter(),
+		trustedProxies:    trustedProxies,
+		panelHost:         panelHost,
+		panelBindLoopback: panelBindIP != nil && panelBindIP.IsLoopback(),
 	}
 
 	mux := http.NewServeMux()
@@ -4055,6 +5556,7 @@ func main() {
 
 	// Protected routes
 	mux.HandleFunc("/api/dashboard", cors(app.authMiddleware(app.handleDashboard)))
+	mux.HandleFunc("/api/ingress-capabilities", cors(app.authMiddleware(app.handleIngressCapabilities)))
 	mux.HandleFunc("/api/sites", cors(app.authMiddleware(app.handleSites)))
 	mux.HandleFunc("/api/sites/", cors(app.authMiddleware(app.handleSiteByID)))
 	mux.HandleFunc("/api/traffic/", cors(app.authMiddleware(app.handleTraffic)))
@@ -4073,18 +5575,17 @@ func main() {
 
 	// HTTP server with graceful shutdown. Site listeners remain independently
 	// bound by ProxyManager and are not affected by PANEL_BIND_ADDR.
-	addr, err := panelListenAddress(os.Getenv("PANEL_BIND_ADDR"), port)
-	if err != nil {
-		log.Fatalf("invalid panel listen address: %v", err)
-	}
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           securityHeaders(mux),
+		Handler:           app.publicHostRouter(panelBodyReadDeadline(securityHeaders(mux))),
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      0, // no write timeout for streaming
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    64 << 10,
+		// Shared-host site traffic can include long-running uploads. Header and
+		// per-endpoint body limits protect the panel without imposing a 30-second
+		// whole-request deadline on media traffic routed by Host.
+		ReadTimeout:    0,
+		WriteTimeout:   0, // no write timeout for streaming
+		IdleTimeout:    120 * time.Second,
+		MaxHeaderBytes: 64 << 10,
 	}
 
 	log.Println("============================================================")
@@ -4111,11 +5612,25 @@ func main() {
 	cancel()
 
 	// Shutdown proxies (flushes traffic)
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer shutdownCancel()
+	proxyShutdownCtx, proxyShutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	pm.GracefulShutdown(proxyShutdownCtx)
+	proxyShutdownCancel()
 
-	pm.GracefulShutdown(shutdownCtx)
-	srv.Shutdown(shutdownCtx)
+	// Give the management/shared-host server its own drain budget. A slow site
+	// shutdown must not hand an already-expired context to the panel server.
+	panelShutdownCtx, panelShutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if err := srv.Shutdown(panelShutdownCtx); err != nil {
+		log.Printf("panel shutdown failed: %v", err)
+	}
+	panelShutdownCancel()
+
+	// A request that exceeded the first proxy drain budget may finish while the
+	// panel/shared listener is shutting down. Give retained instances one final
+	// bounded drain/checkpoint pass so those tail counters are not abandoned just
+	// before process exit, and retry any transient final SQLite write failure.
+	finalProxyCtx, finalProxyCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	pm.GracefulShutdown(finalProxyCtx)
+	finalProxyCancel()
 
 	log.Println("Meridian stopped cleanly")
 }

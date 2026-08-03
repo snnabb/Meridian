@@ -206,6 +206,14 @@ function renderHeadersCard(headers, staggerClass) {
 }
 
 function renderProxyCard(proxy, staggerClass) {
+	const mode = String(proxy.ingress_mode || (proxy.public_host ? 'host' : 'port')).toLowerCase();
+	const modeLabel = { port: '仅独立端口', host: '仅共享域名', both: '共享域名 + 独立端口' }[mode] || mode;
+	const hostRow = proxy.public_host
+	  ? `<div class="diag-row"><span class="diag-key">共享域名</span><span class="diag-val">${esc(proxy.public_host)}</span></div>`
+	  : '';
+	const portValue = proxy.port_listening
+	  ? `:${esc(proxy.listen_port || '--')}（监听中）`
+	  : mode === 'host' ? `:${esc(proxy.listen_port || '--')}（仅保留，未监听）` : `:${esc(proxy.listen_port || '--')}（未监听）`;
   return `
     <div class="diag-card fade-up ${staggerClass}">
       <div class="diag-head">
@@ -218,8 +226,10 @@ function renderProxyCard(proxy, staggerClass) {
         </div>
       </div>
       <div class="diag-rows">
-        <div class="diag-row"><span class="diag-key">代理运行</span><span class="diag-val ${proxy.running ? 'good' : 'bad'}">${proxy.running ? '运行中' : '已停止'}</span></div>
-        <div class="diag-row"><span class="diag-key">监听端口</span><span class="diag-val">${esc(proxy.listen_port || '--')}</span></div>
+		<div class="diag-row"><span class="diag-key">代理运行</span><span class="diag-val ${proxy.running ? 'good' : 'bad'}">${proxy.running ? '运行中' : '已停止'}</span></div>
+			<div class="diag-row"><span class="diag-key">入口模式</span><span class="diag-val">${esc(modeLabel)}</span></div>
+		${hostRow}
+		<div class="diag-row"><span class="diag-key">端口状态</span><span class="diag-val">${portValue}</span></div>
         <div class="diag-row"><span class="diag-key">总请求数</span><span class="diag-val">${typeof proxy.total_requests === 'number' ? proxy.total_requests : '--'}</span></div>
       </div>
     </div>

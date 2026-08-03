@@ -34,9 +34,11 @@ Meridian 把这些事情打包成一个单二进制程序，带管理界面，�
 
 | 功能 | 说明 |
 |------|------|
-| **多站点反代** | 每个站点独立监听端口，独立配置上游地址 |
+| **多站点反代** | 每个站点可选择 `host`、`port` 或 `both` 入口模式，并独立配置主回源与播放回源 |
+| **共享域名入口** | 可为站点配置一个精确域名，通过面板入口按 Host 分流，兼容 Nginx/CDN 的标准 443 入口 |
 | **双上游分流** | 网页/API 和播放/转码流量可分别指向不同上游 |
 | **UA 伪装** | 预设（Infuse / Web / 客户端）、自定义固定身份或透传保留客户端身份；HTTP、WebSocket 与受限播放重定向统一改写或透传 |
+| **加密上游请求头** | 为主回源添加固定自定义 Header；值加密存储、只写不回显，且不会转发到独立播放/CDN 域名 |
 | **流量管控** | 按站点统计流量、设置限速、设置配额 |
 | **WebSocket 代理** | 完整支持 Emby 的 WebSocket 通信 |
 | **SSE 实时推送** | 仪表盘数据通过 Server-Sent Events 实时更新 |
@@ -98,6 +100,7 @@ docker run -d --name meridian \
   -p 127.0.0.1:9090:9090 -p 8001-8010:8001-8010 \
 	-v meridian-data:/app/data \
 	-e JWT_SECRET=$(openssl rand -hex 32) \
+	-e UPSTREAM_HEADER_KEY=$(openssl rand -hex 32) \
 	-e SETUP_TOKEN="$MERIDIAN_SETUP_TOKEN" \
 	ghcr.io/snnabb/meridian:latest
 ```
@@ -120,11 +123,12 @@ function New-MeridianSecret {
     -join ($bytes | ForEach-Object { $_.ToString('x2') })
 }
 $env:JWT_SECRET = New-MeridianSecret
+$env:UPSTREAM_HEADER_KEY = New-MeridianSecret
 $env:SETUP_TOKEN = New-MeridianSecret
 .\meridian.exe
 ```
 
-> 密钥必须用密码学安全随机数生成。`Get-Random` 不够安全，不要用它生成 `JWT_SECRET` 或 `SETUP_TOKEN`。若以前按旧命令生成过密钥，请重新生成并轮换 `JWT_SECRET`。
+> 密钥必须用密码学安全随机数生成。`Get-Random` 不够安全，不要用它生成 `JWT_SECRET`、`UPSTREAM_HEADER_KEY` 或 `SETUP_TOKEN`。若以前按旧命令生成过密钥，请重新生成并轮换 `JWT_SECRET`；已经保存固定上游 Header 后不要直接轮换 `UPSTREAM_HEADER_KEY`，否则旧密文无法解密，必须为所有相关站点重新配置 Header 值。
 >
 > Windows 二进制下载同样依赖 GitHub Releases。没有已发布版本时，请使用源码构建。
 
@@ -134,7 +138,7 @@ $env:SETUP_TOKEN = New-MeridianSecret
 ```bash
 git clone https://github.com/snnabb/Meridian.git && cd Meridian
 go build -o meridian .
-JWT_SECRET=$(openssl rand -hex 32) SETUP_TOKEN=$(openssl rand -hex 32) ./meridian
+JWT_SECRET=$(openssl rand -hex 32) UPSTREAM_HEADER_KEY=$(openssl rand -hex 32) SETUP_TOKEN=$(openssl rand -hex 32) ./meridian
 ```
 
 未配置域名时访问 `http://你的IP:9090`；配置后访问对应的 `https://面板域名`。首次打开会要求输入管理员账号、12–72 字节的密码，以及安装完成时显示的初始化令牌。源码、Docker 和 Windows 部署必须在首次启动前显式设置 `SETUP_TOKEN`；服务本身不会自动生成或记录该值。
@@ -162,11 +166,12 @@ unset ADMIN_PASSWORD
 |------|--------|------|
 | `PORT` | `9090` | 管理面板监听端口 |
 | `DB_PATH` | `meridian.db` | SQLite 数据库路径 |
-| `PANEL_BIND_ADDR` | `0.0.0.0` | 仅控制管理面板的绑定地址；域名模式由安装器设为 `127.0.0.1`，不影响站点监听端口 |
-| `PANEL_DOMAIN` | 空 | 安装器记录的单个管理面板域名；不作为播放回源配置 |
+| `PANEL_BIND_ADDR` | `0.0.0.0` | 控制管理面板及共享 Host 入口的绑定地址；严格 `host` 模式要求回环地址，或配合非空 `TRUSTED_PROXY_CIDRS` 做入口来源白名单 |
+| `PANEL_DOMAIN` | 空 | 管理面板的唯一允许域名；设置后未知 Host 返回 `421`，不再回退到面板 |
 | `JWT_SECRET` | 进程启动时随机生成 | 至少 32 字节的 JWT 签名密钥。**生产环境必须显式设置**，否则每次重启后会话全部失效 |
+| `UPSTREAM_HEADER_KEY` | 空 | 至少 32 字节的独立加密密钥；配置固定上游请求头时必需。丢失或轮换后，已有请求头无法解密；一键安装器会自动生成 |
 | `SETUP_TOKEN` | 无 | 数据库中没有管理员时必须设置的初始化令牌；首次创建成功后仅从进程内存清除，服务不会记录其值 |
-| `TRUSTED_PROXY_CIDRS` | 空 | 允许提供 `X-Real-IP`/`X-Forwarded-For` 的反向代理 CIDR，多个值用逗号分隔；不要填写不受信任的客户端网段 |
+| `TRUSTED_PROXY_CIDRS` | 空 | 可信入口代理 CIDR，多个值用逗号分隔。Meridian 只采纳其规范化的 `X-Real-IP`/`X-Forwarded-Proto`，并在面板非回环绑定时把它同时作为严格 `host` 入口来源白名单；不要填写客户端网段或 `0.0.0.0/0` |
 
 ### Docker Compose
 
@@ -193,6 +198,7 @@ services:
       - meridian-data:/app/data
     environment:
       - JWT_SECRET=your-secret-here    # 替换为一个固定随机字符串
+      - UPSTREAM_HEADER_KEY=your-other-secret-here # 与 JWT_SECRET 不同的固定随机字符串
       - SETUP_TOKEN=your-setup-token   # 首次启动前设置并妥善保存
 
 volumes:
@@ -204,22 +210,30 @@ volumes:
 ## 技术架构
 
 ```
-┌─────────────────────────────────────────────┐
-│                 Meridian                      │
-│                                              │
-│  ┌──────────┐   ┌──────────────────────────┐ │
-│  │ 管理面板  │   │     反代引擎 (per-site)   │ │
-│  │ :9090    │   │  :8001  :8002  :800N     │ │
-│  │          │   │                          │ │
-│  │ REST API │   │  HTTP ──► target_url     │ │
-│  │ SSE 推送 │   │  WS   ──► target_url     │ │
-│  │ 静态文件  │   │  播放  ──► playback_target_url │ │
-│  └──────────┘   └──────────────────────────┘ │
-│       │                     │                │
-│  ┌──────────────────────────────────────┐    │
-│  │            SQLite (嵌入式)            │    │
-│  └──────────────────────────────────────┘    │
-└─────────────────────────────────────────────┘
+                 Nginx / CDN :443
+                         │ 保留原始 Host
+┌────────────────────────▼─────────────────────────┐
+│                    Meridian                      │
+│                                                 │
+│  ┌───────────────────────────────────────────┐  │
+│  │       共享入口 / 管理面板 :9090            │  │
+│  │  PANEL_DOMAIN ──► REST API / SSE / 静态文件 │  │
+│  │  public_host  ──► 站点反代引擎 (host/both)  │  │
+│  └───────────────────────────────────────────┘  │
+│                         │                       │
+│  :8001 / :8002 / :800N ─┤ 可选独立入口          │
+│       (port/both)        │                       │
+│                         ▼                       │
+│  ┌───────────────────────────────────────────┐  │
+│  │              每站点代理与策略              │  │
+│  │  HTTP / WebSocket ──► target_url          │  │
+│  │  播放流量         ──► playback_target_url │  │
+│  └───────────────────────────────────────────┘  │
+│                         │                       │
+│  ┌──────────────────────▼────────────────────┐  │
+│  │              SQLite（嵌入式）              │  │
+│  └───────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────┘
 ```
 
 | 组件 | 技术选型 |
@@ -259,7 +273,7 @@ Meridian/
 | **回源地址**（`target_url`） | 网页、API、元数据 | `https://emby.example.com` |
 | **播放地址**（`playback_target_url`） | 播放、转码、直链下载 | `https://cdn.example.com` |
 
-播放地址为可选项。不设置时所有请求走同一上游。
+播放地址为可选项。不设置时所有请求走同一上游。当前可手工填写最多 128 个播放 authority：第一个是实际播放回源，其余只在 `redirect` 模式中作为允许跟随的重定向白名单；`direct` 模式不会轮询、负载均衡或自动故障转移。本阶段尚不从 Emby 响应中自动发现后端。
 
 地址没有写协议时，Meridian 会把 `域名:443`（也兼容中文全角冒号 `：443`）识别为 HTTPS；其他端口仍默认按 HTTP 处理。HTTPS 使用非 443 端口时请明确写成 `https://域名:端口`。重定向模式会把 `https://域名:443` 和省略默认端口的 `https://域名` 视为同一播放回源。
 
@@ -270,6 +284,60 @@ Meridian/
 
 **典型场景**：Emby 主服务器负责 API 和元数据，CDN 或专用媒体服务器负责大文件分发。
 
+### 共享域名入口
+
+每个站点有三种入口模式：`host`（仅共享域名，推荐）、`port`（仅独立端口）和 `both`（共享域名与独立端口同时启用）。`host` 模式只在面板监听地址上按 `public_host` 分流，不会绑定站点的保留端口；`both` 才会额外监听该高端口。当 Nginx、Cloudflare Tunnel 或其他可信入口保留原始 `Host` 时，Meridian 会把这个域名除下述保留命名空间外的路径转给对应站点。
+
+严格 `host` 模式必须满足以下一项：`PANEL_BIND_ADDR` 是回环地址（推荐，同机 Nginx），或配置非空 `TRUSTED_PROXY_CIDRS`。后一种适用于 Docker 网络/外置入口：共享站点只接受这些 peer CIDR 的请求，直接访问源站 IP 并伪造 `Host` 会返回 `403`。不要把公网客户端网段、容器默认大网段或 `0.0.0.0/0` 当作可信代理；否则等同于取消这层防绕过保护。`both` 是显式高风险兼容模式，独立端口仍需防火墙保护。
+
+设置 `PANEL_DOMAIN` 后，只有精确的面板域名能够进入管理界面，未知域名或 IP Host 返回 `421 Misdirected Request`；已配置但停用的站点返回 `503`，都不会回退并暴露管理面板。未设置 `PANEL_DOMAIN` 时继续支持直接 IP 访问，方便初始部署。
+
+`public_host` 使用精确、大小写不敏感的 DNS 名称匹配。它不接受协议、端口、路径、IP 或通配符，也不能与 `PANEL_DOMAIN` 相同。当前版本不支持路径前缀部署，因为 Emby 的绝对路径、播放 URL 和 WebSocket 端点需要完整的 base-path 协议设计，不能只做字符串裁剪。
+
+`/_meridian/d` 及其子路径保留给后续签名动态播放路由，当前版本固定返回不可缓存的 `410 Gone`，不会转发到任何上游。若现有 Emby 插件或自定义接口正在使用这个命名空间，升级前必须迁移路径；本阶段尚未实现动态后端自动识别。
+
+反向代理必须保留 Host，并把普通 HTTP 与 WebSocket 都转到同一个 Meridian 面板端口。同机 Nginx 建议同时设置 `PANEL_BIND_ADDR=127.0.0.1` 和 `TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128`；前者关闭公网直连，后者让 Meridian 只从本机代理采纳规范化的 `X-Real-IP`。若缺少后者，所有远程登录会共用 Nginx 的回环地址作为限流身份，任一来源都可能触发共享锁定。例如：
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 443 ssl;
+    server_name emby.example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:9090;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        client_max_body_size 0; # 或改成符合你上传策略的明确上限
+    }
+}
+```
+
+Meridian 只接受可信代理提供的单值 `X-Real-IP`，不会从可能包含客户端伪造内容的 `X-Forwarded-For` 链选择身份。Docker、Cloudflare Tunnel 或外置 Nginx 应把 `TRUSTED_PROXY_CIDRS` 精确设为实际代理 peer 网段，不能使用 `0.0.0.0/0`。Meridian 不负责为站点域名申请证书或修改 CDN DNS；证书、Cloudflare SSL 模式、防火墙和源站只允许可信入口访问等设置仍由入口层管理。上例的长超时、关闭缓冲和上传上限是流媒体/长连接所需；如果已有全局策略，可以按等价配置调整。
+
+> 新建共享域名站点默认使用 `host`，这是避免绕过 CDN 的推荐配置；程序会拒绝在“非回环绑定且没有可信代理来源”的条件下启用它。只有确实需要兼容直接端口访问时才选择 `both`，并用防火墙限制来源；`port` 和 `both` 的独立端口都会绑定所有网络接口。
+
+### 固定上游请求头
+
+每个站点可以为主回源配置最多 16 个固定 Header。所有新值都使用 `UPSTREAM_HEADER_KEY` 通过 AES-GCM v2 加密后写入 SQLite，认证数据同时绑定 Header 名称与目标 scheme/主机/有效端口；管理 API 和浏览器只返回 Header 名称与“已配置”状态，不会回显明文或密文。同一主回源 authority 内编辑时值留空表示保留，删除整行才会移除；一旦修改协议、域名或有效端口，旧值会自动清空，必须重新输入，避免把源站秘密带到新主机。
+
+这些 Header 只会发送给 `target_url` 的精确协议、域名和有效端口。独立播放回源、WebSocket 播放目标和跨 authority 重定向都会主动删除它们，避免把源站秘密带给 CDN。`Authorization`、`Cookie`、`Host`、`User-Agent`、`X-Forwarded-*`、常见供应商客户端 IP Header、Emby 授权头和 WebSocket/hop-by-hop Header 由 Meridian 管理，不能在这里覆盖。
+
+> `UPSTREAM_HEADER_KEY` 必须与数据库一起备份并保持不变。不要与 `JWT_SECRET` 共用同一个值；丢失该密钥后，包含加密 Header 的站点会拒绝启动，而不是静默发送空值。
+
 ### UA 身份模式
 
 每个站点可选 Infuse、Web、客户端三个预设，或选择“自定义”固定身份，或选择“透传”保留客户端身份。
@@ -277,7 +345,7 @@ Meridian/
 - **自定义（固定身份）**：填写 `User-Agent`、Emby `Client`、`Version`，Meridian 会在普通 HTTP、WebSocket 以及受配置白名单约束的播放重定向请求中统一改写成这套固定值，所有请求保持一致；`Device` 与 `DeviceId` 会原样保留。为避免请求头注入和 Emby 授权头格式损坏，自定义值只接受受限长度的可打印 ASCII 字符，`Client` 和 `Version` 不接受引号或反斜杠。
 - **透传（每请求真实身份）**：Meridian 不生成也不改写任何 UA 身份，每个请求原样保留客户端自带的 `User-Agent` 与 Emby `Client`、`Version`、`Device`、`DeviceId` 后转发，适合多用户共用一个反代站点、需要按客户端区分身份的部署。
 
-两种模式的凭据安全边界一致：跨 authority 转发时 `Cookie`、`Authorization` 等凭据仍会被剥离，`X-Forwarded-*` 与 hop-by-hop 请求头清洗保持不变，透传不会绕过任何凭据清洗。
+两种模式的凭据安全边界一致：站点请求出站前始终删除 Meridian 管理会话 `meridian_session`，但保留 Emby 自己的 Cookie；跨 authority 转发时 `Cookie`、`Authorization` 等凭据仍会被剥离，`X-Forwarded-*` 与 hop-by-hop 请求头清洗保持不变，透传不会绕过任何凭据清洗。
 
 ---
 
@@ -300,6 +368,7 @@ Meridian/
 ## 运维要点
 
 - **JWT 密钥**：未设置 `JWT_SECRET` 时每次启动生成随机密钥，重启后会话全部失效
+- **上游 Header 密钥**：使用固定请求头时必须长期保留 `UPSTREAM_HEADER_KEY`；它应与 JWT 密钥分开生成和备份
 - **首次初始化**：数据库中没有管理员时必须预先配置 `SETUP_TOKEN`，创建操作在数据库中原子执行，服务不会记录令牌
 - **登录保护**：同一来源在 15 分钟内连续失败 5 次后会被暂时限制 15 分钟；限流记录会过期并在容量达到上限时按最近使用情况淘汰
 - **浏览器边界**：管理 API 使用 `HttpOnly`、`SameSite=Strict` 会话 Cookie，只允许同源的状态变更请求，并发送 CSP、防嵌入和 MIME 嗅探保护头
@@ -344,17 +413,18 @@ Meridian `v1` 明确定位为一个**单管理员、轻量、可直接落地**�
 
 ## 升级现有实例
 
-升级时建议优先保持这两样东西不变：
+升级时建议优先保持这些内容不变：
 
 - `JWT_SECRET`
+- `UPSTREAM_HEADER_KEY`
 - SQLite 数据库文件及其同目录的 `-wal` / `-shm`
 
 使用一键脚本执行 `update` 时，下列步骤会自动完成；手动部署时推荐：
 
 1. 停止正在运行的 Meridian 服务。
-2. 备份当前二进制、数据库文件和 `JWT_SECRET` 所在的环境配置。
+2. 备份当前二进制、数据库文件以及保存 `JWT_SECRET`、`UPSTREAM_HEADER_KEY` 的环境配置。
 3. 替换为新版本二进制或新镜像。
-4. 用原来的 `JWT_SECRET` 和数据库重新启动。
+4. 用原来的 `JWT_SECRET`、`UPSTREAM_HEADER_KEY` 和数据库重新启动。
 5. 登录面板后检查站点列表、端口监听和诊断页。
 
 如果升级后临时忘记保留 `JWT_SECRET`，历史 JWT 会全部失效，表现为所有登录状态需要重新建立。
@@ -368,17 +438,17 @@ Meridian `v1` 明确定位为一个**单管理员、轻量、可直接落地**�
 - `meridian.db`
 - `meridian.db-wal`
 - `meridian.db-shm`
-- 保存 `JWT_SECRET` 的 `.env`、systemd 环境文件或容器环境配置
+- 保存 `JWT_SECRET` 和 `UPSTREAM_HEADER_KEY` 的 `.env`、systemd 环境文件或容器环境配置
 
 恢复步骤：
 
 1. 停止 Meridian。
 2. 还原数据库文件到原路径。
-3. 还原原来的 `JWT_SECRET`。
+3. 还原原来的 `JWT_SECRET` 和 `UPSTREAM_HEADER_KEY`。
 4. 启动 Meridian。
 5. 验证管理员登录、站点配置和关键代理端口。
 
-如果你使用 Docker，恢复时同样要保留挂载卷里的数据库文件，并继续使用原来的 `JWT_SECRET`。
+如果你使用 Docker，恢复时同样要保留挂载卷里的数据库文件，并继续使用原来的 `JWT_SECRET` 和 `UPSTREAM_HEADER_KEY`。
 
 ---
 
@@ -396,6 +466,7 @@ Meridian `v1` 明确定位为一个**单管理员、轻量、可直接落地**�
 - 没有审计日志，操作不可追溯
 - 没有内置通知能力（无 Telegram / Webhook 集成）
 - 管理面板本身不终止 TLS，公网部署必须放在 HTTPS 反向代理之后
+- 共享入口仅支持精确 Host，不支持通配符或 URL 路径前缀
 - TLS 诊断会验证上游证书，但不负责证书签发和续期
 - UA 诊断是本地配置预览，不验证远端实际收到的请求头
 

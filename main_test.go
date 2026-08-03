@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"database/sql"
 	"encoding/json"
@@ -40,10 +41,13 @@ func newTestApp(t *testing.T) *App {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	return &App{
-		db: db,
-		pm: NewProxyManager(db),
+	app := &App{
+		db:                db,
+		pm:                NewProxyManager(db, bytes.Repeat([]byte{0x42}, 32)),
+		panelBindLoopback: true,
 	}
+	app.pm.SetHostOnlyIngressSafe(true)
+	return app
 }
 
 // reservedPorts keeps ephemeral ports out of the kernel's free pool between
@@ -328,11 +332,34 @@ func TestHTTPPassthroughPreservesClientIdentityAndRebuildsForwarding(t *testing.
 	if got := header.Get("X-Forwarded-For"); got != "198.51.100.26" {
 		t.Fatalf("X-Forwarded-For = %q, want rebuilt from the peer address", got)
 	}
-	if got := header.Get("X-Forwarded-Host"); got != "meridian.example:50001" {
-		t.Fatalf("X-Forwarded-Host = %q", got)
+	if got := header.Get("X-Forwarded-Host"); got != "" {
+		t.Fatalf("dedicated-port X-Forwarded-Host = %q, want empty", got)
 	}
 	if got := header.Get("X-Forwarded-Proto"); got != "http" {
 		t.Fatalf("X-Forwarded-Proto = %q", got)
+	}
+}
+
+func TestApplySiteForwardedHostOnlyForCanonicalSharedIngress(t *testing.T) {
+	site := Site{PublicHost: "media.example.com", IngressMode: ingressModeBoth}
+
+	shared := httptest.NewRequest(http.MethodGet, "http://media.example.com/Videos/1", nil)
+	shared = shared.WithContext(context.WithValue(shared.Context(), publicHostIngressContextKey{}, true))
+	sharedHeader := make(http.Header)
+	applySiteForwardedHost(sharedHeader, shared, site)
+	if got := sharedHeader.Get("X-Forwarded-Host"); got != site.PublicHost {
+		t.Fatalf("shared-ingress X-Forwarded-Host=%q, want %q", got, site.PublicHost)
+	}
+
+	for _, req := range []*http.Request{
+		httptest.NewRequest(http.MethodGet, "http://attacker.example:50001/Videos/1", nil),
+		httptest.NewRequest(http.MethodGet, "http://media.example.com:50001/Videos/1", nil),
+	} {
+		header := http.Header{"X-Forwarded-Host": []string{"attacker.example"}}
+		applySiteForwardedHost(header, req, site)
+		if got := header.Get("X-Forwarded-Host"); got != "" {
+			t.Errorf("non-shared ingress X-Forwarded-Host=%q, want empty", got)
+		}
 	}
 }
 
@@ -441,7 +468,7 @@ func TestMigrateAddsCustomUAColumnsForLegacyDatabases(t *testing.T) {
 			}
 			defer db.Close()
 
-			for _, column := range []string{"playback_target_url", "playback_mode", "stream_hosts", "custom_user_agent", "custom_client", "custom_version"} {
+			for _, column := range []string{"playback_target_url", "playback_mode", "stream_hosts", "custom_user_agent", "custom_client", "custom_version", "public_host", "ingress_mode", "upstream_headers"} {
 				var count int
 				if err := db.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('sites') WHERE name=?", column).Scan(&count); err != nil {
 					t.Fatalf("inspect %s: %v", column, err)
@@ -450,12 +477,22 @@ func TestMigrateAddsCustomUAColumnsForLegacyDatabases(t *testing.T) {
 					t.Fatalf("column %s count=%d, want 1", column, count)
 				}
 			}
+			var publicHostIndexCount int
+			if err := db.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_sites_public_host'").Scan(&publicHostIndexCount); err != nil {
+				t.Fatalf("inspect public host index: %v", err)
+			}
+			if publicHostIndexCount != 1 {
+				t.Fatalf("public host index count=%d, want 1", publicHostIndexCount)
+			}
 			site, err := db.GetSite(1)
 			if err != nil {
 				t.Fatalf("read migrated site: %v", err)
 			}
 			if site.UAMode != "infuse" || site.CustomUserAgent != "" || site.CustomClient != "" || site.CustomVersion != "" {
 				t.Fatalf("migrated site UA config = %#v", site)
+			}
+			if site.PublicHost != "" || site.IngressMode != ingressModePort || len(site.UpstreamHeaders) != 0 || site.StoredUpstreamHeaders != "[]" {
+				t.Fatalf("migrated site ingress config = %#v", site)
 			}
 		})
 	}
@@ -838,12 +875,14 @@ func TestReverseProxyRebuildsForwardingHeadersAfterHopHeaderRemoval(t *testing.T
 	for name, want := range map[string]string{
 		"X-Forwarded-For":   "198.51.100.24",
 		"X-Real-IP":         "198.51.100.24",
-		"X-Forwarded-Host":  "meridian.example:50001",
 		"X-Forwarded-Proto": "http",
 	} {
 		if got := captured.Header.Get(name); got != want {
 			t.Errorf("%s = %q, want %q", name, got, want)
 		}
+	}
+	if got := captured.Header.Get("X-Forwarded-Host"); got != "" {
+		t.Errorf("dedicated-port X-Forwarded-Host = %q, want empty", got)
 	}
 	for _, name := range []string{"Forwarded", "X-Forwarded-Custom"} {
 		if got := captured.Header.Get(name); got != "" {
@@ -880,17 +919,76 @@ func TestPrepareWebSocketUpstreamHeadersRebuildsForwardingHeaders(t *testing.T) 
 		"User-Agent":        policy.Profile.UserAgent,
 		"X-Forwarded-For":   "198.51.100.25",
 		"X-Real-IP":         "198.51.100.25",
-		"X-Forwarded-Host":  "meridian.example:50001",
 		"X-Forwarded-Proto": "http",
 	} {
 		if got := header.Get(name); got != want {
 			t.Errorf("%s = %q, want %q", name, got, want)
 		}
 	}
+	if got := header.Get("X-Forwarded-Host"); got != "" {
+		t.Errorf("dedicated-port WebSocket X-Forwarded-Host = %q, want empty", got)
+	}
 	for _, name := range []string{"Forwarded", "X-Forwarded-Custom", "Proxy-Connection"} {
 		if got := header.Get(name); got != "" {
 			t.Errorf("untrusted WebSocket header %s leaked upstream: %q", name, got)
 		}
+	}
+}
+
+func TestTrustedProxyForwardingUsesOnlyNormalizedEdgeValues(t *testing.T) {
+	_, loopback, err := net.ParseCIDR("127.0.0.0/8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	trusted := []*net.IPNet{loopback}
+	req := httptest.NewRequest(http.MethodGet, "http://media.example.com/socket", nil)
+	req.RemoteAddr = "127.0.0.1:54321"
+	req.Header.Set("X-Real-IP", "198.51.100.42")
+	req.Header.Set("X-Forwarded-For", "203.0.113.9, 10.0.0.1")
+	req.Header.Set("X-Forwarded-Proto", "HTTPS")
+	req.Header.Set("X-Forwarded-Custom", "drop-me")
+
+	header := req.Header.Clone()
+	prepareUpstreamHeaders(header, req, UAHeaderPolicy{}, trusted)
+	for name, want := range map[string]string{
+		"X-Forwarded-For":   "198.51.100.42",
+		"X-Real-IP":         "198.51.100.42",
+		"X-Forwarded-Proto": "https",
+	} {
+		if got := header.Get(name); got != want {
+			t.Errorf("trusted HTTP %s=%q, want %q", name, got, want)
+		}
+	}
+	if got := header.Get("X-Forwarded-Host"); got != "" {
+		t.Errorf("dedicated-port trusted X-Forwarded-Host=%q, want empty", got)
+	}
+	if got := header.Get("X-Forwarded-Custom"); got != "" {
+		t.Fatalf("unrecognized forwarding header leaked upstream: %q", got)
+	}
+
+	target, err := normalizeTargetURL("http://origin.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsHeader := prepareWebSocketUpstreamHeadersWithTrustedProxies(req, target, UAHeaderPolicy{}, trusted)
+	if got := wsHeader.Get("X-Forwarded-For"); got != "198.51.100.42" {
+		t.Fatalf("trusted WebSocket X-Forwarded-For=%q", got)
+	}
+	if got := wsHeader.Get("X-Forwarded-Proto"); got != "https" {
+		t.Fatalf("trusted WebSocket X-Forwarded-Proto=%q", got)
+	}
+
+	bad := req.Clone(req.Context())
+	bad.Header = req.Header.Clone()
+	bad.Header.Set("X-Real-IP", "not-an-ip")
+	bad.Header.Set("X-Forwarded-Proto", "javascript")
+	badHeader := bad.Header.Clone()
+	prepareUpstreamHeaders(badHeader, bad, UAHeaderPolicy{}, trusted)
+	if got := badHeader.Get("X-Real-IP"); got != "127.0.0.1" {
+		t.Fatalf("invalid trusted X-Real-IP fallback=%q", got)
+	}
+	if got := badHeader.Get("X-Forwarded-Proto"); got != "http" {
+		t.Fatalf("invalid trusted proto fallback=%q", got)
 	}
 }
 
@@ -954,6 +1052,11 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	for _, snippet := range []string{`id="m-speed"`, "speed_limit: parseInt(document.getElementById('m-speed').value || 0)"} {
 		if !strings.Contains(string(sitesJS), snippet) {
 			t.Errorf("site form must expose and submit speed limit; missing %q", snippet)
+		}
+	}
+	for _, snippet := range []string{`id="m-public-host"`, `id="m-upstream-headers"`, `type="password"`, "upstream_headers: buildUpstreamHeaderPayload(upstreamHeaders)"} {
+		if !strings.Contains(string(sitesJS), snippet) {
+			t.Errorf("site form must expose safe shared ingress and write-only headers; missing %q", snippet)
 		}
 	}
 
@@ -1500,6 +1603,19 @@ func TestJWTSecretRotationInvalidatesExistingToken(t *testing.T) {
 	jwtSecret = []byte("new-test-signing-secret-000000000000")
 	if _, _, err := validateToken(token); err == nil {
 		t.Fatal("token signed before JWT secret rotation remained valid")
+	}
+}
+
+func TestSessionIdentityIgnoresInvalidSameNameCookieShadow(t *testing.T) {
+	token, err := generateToken(7, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "https://panel.example.com/api/dashboard", nil)
+	req.Header.Set("Cookie", sessionCookieName+"=attacker-shadow; "+sessionCookieName+"="+token)
+	userID, username, err := sessionIdentity(req)
+	if err != nil || userID != 7 || username != "admin" {
+		t.Fatalf("sessionIdentity shadow handling=(%d, %q, %v)", userID, username, err)
 	}
 }
 
@@ -4137,10 +4253,10 @@ func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 		t.Fatalf("decode /api/sites: %v", err)
 	}
 	expectedKeys := map[string]bool{
-		"id": true, "name": true, "listen_port": true, "target_url": true,
+		"id": true, "name": true, "listen_port": true, "public_host": true, "ingress_mode": true, "target_url": true,
 		"playback_target_url": true, "playback_mode": true, "stream_hosts": true,
 		"ua_mode": true, "custom_user_agent": true, "custom_client": true,
-		"custom_version": true, "enabled": true, "traffic_quota": true,
+		"custom_version": true, "upstream_headers": true, "enabled": true, "traffic_quota": true,
 		"traffic_used": true, "speed_limit": true, "created_at": true,
 		"updated_at": true, "running": true,
 	}
@@ -4900,6 +5016,846 @@ func TestProxyPlaybackRequestsFallBackToMainTarget(t *testing.T) {
 	if body := mustReadBody(t, resp); !strings.Contains(body, "api:/Videos/42/stream") {
 		t.Fatalf("fallback playback body = %q", body)
 	}
+}
+
+func TestNormalizePublicHostUsesExactDNSNames(t *testing.T) {
+	valid := map[string]string{
+		" MEDIA.Example.COM. ": "media.example.com",
+		"xn--fiqs8s.example":   "xn--fiqs8s.example",
+	}
+	for input, want := range valid {
+		got, err := normalizePublicHost(input)
+		if err != nil || got != want {
+			t.Errorf("normalizePublicHost(%q) = %q, %v; want %q", input, got, err, want)
+		}
+	}
+	for _, input := range []string{
+		"localhost", "https://media.example.com", "media.example.com:443",
+		"*.example.com", "127.0.0.1", "bad_label.example.com", "-bad.example.com",
+	} {
+		if _, err := normalizePublicHost(input); err == nil {
+			t.Errorf("normalizePublicHost(%q) unexpectedly succeeded", input)
+		}
+	}
+	if got := requestPublicHost("MEDIA.EXAMPLE.COM:443"); got != "media.example.com" {
+		t.Fatalf("requestPublicHost = %q, want media.example.com", got)
+	}
+}
+
+func TestUpstreamHeadersAreEncryptedWriteOnlyAndAuthorityScoped(t *testing.T) {
+	key := bytes.Repeat([]byte{0x24}, 32)
+	secret := "emos-secret-value"
+	mainTarget, _ := url.Parse("https://origin.example.com:443/emby")
+	playbackTarget, _ := url.Parse("https://cdn.example.net/video")
+	raw, err := mergeUpstreamHeaders("[]", []UpstreamHeaderInput{{Name: "emos-proxy-id", Value: &secret}}, key, mainTarget.String())
+	if err != nil {
+		t.Fatalf("mergeUpstreamHeaders: %v", err)
+	}
+	if strings.Contains(raw, secret) || !strings.Contains(raw, "ciphertext") {
+		t.Fatalf("stored upstream headers are not encrypted: %s", raw)
+	}
+	views, err := upstreamHeaderViews(raw)
+	if err != nil || len(views) != 1 || views[0].Name != "Emos-Proxy-Id" || !views[0].Configured {
+		t.Fatalf("upstreamHeaderViews = %#v, %v", views, err)
+	}
+	encoded, err := json.Marshal(Site{StoredUpstreamHeaders: raw, UpstreamHeaders: views})
+	if err != nil {
+		t.Fatalf("marshal site: %v", err)
+	}
+	if strings.Contains(string(encoded), secret) || strings.Contains(string(encoded), "ciphertext") || !strings.Contains(string(encoded), `"configured":true`) {
+		t.Fatalf("site API representation exposed a secret or lost write-only metadata: %s", encoded)
+	}
+
+	policy, err := resolveUpstreamHeaderPolicy(raw, key, mainTarget)
+	if err != nil {
+		t.Fatalf("resolveUpstreamHeaderPolicy: %v", err)
+	}
+	otherAuthority, _ := url.Parse("https://other-origin.example.com/emby")
+	if _, err := resolveUpstreamHeaderPolicy(raw, key, otherAuthority); err == nil {
+		t.Fatal("v2 ciphertext unexpectedly decrypted for a different target authority")
+	}
+	header := make(http.Header)
+	header.Set("Emos-Proxy-Id", "client-spoof")
+	policy.apply(header, mainTarget)
+	if got := header.Get("Emos-Proxy-Id"); got != secret {
+		t.Fatalf("main target header = %q, want configured value", got)
+	}
+	policy.apply(header, playbackTarget)
+	if got := header.Get("Emos-Proxy-Id"); got != "" {
+		t.Fatalf("playback target received configured header %q", got)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://client.example/socket", nil)
+	request.Header.Set("Connection", "Upgrade")
+	request.Header.Set("Upgrade", "websocket")
+	wsMain := prepareWebSocketUpstreamHeaders(request, mainTarget, UAHeaderPolicy{}, policy)
+	if got := wsMain.Get("Emos-Proxy-Id"); got != secret {
+		t.Fatalf("main websocket header = %q", got)
+	}
+	wsPlayback := prepareWebSocketUpstreamHeaders(request, playbackTarget, UAHeaderPolicy{}, policy)
+	if got := wsPlayback.Get("Emos-Proxy-Id"); got != "" {
+		t.Fatalf("playback websocket leaked configured header %q", got)
+	}
+
+	retained, err := mergeUpstreamHeaders(raw, []UpstreamHeaderInput{{Name: "EMOS-PROXY-ID"}}, nil, mainTarget.String())
+	if err != nil || retained != raw {
+		t.Fatalf("write-only retain changed ciphertext: retained=%s err=%v", retained, err)
+	}
+	if _, err := mergeUpstreamHeaders("[]", []UpstreamHeaderInput{{Name: "Authorization", Value: &secret}}, key, mainTarget.String()); err == nil {
+		t.Fatal("managed Authorization header unexpectedly accepted")
+	}
+	if _, err := mergeUpstreamHeaders("[]", []UpstreamHeaderInput{{Name: "X-New-Secret", Value: &secret}}, nil, mainTarget.String()); err == nil {
+		t.Fatal("new secret unexpectedly accepted without UPSTREAM_HEADER_KEY")
+	}
+	if _, err := resolveUpstreamHeaderPolicy(raw, bytes.Repeat([]byte{0x99}, 32), mainTarget); err == nil {
+		t.Fatal("configured header unexpectedly decrypted with the wrong key")
+	}
+	stored, err := parseStoredUpstreamHeaders(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored[0].Name = "X-Swapped-Name"
+	tampered, _ := json.Marshal(stored)
+	if _, err := resolveUpstreamHeaderPolicy(string(tampered), key, mainTarget); err == nil {
+		t.Fatal("ciphertext unexpectedly survived header-name swapping")
+	}
+	invalidCiphertext, err := encryptUpstreamHeaderValue("X-Invalid-Value", "line-one\r\nline-two", redirectHostKey(mainTarget), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidRaw, _ := json.Marshal([]storedUpstreamHeader{{Name: "X-Invalid-Value", Ciphertext: invalidCiphertext}})
+	if _, err := resolveUpstreamHeaderPolicy(string(invalidRaw), key, mainTarget); err == nil {
+		t.Fatal("decrypted header value containing CRLF unexpectedly accepted")
+	}
+}
+
+func TestResolveUpstreamHeaderKeyRejectsWhitespace(t *testing.T) {
+	valid := strings.Repeat("a", 32)
+	if key, err := resolveUpstreamHeaderKey(valid); err != nil || len(key) != 32 {
+		t.Fatalf("valid upstream header key resolved to len=%d err=%v", len(key), err)
+	}
+	for _, value := range []string{valid + " ", " " + valid, strings.Repeat("a", 16) + "\t" + strings.Repeat("b", 16)} {
+		if _, err := resolveUpstreamHeaderKey(value); err == nil {
+			t.Fatalf("whitespace-containing key %q unexpectedly accepted", value)
+		}
+	}
+}
+
+func TestLegacyUpdateHelperPreservesSharedIngressConfiguration(t *testing.T) {
+	app := newTestApp(t)
+	secret := "persist-me"
+	stored, err := mergeUpstreamHeaders("[]", []UpstreamHeaderInput{{Name: "X-Origin-Secret", Value: &secret}}, app.pm.upstreamHeaderKey, "http://127.0.0.1:8096")
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err := app.db.CreateSiteRecord(Site{
+		Name:                  "before",
+		ListenPort:            freePort(t),
+		PublicHost:            "media.example.com",
+		TargetURL:             "http://127.0.0.1:8096",
+		PlaybackMode:          "direct",
+		StreamHosts:           "[]",
+		UAMode:                "infuse",
+		StoredUpstreamHeaders: stored,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.UpdateSiteWithCustomUA(site.ID, "after", site.ListenPort, site.TargetURL, "", "direct", "[]", "web", "", "", "", 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.PublicHost != site.PublicHost || updated.StoredUpstreamHeaders != stored || len(updated.UpstreamHeaders) != 1 {
+		t.Fatalf("legacy update erased shared ingress configuration: %#v", updated)
+	}
+	if err := app.db.UpdateSiteWithCustomUA(site.ID, "moved", site.ListenPort, "http://127.0.0.1:8097", "", "direct", "[]", "web", "", "", "", 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	moved, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if moved.StoredUpstreamHeaders != "[]" || len(moved.UpstreamHeaders) != 0 {
+		t.Fatalf("data-layer update carried an origin secret to a new authority: %#v", moved)
+	}
+}
+
+func TestRedirectFollowRemovesConfiguredHeadersFromCrossAuthorityHop(t *testing.T) {
+	key := bytes.Repeat([]byte{0x35}, 32)
+	secret := "main-origin-only"
+	raw, err := mergeUpstreamHeaders("[]", []UpstreamHeaderInput{{Name: "X-Origin-Secret", Value: &secret}}, key, "https://origin.example.com/start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainTarget, _ := url.Parse("https://origin.example.com/start")
+	cdnTarget, _ := url.Parse("https://cdn.example.net/video")
+	policy, err := resolveUpstreamHeaderPolicy(raw, key, mainTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secondHopHeader string
+	calls := 0
+	transport := &redirectFollowTransport{
+		base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls++
+			if calls == 1 {
+				return &http.Response{
+					StatusCode: http.StatusFound,
+					Header:     http.Header{"Location": []string{cdnTarget.String()}},
+					Body:       io.NopCloser(strings.NewReader("")),
+					Request:    req,
+				}, nil
+			}
+			secondHopHeader = req.Header.Get("X-Origin-Secret")
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), Request: req}, nil
+		}),
+		playbackHosts:        map[string]bool{redirectHostKey(cdnTarget): true},
+		upstreamHeaderPolicy: policy,
+	}
+	req := httptest.NewRequest(http.MethodGet, mainTarget.String(), nil)
+	policy.apply(req.Header, mainTarget)
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	defer resp.Body.Close()
+	if calls != 2 || secondHopHeader != "" {
+		t.Fatalf("redirect calls=%d configured header on CDN=%q", calls, secondHopHeader)
+	}
+}
+
+func TestPublicHostRouterAndEncryptedHeaderAPI(t *testing.T) {
+	app := newTestApp(t)
+	app.panelHost = "panel.example.com"
+	receivedHeader := make(chan string, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeader <- r.Header.Get("Emos-Proxy-Id")
+		w.Header().Add("Set-Cookie", "meridian_session=upstream-must-not-overwrite; Path=/")
+		w.Header().Add("Set-Cookie", "emby_session=upstream-keep; Path=/")
+		_, _ = w.Write([]byte("upstream"))
+	}))
+	defer upstream.Close()
+
+	port := freePort(t)
+	releasePort(port)
+	secret := "write-only-emos-value"
+	payload, err := json.Marshal(map[string]interface{}{
+		"name":             "shared-entry",
+		"listen_port":      port,
+		"public_host":      "Media.Example.COM",
+		"target_url":       upstream.URL,
+		"ua_mode":          "infuse",
+		"upstream_headers": []map[string]string{{"name": "EMOS-PROXY-ID", "value": secret}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := httptest.NewRecorder()
+	app.handleSites(created, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(payload)))
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	if strings.Contains(created.Body.String(), secret) || strings.Contains(created.Body.String(), "ciphertext") {
+		t.Fatalf("create response exposed configured header: %s", created.Body.String())
+	}
+
+	sites, err := app.db.ListSites()
+	if err != nil || len(sites) != 1 {
+		t.Fatalf("ListSites = %#v, %v", sites, err)
+	}
+	site := sites[0]
+	t.Cleanup(func() { _ = app.pm.StopSite(site.ID) })
+	if site.PublicHost != "media.example.com" || len(site.UpstreamHeaders) != 1 {
+		t.Fatalf("stored site public configuration = %#v", site)
+	}
+	var stored string
+	if err := app.db.db.QueryRow("SELECT upstream_headers FROM sites WHERE id=?", site.ID).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stored, secret) {
+		t.Fatalf("database stored plaintext upstream header: %s", stored)
+	}
+
+	panel := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("panel")) })
+	router := app.publicHostRouter(panel)
+	proxied := httptest.NewRecorder()
+	proxiedRequest := httptest.NewRequest(http.MethodGet, "https://media.example.com/System/Info/Public", nil)
+	proxiedRequest.Host = "MEDIA.EXAMPLE.COM:443"
+	router.ServeHTTP(proxied, proxiedRequest)
+	if proxied.Code != http.StatusOK || proxied.Body.String() != "upstream" {
+		t.Fatalf("public host route status=%d body=%q", proxied.Code, proxied.Body.String())
+	}
+	responseCookies := strings.Join(proxied.Header().Values("Set-Cookie"), "\n")
+	if strings.Contains(responseCookies, "upstream-must-not-overwrite") || !strings.Contains(responseCookies, "emby_session=upstream-keep") {
+		t.Fatalf("HTTP response Cookie sanitization=%q", responseCookies)
+	}
+	select {
+	case got := <-receivedHeader:
+		if got != secret {
+			t.Fatalf("upstream header = %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream request was not observed")
+	}
+
+	panelRequest := httptest.NewRequest(http.MethodGet, "https://panel.example.com/", nil)
+	panelResponse := httptest.NewRecorder()
+	router.ServeHTTP(panelResponse, panelRequest)
+	if panelResponse.Body.String() != "panel" {
+		t.Fatalf("panel host was not reserved: %q", panelResponse.Body.String())
+	}
+
+	if err := app.pm.StopSite(site.ID); err != nil {
+		t.Fatal(err)
+	}
+	unavailable := httptest.NewRecorder()
+	unavailableRequest := httptest.NewRequest(http.MethodGet, "https://media.example.com/", nil)
+	router.ServeHTTP(unavailable, unavailableRequest)
+	if unavailable.Code != http.StatusServiceUnavailable || strings.Contains(unavailable.Body.String(), "panel") {
+		t.Fatalf("disabled public host did not fail closed: status=%d body=%s", unavailable.Code, unavailable.Body.String())
+	}
+}
+
+func TestPublicHostUniqueIndexIsCaseInsensitive(t *testing.T) {
+	app := newTestApp(t)
+	first, err := app.db.CreateSiteRecord(Site{Name: "one", ListenPort: freePort(t), PublicHost: "media.example.com", TargetURL: "http://127.0.0.1:8096", PlaybackMode: "direct", UAMode: "infuse"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.CreateSiteRecord(Site{Name: "two", ListenPort: freePort(t), PublicHost: "MEDIA.EXAMPLE.COM", TargetURL: "http://127.0.0.1:8096", PlaybackMode: "direct", UAMode: "infuse"}); err == nil {
+		t.Fatalf("duplicate public host accepted after site %d", first.ID)
+	}
+}
+
+func TestPrepareUpstreamHeadersStripsOnlyManagementSessionCookie(t *testing.T) {
+	header := http.Header{
+		"Cookie": []string{
+			"meridian_session=panel-secret; emby_session=keep",
+			"meridian_session_backup=also-keep; preference=dark",
+		},
+	}
+	request := httptest.NewRequest(http.MethodGet, "http://media.example.com/", nil)
+	prepareUpstreamHeaders(header, request, UAHeaderPolicy{})
+
+	parsed, err := http.ParseCookie(header.Get("Cookie"))
+	if err != nil {
+		t.Fatalf("parse sanitized Cookie: %v; value=%q", err, header.Get("Cookie"))
+	}
+	values := make(map[string]string, len(parsed))
+	for _, cookie := range parsed {
+		values[cookie.Name] = cookie.Value
+	}
+	if _, exists := values[sessionCookieName]; exists {
+		t.Fatalf("management session leaked upstream: %q", header.Get("Cookie"))
+	}
+	for name, want := range map[string]string{"emby_session": "keep", "meridian_session_backup": "also-keep", "preference": "dark"} {
+		if got := values[name]; got != want {
+			t.Fatalf("cookie %s=%q, want %q; header=%q", name, got, want, header.Get("Cookie"))
+		}
+	}
+
+	wsRequest := httptest.NewRequest(http.MethodGet, "http://media.example.com/socket", nil)
+	wsRequest.Header.Set("Cookie", "emby_session=keep; meridian_session=panel-secret")
+	wsTarget, err := url.Parse("http://origin.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsHeader := prepareWebSocketUpstreamHeaders(wsRequest, wsTarget, UAHeaderPolicy{})
+	if strings.Contains(wsHeader.Get("Cookie"), sessionCookieName) || !strings.Contains(wsHeader.Get("Cookie"), "emby_session=keep") {
+		t.Fatalf("websocket Cookie sanitization = %q", wsHeader.Get("Cookie"))
+	}
+
+	malformed := http.Header{"Cookie": []string{"invalid cookie; meridian_session=panel-secret"}}
+	stripCookieByName(malformed, sessionCookieName)
+	if got := malformed.Values("Cookie"); len(got) != 0 {
+		t.Fatalf("malformed Cookie was not dropped fail-closed: %q", got)
+	}
+}
+
+func TestStripPanelSessionSetCookiesPreservesOnlyValidNonManagementCookies(t *testing.T) {
+	header := make(http.Header)
+	header.Add("Set-Cookie", "meridian_session=replace-panel; Path=/; HttpOnly")
+	header.Add("Set-Cookie", "emby_session=keep; Path=/; Expires=Wed, 21 Oct 2030 07:28:00 GMT")
+	header.Add("Set-Cookie", "meridian_session_backup=keep-too; Path=/")
+	header.Add("Set-Cookie", "Meridian_session=case-sensitive-name; Path=/")
+	header.Add("Set-Cookie", "malformed cookie without equals")
+	stripPanelSessionSetCookies(header)
+
+	got := header.Values("Set-Cookie")
+	if len(got) != 3 {
+		t.Fatalf("sanitized Set-Cookie=%q, want three valid non-management values", got)
+	}
+	joined := strings.Join(got, "\n")
+	if strings.Contains(joined, "replace-panel") || strings.Contains(joined, "malformed cookie") {
+		t.Fatalf("unsafe Set-Cookie survived: %q", got)
+	}
+	for _, marker := range []string{"emby_session=keep", "Expires=Wed, 21 Oct 2030 07:28:00 GMT", "meridian_session_backup=keep-too", "Meridian_session=case-sensitive-name"} {
+		if !strings.Contains(joined, marker) {
+			t.Fatalf("valid upstream cookie %q was not preserved verbatim: %q", marker, got)
+		}
+	}
+}
+
+func TestNormalizeIngressMode(t *testing.T) {
+	tests := []struct {
+		name       string
+		mode       string
+		publicHost string
+		want       string
+		wantErr    bool
+	}{
+		{name: "legacy port", want: ingressModePort},
+		{name: "secure shared default", publicHost: "media.example.com", want: ingressModeHost},
+		{name: "host", mode: ingressModeHost, publicHost: "media.example.com", want: ingressModeHost},
+		{name: "both", mode: ingressModeBoth, publicHost: "media.example.com", want: ingressModeBoth},
+		{name: "port rejects host", mode: ingressModePort, publicHost: "media.example.com", wantErr: true},
+		{name: "host requires domain", mode: ingressModeHost, wantErr: true},
+		{name: "unknown", mode: "unsafe", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeIngressMode(tt.mode, tt.publicHost)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("normalizeIngressMode(%q, %q) error=%v, wantErr=%v", tt.mode, tt.publicHost, err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Fatalf("normalizeIngressMode(%q, %q)=%q, want %q", tt.mode, tt.publicHost, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHostOnlyStartSkipsReservedPortAndRoutesSharedHost(t *testing.T) {
+	app := newTestApp(t)
+	app.panelHost = "panel.example.com"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("shared-upstream"))
+	}))
+	defer upstream.Close()
+
+	reservedPort := freePort(t) // deliberately keep the reservation open
+	site, err := app.db.CreateSiteRecord(Site{
+		Name:         "host-only",
+		ListenPort:   reservedPort,
+		PublicHost:   "media.example.com",
+		IngressMode:  ingressModeHost,
+		TargetURL:    upstream.URL,
+		PlaybackMode: "direct",
+		StreamHosts:  "[]",
+		UAMode:       "infuse",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.pm.StartSite(*site); err != nil {
+		t.Fatalf("host-only StartSite tried to bind reserved port: %v", err)
+	}
+
+	app.pm.mu.RLock()
+	inst := app.pm.proxies[site.ID]
+	app.pm.mu.RUnlock()
+	if inst == nil || inst.server != nil || inst.listener != nil {
+		t.Fatalf("host-only runtime = %#v, want handler with nil server/listener", inst)
+	}
+
+	router := app.publicHostRouter(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("panel"))
+	}))
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://media.example.com/System/Info/Public", nil)
+	router.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || rr.Body.String() != "shared-upstream" {
+		t.Fatalf("shared route status=%d body=%q", rr.Code, rr.Body.String())
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	app.pm.GracefulShutdown(ctx)
+	if app.pm.IsRunning(site.ID) {
+		t.Fatal("host-only runtime survived graceful shutdown")
+	}
+}
+
+func TestHostOnlyIngressRequiresLoopbackPanelBinding(t *testing.T) {
+	app := newTestApp(t)
+	app.pm.SetHostOnlyIngressSafe(false)
+	site := Site{ID: 501, Name: "strict-host", ListenPort: freePort(t), PublicHost: "media.example.com", IngressMode: ingressModeHost, TargetURL: "http://127.0.0.1:8096", PlaybackMode: "direct", StreamHosts: "[]", UAMode: "infuse"}
+	if err := app.pm.StartSite(site); !errors.Is(err, errUnsafeHostOnlyIngress) {
+		t.Fatalf("host-only start on public panel bind error=%v, want safety rejection", err)
+	}
+	if err := app.pm.validateIngressSafety(ingressModeBoth); err != nil {
+		t.Fatalf("explicit high-risk both mode was unexpectedly rejected: %v", err)
+	}
+	app.pm.SetHostOnlyIngressSafe(true)
+	if err := app.pm.StartSite(site); err != nil {
+		t.Fatalf("host-only start on loopback-safe panel bind: %v", err)
+	}
+	if err := app.pm.StopSite(site.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHostOnlyIngressOnPublicBindAllowsOnlyTrustedProxySources(t *testing.T) {
+	app := newTestApp(t)
+	app.panelBindLoopback = false
+	_, loopback, err := net.ParseCIDR("127.0.0.0/8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.trustedProxies = []*net.IPNet{loopback}
+	app.pm.SetTrustedProxies(app.trustedProxies)
+	app.pm.SetHostOnlyIngressSafe(true)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("trusted")) }))
+	defer upstream.Close()
+	site := Site{ID: 503, Name: "allowlisted-host", ListenPort: freePort(t), PublicHost: "allowlisted.example.com", IngressMode: ingressModeHost, TargetURL: upstream.URL, PlaybackMode: "direct", StreamHosts: "[]", UAMode: "infuse"}
+	if err := app.pm.StartSite(site); err != nil {
+		t.Fatal(err)
+	}
+	defer app.pm.StopSite(site.ID)
+	router := app.publicHostRouter(http.NotFoundHandler())
+
+	direct := httptest.NewRequest(http.MethodGet, "http://allowlisted.example.com/", nil)
+	direct.RemoteAddr = "198.51.100.10:45678"
+	directResponse := httptest.NewRecorder()
+	router.ServeHTTP(directResponse, direct)
+	if directResponse.Code != http.StatusForbidden {
+		t.Fatalf("direct source reached host-only route: status=%d body=%q", directResponse.Code, directResponse.Body.String())
+	}
+
+	proxied := httptest.NewRequest(http.MethodGet, "http://allowlisted.example.com/", nil)
+	proxied.RemoteAddr = "127.0.0.1:45678"
+	proxiedResponse := httptest.NewRecorder()
+	router.ServeHTTP(proxiedResponse, proxied)
+	if proxiedResponse.Code != http.StatusOK || proxiedResponse.Body.String() != "trusted" {
+		t.Fatalf("trusted proxy source rejected: status=%d body=%q", proxiedResponse.Code, proxiedResponse.Body.String())
+	}
+}
+
+func TestBothIngressServesSharedHostAndDedicatedPort(t *testing.T) {
+	app := newTestApp(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("both-upstream"))
+	}))
+	defer upstream.Close()
+	port := freePort(t)
+	releasePort(port)
+	site := Site{ID: 502, Name: "both", ListenPort: port, PublicHost: "both.example.com", IngressMode: ingressModeBoth, TargetURL: upstream.URL, PlaybackMode: "direct", StreamHosts: "[]", UAMode: "infuse"}
+	if err := app.pm.StartSite(site); err != nil {
+		t.Fatal(err)
+	}
+	defer app.pm.StopSite(site.ID)
+
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/System/Info/Public", port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	portBody := mustReadBody(t, resp)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || portBody != "both-upstream" {
+		t.Fatalf("dedicated port status=%d body=%q", resp.StatusCode, portBody)
+	}
+	hostHandler, configured := app.pm.PublicHostHandler(site.PublicHost)
+	if !configured || hostHandler == nil {
+		t.Fatal("both mode did not register shared Host handler")
+	}
+	rr := httptest.NewRecorder()
+	hostHandler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "http://both.example.com/System/Info/Public", nil))
+	if rr.Code != http.StatusOK || rr.Body.String() != "both-upstream" {
+		t.Fatalf("shared Host status=%d body=%q", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHostOnlyStopCancelsInflightRequestAndFlushesFinalTraffic(t *testing.T) {
+	app := newTestApp(t)
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	var inst *ProxyInstance
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+		close(canceled)
+	}))
+	defer upstream.Close()
+	site, err := app.db.CreateSiteRecord(Site{Name: "drain-host", ListenPort: freePort(t), PublicHost: "drain.example.com", IngressMode: ingressModeHost, TargetURL: upstream.URL, PlaybackMode: "direct", StreamHosts: "[]", UAMode: "infuse"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.pm.StartSite(*site); err != nil {
+		t.Fatal(err)
+	}
+	app.pm.mu.RLock()
+	inst = app.pm.proxies[site.ID]
+	app.pm.mu.RUnlock()
+	handler, configured := app.pm.PublicHostHandler(site.PublicHost)
+	if !configured || handler == nil || inst == nil {
+		t.Fatal("host-only runtime not available")
+	}
+	requestDone := make(chan struct{})
+	go func() {
+		defer close(requestDone)
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "http://drain.example.com/stream", nil))
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight upstream request did not start")
+	}
+	if err := app.pm.StopSite(site.ID); err != nil {
+		t.Fatal(err)
+	}
+	for name, ch := range map[string]<-chan struct{}{"upstream cancellation": canceled, "proxy request drain": requestDone} {
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s did not complete", name)
+		}
+	}
+	if app.pm.IsRunning(site.ID) {
+		t.Fatal("host-only site still reports running after StopSite")
+	}
+	updated, err := app.db.GetSite(site.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The canceled proxy writes its local 502 through the metered writer before
+	// the active request drains. Traffic mutation from the upstream server's own
+	// goroutine would not model Meridian I/O and can legitimately occur after
+	// RoundTrip has returned, so only proxy-owned metering belongs in this test.
+	if updated.TrafficUsed == 0 || inst.bytesIn.Load() != 0 || inst.bytesOut.Load() != 0 {
+		t.Fatalf("final traffic was not conserved: persisted=%d pending_in=%d pending_out=%d", updated.TrafficUsed, inst.bytesIn.Load(), inst.bytesOut.Load())
+	}
+	rejected := httptest.NewRecorder()
+	handler.ServeHTTP(rejected, httptest.NewRequest(http.MethodGet, "http://drain.example.com/after-stop", nil))
+	if rejected.Code != http.StatusServiceUnavailable {
+		t.Fatalf("captured handler accepted a new request after stop: %d", rejected.Code)
+	}
+}
+
+func TestPublicHostRouterRejectsUnknownHostsWhenPanelDomainConfigured(t *testing.T) {
+	app := newTestApp(t)
+	app.panelHost = "panel.example.com"
+	panel := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("panel-secret")) })
+	router := app.publicHostRouter(panel)
+
+	for _, rawURL := range []string{"https://unknown.example.com/", "http://127.0.0.1:9090/"} {
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, rawURL, nil))
+		if rr.Code != http.StatusMisdirectedRequest || strings.Contains(rr.Body.String(), "panel-secret") {
+			t.Fatalf("unknown Host %s status=%d body=%q", rawURL, rr.Code, rr.Body.String())
+		}
+	}
+
+	panelResponse := httptest.NewRecorder()
+	router.ServeHTTP(panelResponse, httptest.NewRequest(http.MethodGet, "https://PANEL.EXAMPLE.COM:443/", nil))
+	if panelResponse.Body.String() != "panel-secret" {
+		t.Fatalf("configured panel Host rejected: status=%d body=%q", panelResponse.Code, panelResponse.Body.String())
+	}
+
+	health := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9090/api/auth/check", nil)
+	health.RemoteAddr = "127.0.0.1:54321"
+	healthResponse := httptest.NewRecorder()
+	router.ServeHTTP(healthResponse, health)
+	if healthResponse.Body.String() != "panel-secret" {
+		t.Fatalf("loopback health probe rejected: status=%d body=%q", healthResponse.Code, healthResponse.Body.String())
+	}
+	for _, tc := range []struct {
+		url    string
+		remote string
+	}{
+		{url: "http://localhost:9090/api/auth/check", remote: "127.0.0.1:54321"},
+		{url: "http://[::1]:9090/api/auth/check", remote: "[::1]:54321"},
+	} {
+		req := httptest.NewRequest(http.MethodGet, tc.url, nil)
+		req.RemoteAddr = tc.remote
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+		if rr.Body.String() != "panel-secret" {
+			t.Fatalf("local health probe %s from %s rejected: status=%d body=%q", tc.url, tc.remote, rr.Code, rr.Body.String())
+		}
+	}
+
+	unknownViaLoopback := httptest.NewRequest(http.MethodGet, "http://unknown.example.com/api/auth/check", nil)
+	unknownViaLoopback.RemoteAddr = "127.0.0.1:54321"
+	unknownResponse := httptest.NewRecorder()
+	router.ServeHTTP(unknownResponse, unknownViaLoopback)
+	if unknownResponse.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("unknown Host via loopback proxy status=%d, want 421", unknownResponse.Code)
+	}
+	loopbackHostViaRemote := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9090/api/auth/check", nil)
+	loopbackHostViaRemote.RemoteAddr = "198.51.100.8:54321"
+	remoteResponse := httptest.NewRecorder()
+	router.ServeHTTP(remoteResponse, loopbackHostViaRemote)
+	if remoteResponse.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("loopback Host from non-loopback peer status=%d, want 421", remoteResponse.Code)
+	}
+
+	otherLoopback := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9090/", nil)
+	otherLoopback.RemoteAddr = "127.0.0.1:54321"
+	otherResponse := httptest.NewRecorder()
+	router.ServeHTTP(otherResponse, otherLoopback)
+	if otherResponse.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("loopback non-health path status=%d, want 421", otherResponse.Code)
+	}
+
+	app.panelHost = ""
+	compat := httptest.NewRecorder()
+	app.publicHostRouter(panel).ServeHTTP(compat, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:9090/", nil))
+	if compat.Body.String() != "panel-secret" {
+		t.Fatalf("domainless compatibility route status=%d body=%q", compat.Code, compat.Body.String())
+	}
+}
+
+func TestReservedDynamicRouteReturnsGoneWithoutProxying(t *testing.T) {
+	app := newTestApp(t)
+	var upstreamCalls atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		_, _ = w.Write([]byte("upstream"))
+	}))
+	defer upstream.Close()
+
+	site := Site{ID: 101, Name: "reserved-route", ListenPort: freePort(t), PublicHost: "media.example.com", IngressMode: ingressModeHost, TargetURL: upstream.URL, PlaybackMode: "direct", StreamHosts: "[]", UAMode: "infuse"}
+	if err := app.pm.StartSite(site); err != nil {
+		t.Fatal(err)
+	}
+	defer app.pm.StopSite(site.ID)
+	handler, configured := app.pm.PublicHostHandler(site.PublicHost)
+	if !configured || handler == nil {
+		t.Fatal("host handler not registered")
+	}
+	for _, requestPath := range []string{"/_meridian/d", "/_meridian/d/stale-token"} {
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, requestPath, nil))
+		if rr.Code != http.StatusGone {
+			t.Fatalf("reserved path %s status=%d, want 410", requestPath, rr.Code)
+		}
+	}
+	if got := upstreamCalls.Load(); got != 0 {
+		t.Fatalf("reserved dynamic route reached upstream %d times", got)
+	}
+}
+
+func TestUpdateTargetAuthorityDoesNotCarryEncryptedHeaders(t *testing.T) {
+	t.Run("omitted headers are cleared", func(t *testing.T) {
+		app := newTestApp(t)
+		secret := "origin-one-secret"
+		stored, err := mergeUpstreamHeaders("[]", []UpstreamHeaderInput{{Name: "X-Origin-Secret", Value: &secret}}, app.pm.upstreamHeaderKey, "https://origin-one.example.com/emby")
+		if err != nil {
+			t.Fatal(err)
+		}
+		site, err := app.db.CreateSiteRecord(Site{Name: "authority-change", ListenPort: freePort(t), PublicHost: "one.example.com", IngressMode: ingressModeHost, TargetURL: "https://origin-one.example.com/emby", PlaybackMode: "direct", StreamHosts: "[]", UAMode: "infuse", StoredUpstreamHeaders: stored})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer app.pm.StopSite(site.ID)
+		payload, _ := json.Marshal(map[string]interface{}{"name": site.Name, "listen_port": site.ListenPort, "public_host": site.PublicHost, "ingress_mode": ingressModeHost, "target_url": "https://origin-two.example.com/emby"})
+		rr := httptest.NewRecorder()
+		app.handleSiteByID(rr, httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/sites/%d", site.ID), bytes.NewReader(payload)))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("update status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		updated, err := app.db.GetSite(site.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if updated.StoredUpstreamHeaders != "[]" || len(updated.UpstreamHeaders) != 0 {
+			t.Fatalf("old authority secret survived update: %#v", updated)
+		}
+	})
+
+	t.Run("blank retained value is rejected", func(t *testing.T) {
+		app := newTestApp(t)
+		secret := "origin-one-secret"
+		stored, err := mergeUpstreamHeaders("[]", []UpstreamHeaderInput{{Name: "X-Origin-Secret", Value: &secret}}, app.pm.upstreamHeaderKey, "https://origin-one.example.com")
+		if err != nil {
+			t.Fatal(err)
+		}
+		site, err := app.db.CreateSiteRecord(Site{Name: "authority-reentry", ListenPort: freePort(t), PublicHost: "two.example.com", IngressMode: ingressModeHost, TargetURL: "https://origin-one.example.com", PlaybackMode: "direct", StreamHosts: "[]", UAMode: "infuse", StoredUpstreamHeaders: stored})
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, _ := json.Marshal(map[string]interface{}{"name": site.Name, "listen_port": site.ListenPort, "public_host": site.PublicHost, "ingress_mode": ingressModeHost, "target_url": "https://origin-two.example.com", "upstream_headers": []map[string]string{{"name": "X-Origin-Secret", "value": ""}}})
+		rr := httptest.NewRecorder()
+		app.handleSiteByID(rr, httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/sites/%d", site.ID), bytes.NewReader(payload)))
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("blank secret update status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		unchanged, err := app.db.GetSite(site.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if unchanged.TargetURL != site.TargetURL || unchanged.StoredUpstreamHeaders != stored {
+			t.Fatalf("rejected update changed stored site: %#v", unchanged)
+		}
+	})
+
+	t.Run("same authority path retains headers", func(t *testing.T) {
+		app := newTestApp(t)
+		secret := "same-origin-secret"
+		stored, err := mergeUpstreamHeaders("[]", []UpstreamHeaderInput{{Name: "X-Origin-Secret", Value: &secret}}, app.pm.upstreamHeaderKey, "https://origin.example.com/emby")
+		if err != nil {
+			t.Fatal(err)
+		}
+		site, err := app.db.CreateSiteRecord(Site{Name: "same-authority", ListenPort: freePort(t), PublicHost: "three.example.com", IngressMode: ingressModeHost, TargetURL: "https://origin.example.com/emby", PlaybackMode: "direct", StreamHosts: "[]", UAMode: "infuse", StoredUpstreamHeaders: stored})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer app.pm.StopSite(site.ID)
+		payload, _ := json.Marshal(map[string]interface{}{"name": site.Name, "listen_port": site.ListenPort, "public_host": site.PublicHost, "ingress_mode": ingressModeHost, "target_url": "https://origin.example.com:443/other"})
+		rr := httptest.NewRecorder()
+		app.handleSiteByID(rr, httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/sites/%d", site.ID), bytes.NewReader(payload)))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("same-authority update status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		updated, err := app.db.GetSite(site.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if updated.StoredUpstreamHeaders != stored {
+			t.Fatalf("same-authority update changed encrypted headers: got=%s want=%s", updated.StoredUpstreamHeaders, stored)
+		}
+	})
+
+	t.Run("new authority accepts only a freshly entered secret", func(t *testing.T) {
+		app := newTestApp(t)
+		oldSecret := "old-origin-secret"
+		newSecret := "new-origin-secret"
+		stored, err := mergeUpstreamHeaders("[]", []UpstreamHeaderInput{{Name: "X-Origin-Secret", Value: &oldSecret}}, app.pm.upstreamHeaderKey, "https://origin-one.example.com")
+		if err != nil {
+			t.Fatal(err)
+		}
+		site, err := app.db.CreateSiteRecord(Site{Name: "authority-new-secret", ListenPort: freePort(t), PublicHost: "four.example.com", IngressMode: ingressModeHost, TargetURL: "https://origin-one.example.com", PlaybackMode: "direct", StreamHosts: "[]", UAMode: "infuse", StoredUpstreamHeaders: stored})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer app.pm.StopSite(site.ID)
+		payload, _ := json.Marshal(map[string]interface{}{
+			"name": site.Name, "listen_port": site.ListenPort, "public_host": site.PublicHost,
+			"ingress_mode": ingressModeHost, "target_url": "https://origin-two.example.com",
+			"upstream_headers": []map[string]string{{"name": "X-Origin-Secret", "value": newSecret}},
+		})
+		rr := httptest.NewRecorder()
+		app.handleSiteByID(rr, httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/sites/%d", site.ID), bytes.NewReader(payload)))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("new-authority secret update status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		updated, err := app.db.GetSite(site.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		newTarget, _ := normalizeTargetURL(updated.TargetURL)
+		policy, err := resolveUpstreamHeaderPolicy(updated.StoredUpstreamHeaders, app.pm.upstreamHeaderKey, newTarget)
+		if err != nil || policy.values.Get("X-Origin-Secret") != newSecret {
+			t.Fatalf("freshly entered secret did not bind to new authority: policy=%#v err=%v", policy, err)
+		}
+		oldTarget, _ := normalizeTargetURL(site.TargetURL)
+		if _, err := resolveUpstreamHeaderPolicy(updated.StoredUpstreamHeaders, app.pm.upstreamHeaderKey, oldTarget); err == nil {
+			t.Fatal("new-authority ciphertext unexpectedly decrypted on the old authority")
+		}
+	})
 }
 
 func lenMust(sites []Site, err error) int {

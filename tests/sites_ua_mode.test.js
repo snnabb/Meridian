@@ -94,6 +94,20 @@ test('passthrough payload clears the custom triplet', () => {
   assert.equal(payload.custom_version, '');
 });
 
+test('upstream header payload keeps configured rows write-only', () => {
+	const { buildUpstreamHeaderPayload } = loadSiteHelpers();
+	const payload = buildUpstreamHeaderPayload([
+		{ name: ' EMOS-PROXY-ID ', value: '', configured: true },
+		{ name: ' X-New-Header ', value: ' new-value ', configured: false },
+		{ name: '', value: '', configured: false },
+	]);
+
+	assert.deepEqual(JSON.parse(JSON.stringify(payload)), [
+		{ name: 'EMOS-PROXY-ID', value: '' },
+		{ name: 'X-New-Header', value: 'new-value' },
+	]);
+});
+
 test('passthrough mode label maps to 透传 with an existing pill class', () => {
   const sandbox = loadPageScripts('pages/dashboard.js', 'pages/sites.js');
   const { uaNameMap, uaClassMap } = vm.runInContext('({ uaNameMap, uaClassMap })', sandbox);
