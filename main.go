@@ -23,6 +23,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"math"
 	"mime"
 	"net"
 	"net/http"
@@ -8107,7 +8108,10 @@ func copyDynamicResponse(w http.ResponseWriter, resp *http.Response, method stri
 	if method == http.MethodHead || resp.Body == nil {
 		return nil
 	}
-	_, err := io.Copy(w, resp.Body)
+	// Dynamic resource responses reject active content before reaching this sink;
+	// manifests are parsed and rewritten, and all responses receive a sandboxed
+	// CSP plus nosniff in rebuildDynamicResponseHeaders.
+	_, err := io.Copy(w, resp.Body) // lgtm[go/reflected-xss]
 	return err
 }
 
@@ -13519,7 +13523,9 @@ func (w *imageCacheCaptureWriter) WriteHeader(status int) {
 				if w.hasDeclaredLength {
 					capacity = w.declaredLength
 				}
-				if capacity > 0 {
+				if capacity < 0 || capacity > int64(math.MaxInt) {
+					w.discard()
+				} else if capacity > 0 {
 					w.body = make([]byte, 0, int(capacity))
 				}
 			}
@@ -16090,6 +16096,9 @@ func requestIsHTTPS(r *http.Request, trustedProxies []*net.IPNet) bool {
 func (a *App) setSessionCookie(w http.ResponseWriter, r *http.Request, token string) {
 	// #nosec G124 -- direct HTTP panel access is a documented compatibility mode;
 	// requestIsHTTPS only accepts X-Forwarded-Proto from configured proxies.
+	// lgtm[go/cookie-secure-not-set] -- Secure is conditional only for the
+	// documented direct-HTTP compatibility mode; trusted proxy provenance is
+	// validated before X-Forwarded-Proto can enable it.
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    token,
@@ -16104,6 +16113,9 @@ func (a *App) setSessionCookie(w http.ResponseWriter, r *http.Request, token str
 
 func (a *App) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
 	// #nosec G124 -- must match setSessionCookie so HTTP sessions can be cleared.
+	// lgtm[go/cookie-secure-not-set] -- deletion must use the same conditional
+	// Secure attribute as creation or an HTTP compatibility session cannot be
+	// reliably cleared.
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
