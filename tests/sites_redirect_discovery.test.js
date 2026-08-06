@@ -380,8 +380,8 @@ test('create modal defaults to Safe PlaybackInfo inspection without exposing a s
   assert.match(document.getElementById('m-dynamic-domain-warning').textContent, /公网 DNS 主机名的 HTTPS:443/);
   const modalMarkup = document.getElementById('modal-body').innerHTML;
   assert.match(modalMarkup, /解析 PlaybackInfo/);
-  assert.match(modalMarkup, /PlaybackInfo 将原样透传/);
-  assert.match(modalMarkup, /HTTP 30x 后端发现仍保持启用/);
+  assert.match(modalMarkup, /PlaybackInfo 正文不再解析或改写/);
+  assert.match(modalMarkup, /HTTP 30x 后端发现仍保持启用，动态跟随后的最终响应仍执行 Header 清洗/);
   assert.match(modalMarkup, /外部 URL 不再封装为受控能力链接，可能直接交给客户端/);
 });
 

@@ -986,7 +986,7 @@ async function showSiteModal(site) {
             <div class="form-toggle-list">
               <label class="form-check form-check-panel" for="m-dynamic-playback-info">
                 <input type="checkbox" id="m-dynamic-playback-info" ${dynamicPolicy.dynamic_playback_info_enabled ? 'checked' : ''}>
-                <span><strong>解析 PlaybackInfo</strong><small>关闭后，PlaybackInfo 将原样透传；HTTP 30x 后端发现仍保持启用。PlaybackInfo 中的外部 URL 不再封装为受控能力链接，可能直接交给客户端。</small></span>
+                <span><strong>解析 PlaybackInfo</strong><small>关闭后，PlaybackInfo 正文不再解析或改写；HTTP 30x 后端发现仍保持启用，动态跟随后的最终响应仍执行 Header 清洗。PlaybackInfo 中的外部 URL 不再封装为受控能力链接，可能直接交给客户端。</small></span>
               </label>
             </div>
             <div class="form-warning form-warning-danger extreme-confirmation" id="m-dynamic-extreme-confirm" hidden>
