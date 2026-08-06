@@ -449,6 +449,42 @@ func TestStructuredResponsePipelineBoundsGzipAndInvalidatesValidators(t *testing
 		t.Fatalf("compressed input error=%v, want input-limit rejection", err)
 	}
 }
+
+func TestPlaybackInfoDisabledPassesThroughWhileRedirectDiscoveryRemainsEnabled(t *testing.T) {
+	issuer := newStructuredDiscoveryTestIssuer(t)
+	issuer.policy.sources = []string{dynamicDiscoverySourceRedirect}
+	if !issuer.policy.sourceEnabled(dynamicDiscoverySourceRedirect) || issuer.policy.sourceEnabled(dynamicDiscoverySourcePlaybackInfo) {
+		t.Fatalf("PlaybackInfo-off policy sources = %#v", issuer.policy.sources)
+	}
+
+	payload := `{"MediaSources":[{"DirectStreamUrl":"https://cdn.example.com/video.mp4?token=upstream-secret"}]}`
+	request := httptest.NewRequest(http.MethodPost, "https://api.example.com/Items/1/PlaybackInfo", nil)
+	body := &redirectRuntimeCloseSpy{Reader: strings.NewReader(payload)}
+	header := make(http.Header)
+	header.Set("Content-Type", "application/json")
+	header.Set("ETag", `"upstream-validator"`)
+	response := &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        header,
+		Body:          body,
+		ContentLength: int64(len(payload)),
+		Request:       request,
+	}
+	if err := rewriteDynamicStructuredResponse(response, issuer, false); err != nil {
+		t.Fatalf("PlaybackInfo-off pass-through: %v", err)
+	}
+	if body.closed.Load() || response.Body != body || response.ContentLength != int64(len(payload)) || response.Header.Get("ETag") != `"upstream-validator"` || response.Header.Get("Cache-Control") != "" {
+		t.Fatalf("PlaybackInfo-off response was modified: closed=%t length=%d headers=%#v", body.closed.Load(), response.ContentLength, response.Header)
+	}
+	passedThrough, err := io.ReadAll(response.Body)
+	if err != nil || string(passedThrough) != payload {
+		t.Fatalf("PlaybackInfo-off body=%q err=%v, want unchanged", passedThrough, err)
+	}
+	if len(issuer.state.capabilities) != 0 {
+		t.Fatalf("PlaybackInfo-off minted %d capabilities", len(issuer.state.capabilities))
+	}
+	_ = response.Body.Close()
+}
 func TestDynamicParseBudgetEnforcesPerSiteConcurrency(t *testing.T) {
 	runtime := newDynamicRuntime()
 	limits, ok := dynamicLimitsForProfile(dynamicProfileCompatible)

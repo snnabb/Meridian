@@ -40,11 +40,11 @@ test('ingress payload clears stale host for port mode and preserves it otherwise
   });
 });
 
-test('new-site ingress defaults follow backend host-only capability', () => {
+test('new-site ingress always defaults to a single port listener', () => {
   const { defaultIngressMode } = loadHelpers();
-  assert.equal(defaultIngressMode({ host_only_available: true }), 'host');
+  assert.equal(defaultIngressMode({ host_only_available: true }), 'port');
   assert.equal(defaultIngressMode({ host_only_available: false }), 'port');
-  assert.equal(defaultIngressMode(undefined), 'host');
+  assert.equal(defaultIngressMode(undefined), 'port');
 });
 
 test('ingress summary never presents a host-only reserve port as listening', () => {
@@ -60,6 +60,37 @@ test('ingress summary never presents a host-only reserve port as listening', () 
   assert.match(both, /:8123/);
 });
 
+test('plain site-card values share one semantic style while addresses remain monospace', () => {
+  const { renderIngressSummary, renderDynamicSiteSummary, renderPlaybackRow } = loadHelpers();
+  const ingress = renderIngressSummary({ ingress_mode: 'host', public_host: 'media.example.com', listen_port: 8123 });
+  assert.match(ingress, /class="site-row-value">仅共享域名<\/span>/);
+  assert.match(ingress, /class="mono">Host: media\.example\.com<\/span>/);
+
+  const discovery = renderDynamicSiteSummary({
+    dynamic_discovery_enabled: true,
+    dynamic_profile: 'safe',
+    dynamic_domain_rules: [],
+    dynamic_allow_https_downgrade: false,
+  });
+  assert.match(discovery, /class="site-row-value">已启用 · Safe（安全）<\/span>/);
+
+  const inheritedPlayback = renderPlaybackRow({ target_url: 'https://origin.example' });
+  assert.match(inheritedPlayback, /class="site-row-value">跟随主回源<\/span>/);
+  const configuredPlayback = renderPlaybackRow({
+    target_url: 'https://origin.example',
+    playback_target_url: 'https://playback.example',
+    stream_hosts: [],
+    playback_mode: 'redirect',
+  });
+  assert.match(configuredPlayback, /class="mono">https:\/\/playback\.example<\/span>/);
+  assert.match(configuredPlayback, /class="site-row-value">重定向跟随<\/span>/);
+
+  const source = loadSitesSource();
+  assert.ok(source.includes('<span class="site-row-value">${upstreamHeaderCount} 个（加密）</span>'));
+  assert.ok(source.includes('<span class="site-row-value">${formatBytes(s.traffic_used)}</span>'));
+  assert.match(source, /class="pill \$\{uaClassMap\[s\.ua_mode\]/);
+});
+
 test('target authority comparison ignores path and explicit default ports', () => {
   const { normalizedTargetAuthority } = loadHelpers();
 	assert.equal(normalizedTargetAuthority('https://origin.example.com/emby'), 'https://origin.example.com:443');
@@ -68,14 +99,67 @@ test('target authority comparison ignores path and explicit default ports', () =
   assert.notEqual(normalizedTargetAuthority('https://origin.example.com'), normalizedTargetAuthority('https://other.example.com'));
 });
 
-test('site modal always loads deployment capabilities for create and edit flows', () => {
-  const source = loadSitesSource();
-  const start = source.indexOf('async function showSiteModal(site)');
-  const end = source.indexOf('// Global actions', start);
-  const modalSource = source.slice(start, end);
+test('empty state directs the user to the create action', () => {
+  const { renderSitesEmptyState } = loadHelpers();
+  const html = renderSitesEmptyState();
+  assert.match(html, /还没有站点/);
+  assert.match(html, /“添加站点”/);
+  assert.match(html, /role="status"/);
+});
 
-  assert.match(modalSource, /normalizeSiteCapabilities\(await API\.ingressCapabilities\(\)\)/);
-  assert.doesNotMatch(modalSource, /if \(!isEdit\)[\s\S]{0,200}ingressCapabilities/);
+test('proxy optimization payload uses the exact shared boolean fields', () => {
+  const { buildProxyOptimizationPayload } = loadHelpers();
+  assert.deepEqual(JSON.parse(JSON.stringify(buildProxyOptimizationPayload(true, false, true))), {
+    ping_cache_enabled: true,
+    image_cache_enabled: false,
+    progress_coalescing_enabled: true,
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(buildProxyOptimizationPayload(1, null, 'yes'))), {
+    ping_cache_enabled: false,
+    image_cache_enabled: false,
+    progress_coalescing_enabled: false,
+  });
+});
+
+test('cache and request policy uses neutral naming and explicit progress semantics', () => {
+  const source = loadSitesSource();
+  assert.match(source, /function buildProxyOptimizationPayload/);
+  assert.equal((source.match(/buildProxyOptimizationPayload/g) || []).length, 3);
+  assert.match(source, /data-site-group="cache-request-policy"/);
+  assert.match(source, /<legend>缓存与请求策略<\/legend>/);
+  assert.match(source, /<strong>播放进度优化<\/strong>/);
+  assert.match(source, /密集更新时仅保留最新一条待发往上游的进度/);
+  assert.match(source, /发送 Stopped 前会先向上游发送最终位置/);
+  assert.doesNotMatch(source, /播放进度合并/);
+  assert.match(source, /<strong>流量与速度限制<\/strong>/);
+});
+
+test('request limit payload is opt-in and preserves the existing backend fields', () => {
+  const { buildRequestLimitPayload } = loadHelpers();
+  assert.deepEqual(JSON.parse(JSON.stringify(buildRequestLimitPayload(false, '2', '25'))), {
+    traffic_quota: 0,
+    speed_limit: 0,
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(buildRequestLimitPayload(true, '2', '25'))), {
+    traffic_quota: 2 * 1073741824,
+    speed_limit: 25,
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(buildRequestLimitPayload(true, '0', '12'))), {
+    traffic_quota: 0,
+    speed_limit: 12,
+  });
+});
+
+test('site modal focus cycle traps forward and reverse tab movement', () => {
+  const { cycleSiteModalFocus } = loadHelpers();
+  const focused = [];
+  const first = { focus() { focused.push('first'); } };
+  const last = { focus() { focused.push('last'); } };
+  const forward = { key: 'Tab', shiftKey: false, preventDefault() { focused.push('prevent-forward'); } };
+  const reverse = { key: 'Tab', shiftKey: true, preventDefault() { focused.push('prevent-reverse'); } };
+  assert.equal(cycleSiteModalFocus(forward, [first, last], last), true);
+  assert.equal(cycleSiteModalFocus(reverse, [first, last], first), true);
+  assert.deepEqual(focused, ['prevent-forward', 'first', 'prevent-reverse', 'last']);
 });
 
 test('stream host normalization accepts the array API and legacy JSON strings', () => {
@@ -128,6 +212,13 @@ test('missing upstream header key disables edits but leaves deletion available',
   const removeButton = disabled.match(/<button[^>]*m-upstream-header-remove[^>]*>/)?.[0] || '';
   assert.ok(removeButton, 'configured row must retain a delete control');
   assert.ok(!removeButton.includes('disabled'), 'delete control must remain enabled');
+  assert.match(disabled, /<fieldset class="form-list-row upstream-header-row">/);
+  assert.match(disabled, /<legend class="sr-only">上游请求头 1<\/legend>/);
+  assert.match(disabled, /for="m-upstream-header-name-0"/);
+  assert.match(disabled, /for="m-upstream-header-value-0"/);
+  assert.match(disabled, /type="password" class="form-input m-upstream-header-value"/);
+  assert.match(disabled, /class="btn-ghost danger form-row-action m-upstream-header-remove"/);
+  assert.ok(!disabled.includes('style='), 'row layout must be class-based for responsive stacking');
 
   const enabled = renderUpstreamHeaderRows([
     { name: 'X-Origin-Secret', configured: true },

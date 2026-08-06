@@ -1078,13 +1078,14 @@ func TestDynamicRedirectRuntimeCarriesPlaybackInfoSourceAcrossRenamedTarget(t *t
 	}
 }
 
-func TestDynamicRedirectRuntimeCarriesDisabledPlaybackIdentityAndFailsClosed(t *testing.T) {
-	policy := redirectRuntimePolicy(dynamicProfileCompatible, true)
+func TestDynamicRedirectRuntimePassesDisabledPlaybackInfoThrough(t *testing.T) {
+	policy := redirectRuntimePolicy(dynamicProfileSafe, true)
 	policy.sources = []string{dynamicDiscoverySourceRedirect}
 	_, state := redirectRuntimeState(t, policy.limits, dynamicIPResolverFunc(func(context.Context, string) ([]net.IPAddr, error) {
 		return []net.IPAddr{{IP: net.ParseIP("1.1.1.1")}}, nil
 	}))
 	body := `{"MediaSources":[{"DirectStreamUrl":"https://media.example.com/video.mp4?token=secret"}]}`
+	captures := make(chan redirectRuntimeDialCapture, 1)
 	transport := &redirectFollowTransport{
 		base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			return redirectRuntimeResponse(req, http.StatusFound, []string{"https://cdn.example.com/session/renamed"}, http.NoBody), nil
@@ -1092,27 +1093,39 @@ func TestDynamicRedirectRuntimeCarriesDisabledPlaybackIdentityAndFailsClosed(t *
 		configuredAuthorities: map[string]bool{"https://origin.example.net": true},
 		dynamicPolicy:         policy,
 		dynamicState:          state,
-		dynamicTransportFactory: redirectRuntimeFactory(make(chan redirectRuntimeDialCapture, 1), func(*http.Request) string {
-			return fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+		dynamicTransportFactory: redirectRuntimeFactory(captures, func(*http.Request) string {
+			return fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nETag: upstream-validator\r\n\r\n%s", len(body), body)
 		}),
 	}
 	request := redirectRuntimeEligibleRequest(http.MethodGet, "https://origin.example.net/Items/1/PlaybackInfo")
 	source := dynamicStructuredRequestIdentity(request)
-	if source != dynamicDiscoverySourcePlaybackInfo || policy.sourceEnabled(source) {
-		t.Fatalf("disabled PlaybackInfo request identity = %q enabled=%t", source, policy.sourceEnabled(source))
+	if source != dynamicDiscoverySourcePlaybackInfo || policy.sourceEnabled(source) || !policy.sourceEnabled(dynamicDiscoverySourceRedirect) {
+		t.Fatalf("PlaybackInfo-off request identity = %q playback_enabled=%t redirect_enabled=%t", source, policy.sourceEnabled(source), policy.sourceEnabled(dynamicDiscoverySourceRedirect))
 	}
 	request = request.WithContext(context.WithValue(request.Context(), dynamicExpectedStructuredSourceContextKey{}, source))
 	resp, err := transport.RoundTrip(request)
 	if err != nil {
-		t.Fatalf("disabled-source redirect RoundTrip: %v", err)
+		t.Fatalf("PlaybackInfo-off redirect RoundTrip: %v", err)
 	}
-	if got := dynamicResponseExpectedStructuredSource(resp); got != dynamicDiscoverySourcePlaybackInfo {
-		t.Fatalf("disabled source identity after redirect = %q", got)
+	if capture := <-captures; capture.err != nil {
+		t.Fatalf("PlaybackInfo-off redirect capture: %#v", capture)
+	}
+	if !responseIsDynamic(resp) || dynamicResponseExpectedStructuredSource(resp) != dynamicDiscoverySourcePlaybackInfo {
+		t.Fatalf("redirected response identity: dynamic=%t source=%q", responseIsDynamic(resp), dynamicResponseExpectedStructuredSource(resp))
 	}
 	issuer := &dynamicCapabilityIssuer{key: make([]byte, 32), siteID: 1, policyRevision: 1, policy: policy, state: state}
-	if err := rewriteDynamicStructuredResponseExpected(resp, issuer, true, dynamicResponseExpectedStructuredSource(resp), 0, false); err == nil {
-		t.Fatal("renamed dynamic PlaybackInfo response bypassed its disabled source policy")
+	if err := rewriteDynamicStructuredResponseExpected(resp, issuer, true, dynamicResponseExpectedStructuredSource(resp), 0, false); err != nil {
+		t.Fatalf("PlaybackInfo-off redirected response was rejected: %v", err)
 	}
+	unchanged, err := io.ReadAll(resp.Body)
+	if err != nil || string(unchanged) != body {
+		t.Fatalf("PlaybackInfo-off redirected body=%q err=%v, want unchanged", unchanged, err)
+	}
+	if resp.Header.Get("ETag") != "upstream-validator" || len(issuer.state.capabilities) != 0 {
+		t.Fatalf("PlaybackInfo-off redirected response changed: headers=%#v capabilities=%d", resp.Header, len(issuer.state.capabilities))
+	}
+	commitDynamicResponseAuthorities(resp)
+	_ = resp.Body.Close()
 
 	configuredRequest := httptest.NewRequest(http.MethodGet, "https://origin.example.net/session/renamed", nil)
 	configuredRequest = configuredRequest.WithContext(context.WithValue(configuredRequest.Context(), dynamicExpectedStructuredSourceContextKey{}, source))
@@ -1120,11 +1133,23 @@ func TestDynamicRedirectRuntimeCarriesDisabledPlaybackIdentityAndFailsClosed(t *
 	configuredHeader.Set("Content-Type", "application/json")
 	configuredResponse := &http.Response{StatusCode: http.StatusOK, Header: configuredHeader, Body: io.NopCloser(strings.NewReader(body)), ContentLength: int64(len(body)), Request: configuredRequest}
 	if err := rewriteDynamicStructuredResponseExpected(configuredResponse, issuer, false, source, 0, false); err != nil {
-		t.Fatalf("configured response with disabled source did not remain compatible: %v", err)
+		t.Fatalf("configured response with PlaybackInfo off did not pass through: %v", err)
 	}
-	unchanged, err := io.ReadAll(configuredResponse.Body)
+	unchanged, err = io.ReadAll(configuredResponse.Body)
 	if err != nil || string(unchanged) != body {
-		t.Fatalf("configured disabled-source response changed: %q err=%v", unchanged, err)
+		t.Fatalf("configured PlaybackInfo-off body=%q err=%v, want unchanged", unchanged, err)
+	}
+
+	opaqueBody := `<html><body>opaque upstream response</body></html>`
+	opaqueHeader := make(http.Header)
+	opaqueHeader.Set("Content-Type", "text/html")
+	opaqueResponse := &http.Response{StatusCode: http.StatusOK, Header: opaqueHeader, Body: io.NopCloser(strings.NewReader(opaqueBody)), ContentLength: int64(len(opaqueBody)), Request: configuredRequest}
+	if err := rewriteDynamicStructuredResponseExpected(opaqueResponse, issuer, true, source, 0, false); err != nil {
+		t.Fatalf("PlaybackInfo-off opaque redirected response was rejected: %v", err)
+	}
+	unchanged, err = io.ReadAll(opaqueResponse.Body)
+	if err != nil || string(unchanged) != opaqueBody || len(issuer.state.capabilities) != 0 {
+		t.Fatalf("PlaybackInfo-off opaque body=%q err=%v capabilities=%d", unchanged, err, len(issuer.state.capabilities))
 	}
 }
 
@@ -1495,6 +1520,58 @@ func TestDynamicRedirectRuntimeRejectsMalformedRedirectChains(t *testing.T) {
 		}
 		redirectRuntimeAssertError(t, err, dynamicObservationReasonHopLimit)
 	})
+}
+
+func TestDynamicSafeEmptyRulesKeepHTTPS443PublicDNSBoundary(t *testing.T) {
+	policy := redirectRuntimePolicy(dynamicProfileSafe, true)
+	policy.domainRules = nil
+	selfTargets := newTestDynamicSelfTargetPolicy(t)
+	parse := func(raw string) *url.URL {
+		t.Helper()
+		target, err := normalizeDynamicURL(raw)
+		if err != nil {
+			t.Fatalf("normalize %q: %v", raw, err)
+		}
+		return target
+	}
+
+	publicTarget := parse("https://cdn.example.net/media")
+	if reason := policy.validateTarget(nil, publicTarget, selfTargets); reason != "" {
+		t.Fatalf("public DNS HTTPS:443 reason=%q, want allowed", reason)
+	}
+	publicResolver := dynamicIPResolverFunc(func(context.Context, string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("1.1.1.1")}}, nil
+	})
+	if pinned, err := resolveDynamicURLIPs(context.Background(), publicResolver, publicTarget, policy.limits.MaxDNSIPs, selfTargets); err != nil || len(pinned) != 1 || !pinned[0].Equal(net.ParseIP("1.1.1.1")) {
+		t.Fatalf("public DNS resolution pins=%v err=%v", pinned, err)
+	}
+
+	for name, test := range map[string]struct {
+		raw    string
+		reason string
+	}{
+		"IP literal": {raw: "https://8.8.8.8/media", reason: dynamicObservationReasonDomainDenied},
+		"HTTP":       {raw: "http://cdn.example.net/media", reason: dynamicObservationReasonSchemeDenied},
+		"non-443":    {raw: "https://cdn.example.net:444/media", reason: dynamicObservationReasonPortDenied},
+		"self":       {raw: "https://panel.example.com/media", reason: dynamicObservationReasonSelfTarget},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if reason := policy.validateTarget(nil, parse(test.raw), selfTargets); reason != test.reason {
+				t.Fatalf("reason=%q, want %q", reason, test.reason)
+			}
+		})
+	}
+
+	privateTarget := parse("https://private.example.net/media")
+	if reason := policy.validateTarget(nil, privateTarget, selfTargets); reason != "" {
+		t.Fatalf("private DNS name was rejected before DNS pinning: %q", reason)
+	}
+	privateResolver := dynamicIPResolverFunc(func(context.Context, string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("10.0.0.8")}}, nil
+	})
+	if _, err := resolveDynamicURLIPs(context.Background(), privateResolver, privateTarget, policy.limits.MaxDNSIPs, selfTargets); err == nil {
+		t.Fatal("Safe empty rules allowed a private DNS answer")
+	}
 }
 
 func TestDynamicRedirectRuntimeRefusesUnsafeUnknownTargets(t *testing.T) {

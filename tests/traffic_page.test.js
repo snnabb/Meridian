@@ -7,395 +7,476 @@ const test = require('node:test');
 const vm = require('node:vm');
 
 const STATIC_JS = path.join(__dirname, '..', 'web', 'static', 'js');
-
-function readScript(relativePath) {
-  return fs.readFileSync(path.join(STATIC_JS, relativePath), 'utf8');
+function loadInto(sandbox, ...files) {
+  for (const file of files) vm.runInContext(fs.readFileSync(path.join(STATIC_JS, file), 'utf8'), sandbox, { filename: file });
+}
+function okJson(body) { return { status: 200, ok: true, statusText: 'OK', json: async () => body }; }
+async function flushTraffic() {
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
 }
 
-function loadInto(sandbox, ...relativePaths) {
-  for (const relativePath of relativePaths) {
-    vm.runInContext(readScript(relativePath), sandbox, { filename: relativePath });
-  }
-}
-
-function okJson(body) {
-  return { status: 200, ok: true, statusText: 'OK', json: async () => body };
-}
-
-function makeCanvasContext() {
+function makeContext() {
+  const calls = [];
+  const record = name => (...args) => { calls.push({ name, args }); };
   return {
-    scale() {}, clearRect() {}, beginPath() {}, moveTo() {}, lineTo() {},
-    quadraticCurveTo() {}, stroke() {}, fill() {}, save() {}, restore() {},
-    closePath() {}, fillText() {},
-    createLinearGradient() { return { addColorStop() {} }; },
+    calls,
+    scale: record('scale'), clearRect: record('clearRect'), beginPath: record('beginPath'),
+    moveTo: record('moveTo'), lineTo: record('lineTo'), quadraticCurveTo: record('quadraticCurveTo'), bezierCurveTo: record('bezierCurveTo'),
+    stroke: record('stroke'), fill: record('fill'), arc: record('arc'), fillText: record('fillText'),
+    save: record('save'), restore: record('restore'), closePath: record('closePath'),
+    createLinearGradient(...args) {
+      calls.push({ name: 'createLinearGradient', args });
+      return { addColorStop: record('addColorStop') };
+    },
   };
 }
-
-function makeElement(id, opts) {
-  opts = opts || {};
+function makeElement(id, value) {
+  const listeners = {}, classes = new Set(), attributes = {}, capturedPointers = new Set();
+  const context = makeContext();
   return {
-    id,
-    value: opts.value !== undefined ? opts.value : '',
-    innerHTML: '',
-    textContent: '',
-    style: {},
-    hidden: false,
-    required: false,
-    disabled: false,
-    onchange: null,
-    className: '',
-    dataset: {},
-    classList: { add() {}, remove() {}, toggle() {} },
-    setAttribute() {},
-    addEventListener() {},
-    focus() {},
-    getContext() { return makeCanvasContext(); },
-    parentElement: { clientWidth: 800 },
-    isConnected: true,
-    scrollTop: 0,
-    width: undefined,
-    height: undefined,
+    id, value: value || '', innerHTML: '', textContent: '', className: '', hidden: false, style: {}, width: undefined, height: undefined,
+    parentElement: { clientWidth: 800 }, rect: { left: 0, width: 800 }, context,
+    captureCalls: [], releaseCalls: [],
+    classList: {
+      add(...names) { names.forEach(name => classes.add(name)); },
+      remove(...names) { names.forEach(name => classes.delete(name)); },
+      contains(name) { return classes.has(name); },
+      toggle(name, force) {
+        const enabled = force === undefined ? !classes.has(name) : !!force;
+        if (enabled) classes.add(name); else classes.delete(name);
+        return enabled;
+      },
+    },
+    setAttribute(name, next) { attributes[name] = String(next); this[name] = String(next); },
+    removeAttribute(name) { delete attributes[name]; delete this[name]; },
+    getAttribute(name) { return Object.prototype.hasOwnProperty.call(attributes, name) ? attributes[name] : null; },
+    addEventListener(name, cb) { listeners[name] = cb; },
+    dispatch(name, event) {
+      if (!listeners[name]) return undefined;
+      const next = event || {};
+      if (!next.type) next.type = name;
+      if (!next.preventDefault) next.preventDefault = function preventDefault() { this.defaultPrevented = true; };
+      next.currentTarget = this;
+      return listeners[name](next);
+    },
+    focus(options) { this.focused = true; this.focusOptions = options; },
+    getBoundingClientRect() { return this.rect; },
+    getContext() { return context; },
+    setPointerCapture(pointerId) { capturedPointers.add(pointerId); this.captureCalls.push(pointerId); },
+    hasPointerCapture(pointerId) { return capturedPointers.has(pointerId); },
+    releasePointerCapture(pointerId) { capturedPointers.delete(pointerId); this.releaseCalls.push(pointerId); },
+    losePointerCapture(pointerId) {
+      if (!capturedPointers.delete(pointerId)) return;
+      this.dispatch('lostpointercapture', { pointerId });
+    },
+    listeners,
   };
 }
-
-function makeDocument(elementsById) {
-  const elements = new Map(Object.entries(elementsById || {}));
-  return {
-    getElementById(id) { return elements.get(id) || null; },
-    querySelectorAll() { return []; },
-    addEventListener() {},
-    body: { classList: { add() {}, remove() {} } },
-    activeElement: null,
-  };
-}
-
-// Loads api.js + dashboard.js (for formatBytes) + traffic.js into one sandbox,
-// the way index.html evaluates them as classic <script> tags sharing a global.
-function makeTrafficHarness(options) {
-  options = options || {};
+function harness(fetchImpl) {
   const elements = {
     'page-traffic': makeElement('page-traffic'),
-    'traffic-site-select': makeElement('traffic-site-select', { value: '1' }),
-    'traffic-hours-select': makeElement('traffic-hours-select', { value: '24' }),
+    'traffic-site-select': makeElement('traffic-site-select', '1'),
+    'traffic-hours-select': makeElement('traffic-hours-select', '1440'),
+    'traffic-chart-status': makeElement('traffic-chart-status'),
+    'traffic-chart-status-message': makeElement('traffic-chart-status-message'),
+    'traffic-chart-retry': makeElement('traffic-chart-retry'),
+    'traffic-point-detail': makeElement('traffic-point-detail'),
     'traffic-totals': makeElement('traffic-totals'),
     trafficChart: makeElement('trafficChart'),
   };
-
-  const intervals = [];
-  const cleared = [];
-  const calls = [];
-  let nextTimerId = 1;
-  let resizeListeners = 0;
-
+  const calls = [], intervals = [], cleared = [];
+  let timer = 0, resizeListeners = 0;
   const sandbox = {
-    window: {
-      addEventListener(name) { if (name === 'resize') resizeListeners++; },
-      devicePixelRatio: 1,
-    },
-    document: makeDocument(elements),
-    Toast: { error() {}, success() {}, info() {} },
-    console,
-    fetch: async (url, opts) => {
-      calls.push(String(url));
-      if (options.fetch) return options.fetch(url, opts);
-      return okJson({});
-    },
-    setInterval(cb, ms) { const id = nextTimerId++; intervals.push({ id, ms, cb }); return id; },
-    clearInterval(id) { cleared.push(id); },
-    setTimeout() { return 0; },
-    clearTimeout() {},
-    confirm: () => true,
-    Router: { current: 'traffic' },
+    window: { devicePixelRatio: 1, addEventListener(name) { if (name === 'resize') resizeListeners++; } },
+    document: { getElementById(id) { return elements[id] || null; }, querySelectorAll() { return []; }, body: { classList: { add() {}, remove() {} } } },
+    Router: { current: 'traffic' }, Toast: { error() {}, success() {}, info() {} }, console,
+    fetch: async (url, opts) => { calls.push(String(url)); return fetchImpl ? fetchImpl(url, opts) : okJson([]); },
+    setInterval(cb, ms) { const id = ++timer; intervals.push({ id, cb, ms }); return id; },
+    clearInterval(id) { cleared.push(id); }, setTimeout() { return 0; }, clearTimeout() {}, confirm() { return true; },
   };
   vm.createContext(sandbox);
   loadInto(sandbox, 'api.js', 'pages/dashboard.js', 'pages/traffic.js');
-  return { sandbox, elements, intervals, cleared, calls, resizeListeners };
+  return { sandbox, elements, calls, intervals, cleared, get resizeListeners() { return resizeListeners; } };
 }
 
-test('getTrafficSnapshot calls the additive snapshot endpoint; getTraffic is kept', async () => {
+function bucket(minute, incoming, outgoing, requests, extra) {
+  return Object.assign({ minute_start_unix: minute, bytes_in: incoming, bytes_out: outgoing, requests }, extra || {});
+}
+function countVerticalSegments(calls) {
+  return calls.reduce((count, call, index) => {
+    const previous = calls[index - 1];
+    if (call.name !== 'lineTo' || !previous || previous.name !== 'moveTo') return count;
+    const vertical = Math.abs(call.args[0] - previous.args[0]) < 1e-9
+      && Math.abs(call.args[1] - previous.args[1]) > 1e-9;
+    return count + (vertical ? 1 : 0);
+  }, 0);
+}
+
+test('traffic render starts refresh before issuing its live site request', async () => {
+  const h = harness(async url => String(url) === '/api/sites'
+    ? okJson([{ id: 1, name: 'Ready' }])
+    : okJson([]));
+  vm.runInContext('renderTraffic()', h.sandbox);
+  await flushTraffic();
+  assert.match(h.elements['traffic-site-select'].innerHTML, /Ready/);
+  assert.ok(h.calls.includes('/api/traffic/1/timeline?minutes=1440'));
+});
+test('API timeline helper uses the exact minute endpoint and default range', async () => {
   const calls = [];
-  const sandbox = {
-    window: {},
-    fetch: async (url) => { calls.push(String(url)); return okJson({ snapshot: { traffic_used: 7 }, logs: [] }); },
-  };
-  vm.createContext(sandbox);
-  loadInto(sandbox, 'api.js');
-
-  const data = await vm.runInContext('API.getTrafficSnapshot(7, 24)', sandbox);
-  assert.equal(calls[0], '/api/traffic/7/snapshot?hours=24');
-  assert.equal(data.snapshot.traffic_used, 7);
-  assert.deepEqual(data.logs, []);
-
-  await vm.runInContext('API.getTraffic(7, 24)', sandbox);
-  assert.equal(calls[1], '/api/traffic/7?hours=24', 'legacy getTraffic must remain available unchanged');
-
-  await vm.runInContext('API.getTrafficSnapshot(3)', sandbox);
-  assert.equal(calls[2], '/api/traffic/3/snapshot?hours=24', 'hours must default to 24');
+  const sandbox = { window: {}, fetch: async url => { calls.push(String(url)); return okJson([]); } };
+  vm.createContext(sandbox); loadInto(sandbox, 'api.js');
+  await vm.runInContext('API.getTrafficTimeline(7, 360)', sandbox);
+  await vm.runInContext('API.getTrafficTimeline(8)', sandbox);
+  assert.deepEqual(calls, ['/api/traffic/7/timeline?minutes=360', '/api/traffic/8/timeline?minutes=1440']);
 });
 
-test('traffic page paints totals from the snapshot and the chart from merged logs in one request', async () => {
-  const recordedAt = new Date(Date.now() - 3600000).toISOString();
-  const h = makeTrafficHarness({
-    fetch: async (url) => {
-      if (String(url) === '/api/traffic/1/snapshot?hours=24') {
-        return okJson({
-          snapshot: {
-            id: 1, name: 'Alpha', running: true, traffic_used: 1000000, traffic_quota: 5000000,
-            persisted_traffic: 0, bytes_in: 1000000, bytes_out: 0, requests: 3,
-          },
-          logs: [{ id: 9, site_id: 1, bytes_in: 400000, bytes_out: 600000, recorded_at: recordedAt }],
-        });
-      }
-      return okJson({});
-    },
-  });
-
+test('chart makes one request, keeps exact public buckets, and starts without a minute selection', async () => {
+  const h = harness(async () => okJson([
+    bucket(60, 100, 200, 1, { site_id: 99, client_ip: 'secret', name: 'private' }),
+    bucket(120, 300, 400, 2),
+  ]));
   await vm.runInContext('loadTrafficChart()', h.sandbox);
-
-  assert.deepEqual(
-    h.calls,
-    ['/api/traffic/1/snapshot?hours=24'],
-    'the chart must load from a single snapshot request, not a second listSites call',
-  );
-  const totals = h.elements['traffic-totals'].innerHTML;
-  assert.ok(totals.includes(h.sandbox.formatBytes(400000)), 'inbound total must come from the returned logs');
-  assert.ok(totals.includes(h.sandbox.formatBytes(600000)), 'outbound total must come from the returned logs');
-  assert.ok(totals.includes(h.sandbox.formatBytes(1000000)), 'cumulative total must come from snapshot.traffic_used');
-  assert.ok(
-    totals.includes('额度') && totals.includes(h.sandbox.formatBytes(5000000)),
-    'quota line must come from snapshot.traffic_quota',
-  );
-  assert.equal(h.elements.trafficChart.width, 800, 'chart must be drawn from the merged logs');
+  assert.deepEqual(h.calls, ['/api/traffic/1/timeline?minutes=1440']);
+  assert.equal(h.elements.trafficChart.width, 800);
+  assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), null);
+  assert.equal(h.elements['traffic-point-detail'].hidden, true);
+  assert.equal(h.elements.trafficChart.getAttribute('aria-valuetext'), null);
+  assert.equal(countVerticalSegments(h.elements.trafficChart.context.calls), 0);
+  assert.equal(h.elements.trafficChart.context.calls.filter(call => call.name === 'arc').length, 0);
+  const safe = JSON.parse(vm.runInContext('JSON.stringify(trafficChartState.buckets)', h.sandbox));
+  assert.deepEqual(Object.keys(safe[0]).sort(), ['bytes_in', 'bytes_out', 'minute_start_unix', 'requests']);
+  assert.equal(safe.length, 2);
+  assert.equal(safe[0].minute_start_unix, 60);
+  assert.ok(!h.elements['traffic-point-detail'].innerHTML.includes('secret'));
 });
 
-test('no quota line is rendered when the site has no quota', async () => {
-  const h = makeTrafficHarness({
-    fetch: async (url) => {
-      if (String(url) === '/api/traffic/1/snapshot?hours=24') {
-        return okJson({ snapshot: { traffic_used: 42, traffic_quota: 0 }, logs: [] });
-      }
-      return okJson({});
-    },
-  });
-
-  await vm.runInContext('loadTrafficChart()', h.sandbox);
-
-  const totals = h.elements['traffic-totals'].innerHTML;
-  assert.ok(totals.includes(h.sandbox.formatBytes(42)), 'cumulative total must still render');
-  assert.ok(!totals.includes('额度'), 'a zero quota must not render a quota line');
-});
-
-test('traffic refresh timer ticks every 15s and only while the traffic route is active', () => {
-  const h = makeTrafficHarness();
-  vm.runInContext('startTrafficRefresh()', h.sandbox);
-  assert.equal(h.intervals.length, 1);
-  assert.equal(h.intervals[0].ms, 15000);
-
-  const tick = h.intervals[0].cb;
-  h.sandbox.Router.current = 'dashboard';
-  tick();
-  assert.equal(h.calls.length, 0, 'timer must not fetch while another route is active');
-
-  h.sandbox.Router.current = 'traffic';
-  tick();
-  assert.equal(h.calls.length, 1);
-  assert.equal(h.calls[0], '/api/traffic/1/snapshot?hours=24');
-
-  vm.runInContext('stopTrafficRefresh()', h.sandbox);
-  assert.deepEqual(h.cleared, [h.intervals[0].id], 'stopTrafficRefresh must clear the interval');
-});
-
-test('renderTraffic restarts the timer and never re-registers the resize listener', async () => {
-  const h = makeTrafficHarness({
-    fetch: async (url) => {
-      if (String(url) === '/api/sites') return okJson([{ id: 1, name: 'Alpha' }]);
-      if (String(url) === '/api/traffic/1/snapshot?hours=24') return okJson({ snapshot: { traffic_used: 0, traffic_quota: 0 }, logs: [] });
-      return okJson({});
-    },
-  });
-  assert.equal(h.resizeListeners, 1, 'resize must be registered once when the script loads');
-
-  await vm.runInContext('renderTraffic()', h.sandbox);
-  assert.equal(h.intervals.length, 1);
-  assert.equal(h.intervals[0].ms, 15000);
-
-  await vm.runInContext('renderTraffic()', h.sandbox);
-  assert.equal(h.intervals.length, 2);
-  assert.deepEqual(h.cleared, [h.intervals[0].id], 'a re-render must stop the previous timer before starting a new one');
-  assert.equal(h.resizeListeners, 1, 're-rendering must not add another resize listener');
-});
-
-test('leaving the traffic route stops the refresh timer; staying keeps it', () => {
-  const cleared = [];
-  let nextTimerId = 1;
-  const sandbox = {
-    window: { addEventListener() {} },
-    document: {
-      getElementById() { return null; },
-      querySelectorAll() { return []; },
-    },
-    location: { hash: '#traffic' },
-    console,
-    setInterval() { return nextTimerId++; },
-    clearInterval(id) { cleared.push(id); },
+test('all four range cards sum every API bucket before and after point selection', async () => {
+  const contracts = {
+    60: { label: '最近 1 小时', incoming: 40, outgoing: 60, requests: 3, buckets: [bucket(1, 10, 20, 1), bucket(2, 30, 40, 2)] },
+    360: { label: '最近 6 小时', incoming: 10, outgoing: 12, requests: 14, buckets: [bucket(3, 3, 4, 5), bucket(4, 7, 8, 9)] },
+    1440: { label: '最近 24 小时', incoming: 400, outgoing: 600, requests: 3, buckets: [bucket(5, 100, 200, 1), bucket(6, 300, 400, 2)] },
+    10080: { label: '最近 7 天', incoming: 900, outgoing: 400, requests: 23, buckets: [bucket(7, 500, 100, 11), bucket(8, 400, 300, 12)] },
   };
-  vm.createContext(sandbox);
-  loadInto(sandbox, 'pages/traffic.js', 'router.js');
+  const h = harness(async url => {
+    const match = /minutes=(\d+)/.exec(String(url));
+    return okJson(contracts[match[1]].buckets);
+  });
 
-  vm.runInContext('Router.resolve()', sandbox);
-  assert.equal(vm.runInContext('Router.current', sandbox), 'traffic');
-  vm.runInContext('startTrafficRefresh()', sandbox);
-  const timerId = nextTimerId - 1;
+  for (const [minutes, contract] of Object.entries(contracts)) {
+    h.elements['traffic-hours-select'].value = minutes;
+    await vm.runInContext('loadTrafficChart({ resetSelection: true })', h.sandbox);
+    const beforeSelection = h.elements['traffic-totals'].innerHTML;
+    assert.ok(beforeSelection.includes(`${contract.label} · 入站总量</div><div class="total-value">${contract.incoming} B</div>`));
+    assert.ok(beforeSelection.includes(`${contract.label} · 出站总量</div><div class="total-value">${contract.outgoing} B</div>`));
+    assert.ok(beforeSelection.includes(`${contract.label} · 请求总数</div><div class="total-value">${contract.requests}</div>`));
+    assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), null);
 
-  sandbox.location.hash = '#traffic';
-  vm.runInContext('Router.resolve()', sandbox);
-  assert.deepEqual(cleared, [], 'staying on traffic must keep the timer alive');
-
-  sandbox.location.hash = '#sites';
-  vm.runInContext('Router.resolve()', sandbox);
-  assert.deepEqual(cleared, [timerId], 'leaving traffic must stop the refresh timer');
+    vm.runInContext('selectTrafficPoint(0)', h.sandbox);
+    assert.equal(h.elements['traffic-totals'].innerHTML, beforeSelection);
+    assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), contract.buckets[0].minute_start_unix);
+    assert.match(h.elements['traffic-point-detail'].innerHTML, new RegExp(`请求 ${contract.buckets[0].requests}`));
+  }
 });
 
-test('logout tears down the traffic refresh timer', async () => {
-  const elementIds = [
-    'page-login', 'app-shell', 'login-footer', 'btn-login', 'setup-token-group',
-    'setup-token-input', 'inp-setup-token', 'modal-overlay', 'modal-close',
-    'loginForm', 'avatar-btn', 'inp-username', 'inp-password',
+test('site and range resets clear a pinned minute immediately and after the response', async () => {
+  const waiting = [];
+  let request = 0;
+  const h = harness(async () => {
+    request++;
+    if (request === 1) return okJson([bucket(60, 1, 2, 3), bucket(120, 4, 5, 6)]);
+    return new Promise(resolve => waiting.push(resolve));
+  });
+  await vm.runInContext('loadTrafficChart()', h.sandbox);
+  vm.runInContext('selectTrafficPoint(1)', h.sandbox);
+
+  h.elements.trafficChart.context.calls.length = 0;
+  h.elements['traffic-hours-select'].value = '60';
+  const rangeRequest = vm.runInContext('loadTrafficChart({ resetSelection: true })', h.sandbox);
+  assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), null);
+  assert.equal(h.elements['traffic-point-detail'].hidden, true);
+  waiting.shift()(okJson([bucket(180, 7, 8, 9), bucket(240, 10, 11, 12)]));
+  await rangeRequest;
+  assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), null);
+  assert.equal(countVerticalSegments(h.elements.trafficChart.context.calls), 0);
+
+  vm.runInContext('selectTrafficPoint(1)', h.sandbox);
+  h.elements.trafficChart.context.calls.length = 0;
+  h.elements['traffic-site-select'].value = '2';
+  const siteRequest = vm.runInContext('loadTrafficChart({ resetSelection: true })', h.sandbox);
+  assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), null);
+  assert.equal(h.elements['traffic-point-detail'].hidden, true);
+  waiting.shift()(okJson([bucket(300, 13, 14, 15)]));
+  await siteRequest;
+  assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), null);
+  assert.equal(countVerticalSegments(h.elements.trafficChart.context.calls), 0);
+});
+test('zero-traffic chart renders defined byte-axis labels', async () => {
+  const h = harness(async () => okJson([bucket(60, 0, 0, 0)]));
+  const labels = [];
+  h.elements.trafficChart.getContext = () => ({
+    ...makeContext(),
+    fillText(value) { labels.push(String(value)); },
+  });
+  await vm.runInContext('loadTrafficChart()', h.sandbox);
+  assert.equal(labels.slice(0, 5).some(label => label.includes('undefined')), false);
+  assert.deepEqual(labels.slice(0, 5), ['5 B', '3 B', '2 B', '1 B', '0 B']);
+});
+
+test('traffic series use bounded five-point cubic smoothing without mutating source buckets', async () => {
+  const points = [
+    bucket(60, 0, 300, 1), bucket(120, 400, 50, 2),
+    bucket(180, 25, 275, 3), bucket(240, 350, 100, 4),
   ];
-  const elements = {};
-  const listeners = {};
-  for (const id of elementIds) {
-    const el = makeElement(id);
-    el.addEventListener = (event, cb) => {
-      (listeners[id] = listeners[id] || {})[event] = cb;
-    };
-    elements[id] = el;
+  const h = harness(async () => okJson(points));
+  await vm.runInContext('loadTrafficChart()', h.sandbox);
+  const before = vm.runInContext('JSON.stringify(trafficChartState.buckets)', h.sandbox);
+  const smoothedIncoming = JSON.parse(vm.runInContext(
+    "JSON.stringify([0, 1, 2, 3].map(index => smoothedTrafficValue(trafficChartState.buckets, 'bytes_in', index)))",
+    h.sandbox,
+  ));
+  assert.deepEqual(smoothedIncoming, [0, 178.125, 218.75, 350]);
+
+  const calls = h.elements.trafficChart.context.calls;
+  const curves = calls.filter(call => call.name === 'bezierCurveTo');
+  assert.equal(curves.length, 2 * (points.length - 1));
+  assert.equal(calls.filter(call => call.name === 'quadraticCurveTo').length, 0);
+  assert.equal(calls.filter(call => call.name === 'lineTo').length, 5);
+
+  const seriesStarts = calls.filter(call => call.name === 'moveTo').slice(-2);
+  assert.equal(seriesStarts.length, 2);
+  for (let series = 0; series < 2; series++) {
+    let previousX = seriesStarts[series].args[0];
+    let previousY = seriesStarts[series].args[1];
+    for (const curve of curves.slice(series * (points.length - 1), (series + 1) * (points.length - 1))) {
+      const [control1X, control1Y, control2X, control2Y, currentX, currentY] = curve.args;
+      assert.ok(curve.args.every(Number.isFinite));
+      assert.ok(control1X >= previousX && control1X <= currentX);
+      assert.ok(control2X >= previousX && control2X <= currentX);
+      const lowerY = Math.min(previousY, currentY), upperY = Math.max(previousY, currentY);
+      assert.ok(control1Y >= lowerY && control1Y <= upperY);
+      assert.ok(control2Y >= lowerY && control2Y <= upperY);
+      assert.ok(currentX >= 64 && currentX <= 768);
+      assert.ok(currentY >= 20 && currentY <= 236);
+      previousX = currentX;
+      previousY = currentY;
+    }
   }
 
-  const calls = [];
-  const cleared = [];
-  let nextTimerId = 1;
-  const sandbox = {
-    window: { addEventListener() {} },
-    document: makeDocument(elements),
-    Toast: { error() {}, success() {}, info() {} },
-    console,
-    confirm: () => true,
-    // app.js assigns window.closeModal but reads the bare global at load time
-    // (modal-close click handler), which this sandbox must provide up front.
-    closeModal() {},
-    fetch: async (url) => { calls.push(String(url)); return okJson({}); },
-    setInterval() { return nextTimerId++; },
-    clearInterval(id) { cleared.push(id); },
-    setTimeout() { return 0; },
-    clearTimeout() {},
-    location: { hash: '#dashboard' },
-  };
-  vm.createContext(sandbox);
-  // app.js runs checkAuth() at load; the stub reports an unauthenticated session.
-  loadInto(sandbox, 'api.js', 'pages/dashboard.js', 'pages/traffic.js', 'app.js');
-
-  vm.runInContext('startTrafficRefresh()', sandbox);
-  const timerId = nextTimerId - 1;
-
-  await listeners['avatar-btn'].click();
-
-  assert.deepEqual(cleared, [timerId], 'logout must stop the traffic refresh timer');
-  assert.ok(calls.includes('/api/auth/logout'), 'logout must POST the session away');
-  assert.equal(vm.runInContext('API.authenticated', sandbox), false);
+  vm.runInContext('drawTrafficChart(trafficChartState.buckets)', h.sandbox);
+  assert.equal(vm.runInContext('JSON.stringify(trafficChartState.buckets)', h.sandbox), before);
+  assert.equal(JSON.parse(before).length, points.length);
 });
 
-test('a late snapshot response cannot paint over a different route', async () => {
-  const h = makeTrafficHarness();
-  let resolveFetch;
-  const gate = new Promise(resolve => { resolveFetch = resolve; });
-  h.sandbox.fetch = async () => gate;
+test('mobile chart limits timestamp labels before they overlap', async () => {
+  const h = harness(async () => okJson([
+    bucket(60, 1, 2, 3), bucket(120, 4, 5, 6), bucket(180, 7, 8, 9),
+    bucket(240, 10, 11, 12), bucket(300, 13, 14, 15),
+  ]));
+  h.elements.trafficChart.rect.width = 328;
+  h.elements.trafficChart.parentElement.clientWidth = 328;
+  await vm.runInContext('loadTrafficChart()', h.sandbox);
+  const mobileLabels = h.elements.trafficChart.context.calls.filter(call => call.name === 'fillText');
+  assert.equal(mobileLabels.length, 7, 'five y-axis labels plus two timestamp labels');
 
+  h.elements.trafficChart.context.calls.length = 0;
+  h.elements.trafficChart.rect.width = 500;
+  vm.runInContext('drawTrafficChart(trafficChartState.buckets)', h.sandbox);
+  const widerLabels = h.elements.trafficChart.context.calls.filter(call => call.name === 'fillText');
+  assert.equal(widerLabels.length, 8, 'a wider chart can show three timestamp labels');
+});
+
+test('loading, empty, error, and retry states are explicit', async () => {
+  let reject;
+  const pendingResponse = new Promise((resolve, rejectPromise) => { reject = rejectPromise; });
+  const h = harness(async () => pendingResponse);
   const pending = vm.runInContext('loadTrafficChart()', h.sandbox);
-  h.sandbox.Router.current = 'sites';
-  resolveFetch(okJson({ snapshot: { traffic_used: 999999 }, logs: [] }));
+  assert.match(h.elements['traffic-chart-status'].className, /loading/);
+  reject(new Error('offline'));
   await pending;
+  assert.match(h.elements['traffic-chart-status'].className, /error/);
+  assert.equal(h.elements['traffic-chart-retry'].hidden, false);
+  assert.equal(vm.runInContext('typeof trafficRetryAction', h.sandbox), 'function');
 
-  assert.equal(h.elements['traffic-totals'].innerHTML, '', 'a response arriving after leaving must not paint totals');
-  assert.equal(h.elements.trafficChart.width, undefined, 'a response arriving after leaving must not draw the chart');
+  h.sandbox.fetch = async url => { h.calls.push(String(url)); return okJson([bucket(60, 0, 0, 0)]); };
+  await vm.runInContext('trafficRetryAction()', h.sandbox);
+  assert.match(h.elements['traffic-chart-status'].className, /empty/);
+  assert.match(h.elements['traffic-chart-status-message'].textContent, /暂无/);
 });
 
-test('a late snapshot response cannot paint over a different site selection', async () => {
-  const h = makeTrafficHarness();
-  let resolveFetch;
-  const gate = new Promise(resolve => { resolveFetch = resolve; });
-  h.sandbox.fetch = async () => gate;
-
+test('stale response cannot paint after site selection changes', async () => {
+  let resolve;
+  const gate = new Promise(next => { resolve = next; });
+  const h = harness(async () => gate);
   const pending = vm.runInContext('loadTrafficChart()', h.sandbox);
   h.elements['traffic-site-select'].value = '2';
-  resolveFetch(okJson({ snapshot: { traffic_used: 999999 }, logs: [] }));
+  resolve(okJson([bucket(60, 99, 88, 1)]));
   await pending;
-
-  assert.equal(h.elements['traffic-totals'].innerHTML, '', 'a response for the old selection must not paint');
+  assert.equal(h.elements['traffic-totals'].innerHTML, '');
   assert.equal(h.elements.trafficChart.width, undefined);
 });
 
-test('site list responses arriving after leaving the route are dropped', async () => {
-  const h = makeTrafficHarness();
-  let resolveFetch;
-  const gate = new Promise(resolve => { resolveFetch = resolve; });
-  h.sandbox.fetch = async () => gate;
-
-  const pending = vm.runInContext('loadTrafficSites()', h.sandbox);
-  h.sandbox.Router.current = 'sites';
-  h.sandbox.fetch = async () => { h.calls.push('fetched'); return gate; };
-  resolveFetch(okJson([{ id: 1, name: 'Alpha' }]));
+test('refresh is one 15-second timer and teardown clears it and invalidates late requests', async () => {
+  let resolve;
+  const gate = new Promise(next => { resolve = next; });
+  const h = harness(async () => gate);
+  vm.runInContext('startTrafficRefresh()', h.sandbox);
+  assert.equal(h.intervals.length, 1);
+  assert.equal(h.intervals[0].ms, 15000);
+  const pending = vm.runInContext('loadTrafficChart()', h.sandbox);
+  vm.runInContext('stopTrafficRefresh()', h.sandbox);
+  assert.deepEqual(h.cleared, [h.intervals[0].id]);
+  resolve(okJson([bucket(60, 1, 2, 3)]));
   await pending;
-
-  assert.equal(h.elements['traffic-site-select'].innerHTML, '', 'sites must not populate after leaving the page');
-  assert.deepEqual(h.calls, [], 'no chart request may follow a dropped site list');
+  assert.equal(h.elements['traffic-totals'].innerHTML, '');
 });
-
-test('site list populates the select and auto-loads the chart for the first site', async () => {
-  const h = makeTrafficHarness({
-    fetch: async (url) => {
-      if (String(url) === '/api/sites') return okJson([{ id: 1, name: 'Alpha' }]);
-      return okJson({ snapshot: { traffic_used: 0, traffic_quota: 0 }, logs: [] });
-    },
+test('stale site list cannot overwrite a newer traffic-page instance', async () => {
+  let resolveFirst;
+  let siteRequests = 0;
+  const h = harness(async url => {
+    if (String(url) === '/api/sites') {
+      siteRequests++;
+      if (siteRequests === 1) return new Promise(resolve => { resolveFirst = resolve; });
+      return okJson([{ id: 2, name: 'Fresh' }]);
+    }
+    return okJson([]);
   });
-
-  await vm.runInContext('loadTrafficSites()', h.sandbox);
-
-  assert.ok(h.elements['traffic-site-select'].innerHTML.includes('Alpha'), 'select must be populated with the site name');
-  assert.deepEqual(h.calls, ['/api/sites', '/api/traffic/1/snapshot?hours=24'], 'populating must trigger one chart load');
+  const stale = vm.runInContext('loadTrafficSites()', h.sandbox);
+  vm.runInContext('stopTrafficRefresh()', h.sandbox);
+  const fresh = vm.runInContext('loadTrafficSites()', h.sandbox);
+  await fresh;
+  resolveFirst(okJson([{ id: 1, name: 'Stale' }]));
+  await stale;
+  assert.match(h.elements['traffic-site-select'].innerHTML, /Fresh/);
+  assert.doesNotMatch(h.elements['traffic-site-select'].innerHTML, /Stale/);
 });
 
-test('dashboard table paints live traffic_used and the running badge from one /api/sites request', async () => {
-  const elements = {
-    'dash-table': makeElement('dash-table'),
-  };
-  const calls = [];
-  const sandbox = {
-    window: {},
-    document: makeDocument(elements),
-    console,
-    Toast: { error() {}, success() {}, info() {} },
-    fetch: async (url) => {
-      calls.push(String(url));
-      return okJson([
-        { id: 1, name: 'Alpha', target_url: 'http://a.example', ua_mode: 'infuse', listen_port: 8001, running: true, traffic_used: 1048576 },
-        { id: 2, name: 'Beta', target_url: 'http://b.example', ua_mode: 'web', listen_port: 8002, running: false, traffic_used: 0 },
-      ]);
-    },
-    Router: { current: 'dashboard' },
-    setInterval() { return 1; },
-    clearInterval() {},
-    setTimeout() { return 0; },
-    clearTimeout() {},
-  };
-  vm.createContext(sandbox);
-  loadInto(sandbox, 'api.js', 'pages/dashboard.js');
+test('pointermove without a press never selects a minute', async () => {
+  const h = harness(async url => String(url) === '/api/sites'
+    ? okJson([{ id: 1, name: 'Ready' }])
+    : okJson([bucket(60, 1, 2, 3), bucket(120, 4, 5, 6), bucket(180, 7, 8, 9)]));
+  vm.runInContext('renderTraffic()', h.sandbox);
+  await flushTraffic();
+  h.elements.trafficChart.dispatch('pointermove', { pointerId: 5, pointerType: 'mouse', clientX: 400 });
+  assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), null);
+  assert.equal(h.elements['traffic-point-detail'].hidden, true);
+  assert.equal(h.elements.trafficChart.focused, undefined);
+  assert.deepEqual(h.elements.trafficChart.captureCalls, []);
+});
 
-  await vm.runInContext('loadDashboardTable()', sandbox);
+test('press-drag scrubbing clamps exact buckets and clears every capture lifecycle', async () => {
+  const h = harness(async url => String(url) === '/api/sites'
+    ? okJson([{ id: 1, name: 'Ready' }])
+    : okJson([bucket(60, 1, 2, 3), bucket(120, 4, 5, 6), bucket(180, 7, 8, 9)]));
+  vm.runInContext('renderTraffic()', h.sandbox);
+  await flushTraffic();
+  const canvas = h.elements.trafficChart;
 
-  assert.deepEqual(calls, ['/api/sites'], 'the dashboard table must load from exactly one /api/sites request');
-  const html = elements['dash-table'].innerHTML;
-  assert.ok(html.includes('Alpha') && html.includes('Beta'), 'every site must be rendered');
-  assert.ok(html.includes(sandbox.formatBytes(1048576)), 'the authoritative traffic_used must be formatted into the row');
-  assert.ok(html.includes('运行中') && html.includes('已停止'), 'the running flag must drive the status badge');
+  const touchDown = { pointerId: 10, pointerType: 'touch', button: 0, clientX: -500 };
+  canvas.dispatch('pointerdown', touchDown);
+  assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), 60);
+  assert.equal(vm.runInContext('trafficChartState.scrubPointerId', h.sandbox), 10);
+  assert.equal(canvas.hasPointerCapture(10), true);
+  assert.equal(canvas.classList.contains('is-scrubbing'), true);
+  assert.equal(canvas.focused, true);
+  assert.equal(touchDown.defaultPrevented, true);
+
+  canvas.dispatch('pointermove', { pointerId: 10, pointerType: 'touch', clientX: 5000 });
+  assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), 180);
+  assert.match(h.elements['traffic-point-detail'].innerHTML, /请求 9/);
+  canvas.dispatch('pointermove', { pointerId: 99, pointerType: 'touch', clientX: -500 });
+  assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), 180);
+  canvas.dispatch('pointerup', { pointerId: 10, pointerType: 'touch', clientX: 5000 });
+  assert.equal(vm.runInContext('trafficChartState.scrubPointerId', h.sandbox), null);
+  assert.equal(canvas.hasPointerCapture(10), false);
+  assert.equal(canvas.classList.contains('is-scrubbing'), false);
+  canvas.dispatch('pointermove', { pointerId: 10, pointerType: 'touch', clientX: -500 });
+  assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), 180);
+
+  canvas.dispatch('pointerdown', { pointerId: 11, pointerType: 'mouse', button: 0, clientX: 400 });
+  assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), 120);
+  canvas.dispatch('pointercancel', { pointerId: 11, pointerType: 'mouse' });
+  assert.equal(vm.runInContext('trafficChartState.scrubPointerId', h.sandbox), null);
+  assert.equal(canvas.classList.contains('is-scrubbing'), false);
+
+  canvas.dispatch('pointerdown', { pointerId: 12, pointerType: 'mouse', button: 2, clientX: 5000 });
+  assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), 120);
+  assert.equal(canvas.hasPointerCapture(12), false);
+
+  canvas.dispatch('pointerdown', { pointerId: 13, pointerType: 'touch', button: 0, clientX: -500 });
+  assert.equal(canvas.hasPointerCapture(13), true);
+  canvas.losePointerCapture(13);
+  assert.equal(vm.runInContext('trafficChartState.scrubPointerId', h.sandbox), null);
+  assert.equal(canvas.classList.contains('is-scrubbing'), false);
+  assert.deepEqual(canvas.captureCalls, [10, 11, 13]);
+  assert.deepEqual(canvas.releaseCalls, [10, 11]);
+});
+
+test('Left Right Home End navigate the pinned point', async () => {
+  const h = harness(async () => okJson([bucket(60, 1, 1, 1), bucket(120, 2, 2, 2), bucket(180, 3, 3, 3)]));
+  await vm.runInContext('loadTrafficChart()', h.sandbox);
+  assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), null);
+  let prevented = 0;
+  h.sandbox.keyEvent = { key: 'ArrowLeft', preventDefault() { prevented++; } };
+  vm.runInContext('navigateTrafficPoint(keyEvent)', h.sandbox);
+  assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), 120);
+  h.sandbox.keyEvent.key = 'Home'; vm.runInContext('navigateTrafficPoint(keyEvent)', h.sandbox);
+  assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), 60);
+  h.sandbox.keyEvent.key = 'End'; vm.runInContext('navigateTrafficPoint(keyEvent)', h.sandbox);
+  assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), 180);
+  assert.equal(prevented, 3);
+});
+
+test('the 15-second same-series refresh preserves a selected timestamp', async () => {
+  let call = 0;
+  const h = harness(async () => {
+    call++;
+    return okJson([bucket(60, call, 0, call), bucket(120, call, 0, call), bucket(180, call, 0, call)]);
+  });
+  vm.runInContext('startTrafficRefresh()', h.sandbox);
+  await vm.runInContext('loadTrafficChart()', h.sandbox);
+  assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), null);
+  vm.runInContext('selectTrafficPoint(1)', h.sandbox);
+  h.intervals[0].cb();
+  await flushTraffic();
+  assert.equal(call, 2);
+  assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), 120);
+  assert.match(h.elements['traffic-point-detail'].innerHTML, /请求 2/);
+});
+
+test('same-series refresh keeps a newer selection made while its request is pending', async () => {
+  let call = 0;
+  let resolveRefresh;
+  const points = [bucket(60, 1, 0, 1), bucket(120, 2, 0, 2), bucket(180, 3, 0, 3)];
+  const h = harness(async () => {
+    call++;
+    if (call === 1) return okJson(points);
+    return new Promise(resolve => { resolveRefresh = resolve; });
+  });
+  await vm.runInContext('loadTrafficChart()', h.sandbox);
+  vm.runInContext('selectTrafficPoint(0)', h.sandbox);
+
+  const refresh = vm.runInContext('loadTrafficChart()', h.sandbox);
+  vm.runInContext('selectTrafficPoint(2)', h.sandbox);
+  resolveRefresh(okJson([bucket(60, 10, 0, 10), bucket(120, 20, 0, 20), bucket(180, 30, 0, 30)]));
+  await refresh;
+
+  assert.equal(vm.runInContext('trafficChartState.selectedTimestamp', h.sandbox), 180);
+  assert.match(h.elements['traffic-point-detail'].innerHTML, /请求 30/);
+});
+
+test('traffic interaction stays press-only, smooth, and touch-scrubbable', () => {
+  const source = fs.readFileSync(path.join(STATIC_JS, 'pages/traffic.js'), 'utf8');
+  const css = fs.readFileSync(path.join(__dirname, '..', 'web', 'static', 'css', 'style.css'), 'utf8');
+  assert.ok(!/<table/i.test(source));
+  assert.ok(!/mousemove|mouseover|mouseenter/.test(source));
+  assert.match(source, /pointerdown/);
+  assert.match(source, /pointermove/);
+  assert.match(source, /pointercancel/);
+  assert.match(source, /lostpointercapture/);
+  assert.match(source, /setPointerCapture/);
+  assert.match(source, /bezierCurveTo/);
+  assert.match(source, /ArrowLeft/);
+  assert.match(css, /canvas#trafficChart\s*\{[^}]*touch-action:\s*none/s);
+  assert.match(css, /canvas#trafficChart\.is-scrubbing/);
 });

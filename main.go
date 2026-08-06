@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"container/list"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -288,11 +289,12 @@ type DynamicProfileLimits struct {
 }
 
 type DynamicProfile struct {
-	ID          string               `json:"id"`
-	Label       string               `json:"label"`
-	Recommended bool                 `json:"recommended"`
-	Limits      DynamicProfileLimits `json:"limits"`
-	Features    DynamicFeatureFlags  `json:"features"`
+	ID               string               `json:"id"`
+	Label            string               `json:"label"`
+	Recommended      bool                 `json:"recommended"`
+	DiscoverySources []string             `json:"discovery_sources"`
+	Limits           DynamicProfileLimits `json:"limits"`
+	Features         DynamicFeatureFlags  `json:"features"`
 }
 
 type DynamicGlobalLimits struct {
@@ -312,20 +314,37 @@ type DynamicGlobalLimits struct {
 	MaxTargetURLBytes            int   `json:"max_target_url_bytes"`
 }
 
+type DynamicDefaultPolicy struct {
+	DynamicDiscoveryEnabled    bool                `json:"dynamic_discovery_enabled"`
+	DynamicProfile             string              `json:"dynamic_profile"`
+	DynamicDiscoverySources    []string            `json:"dynamic_discovery_sources"`
+	DynamicDomainRules         []DynamicDomainRule `json:"dynamic_domain_rules"`
+	DynamicAllowHTTPSDowngrade bool                `json:"dynamic_allow_https_downgrade"`
+}
+
+type DynamicRollbackReadiness struct {
+	EnabledSafeEmptyRules      int64 `json:"enabled_safe_empty_rules"`
+	EnabledLegacySourceSubsets int64 `json:"enabled_legacy_source_subsets"`
+}
+
 type DynamicProfilesResponse struct {
-	Stage         string              `json:"stage"`
-	Available     bool                `json:"available"`
-	KeyConfigured bool                `json:"key_configured"`
-	Profiles      []DynamicProfile    `json:"profiles"`
-	GlobalLimits  DynamicGlobalLimits `json:"global_limits"`
+	Stage               string                   `json:"stage"`
+	Available           bool                     `json:"available"`
+	KeyConfigured       bool                     `json:"key_configured"`
+	DefaultPolicy       DynamicDefaultPolicy     `json:"default_policy"`
+	EmptyRulesSemantics string                   `json:"empty_rules_semantics"`
+	RollbackReadiness   DynamicRollbackReadiness `json:"rollback_readiness"`
+	Profiles            []DynamicProfile         `json:"profiles"`
+	GlobalLimits        DynamicGlobalLimits      `json:"global_limits"`
 }
 
 func dynamicProfilesCatalog() []DynamicProfile {
 	return []DynamicProfile{
 		{
-			ID:          dynamicProfileSafe,
-			Label:       "Safe",
-			Recommended: true,
+			ID:               dynamicProfileSafe,
+			Label:            "Safe",
+			Recommended:      true,
+			DiscoverySources: []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourcePlaybackInfo},
 			Limits: DynamicProfileLimits{
 				AllowedSchemes:             []string{"https"},
 				AllowedPorts:               []int{443},
@@ -344,9 +363,10 @@ func dynamicProfilesCatalog() []DynamicProfile {
 			Features: DynamicFeatureFlags{RedirectDiscovery: true, PlaybackInfo: true},
 		},
 		{
-			ID:          dynamicProfileCompatible,
-			Label:       "Compatible",
-			Recommended: false,
+			ID:               dynamicProfileCompatible,
+			Label:            "Compatible",
+			Recommended:      false,
+			DiscoverySources: allDynamicDiscoverySources(),
 			Limits: DynamicProfileLimits{
 				AllowedSchemes:             []string{"http", "https"},
 				AllowedPorts:               []int{},
@@ -365,9 +385,10 @@ func dynamicProfilesCatalog() []DynamicProfile {
 			Features: DynamicFeatureFlags{RedirectDiscovery: true, PlaybackInfo: true, HLS: true, DASH: true},
 		},
 		{
-			ID:          dynamicProfileExtreme,
-			Label:       "Extreme",
-			Recommended: false,
+			ID:               dynamicProfileExtreme,
+			Label:            "Extreme",
+			Recommended:      false,
+			DiscoverySources: allDynamicDiscoverySources(),
 			Limits: DynamicProfileLimits{
 				AllowedSchemes:             []string{"http", "https"},
 				AllowedPorts:               []int{},
@@ -385,6 +406,16 @@ func dynamicProfilesCatalog() []DynamicProfile {
 			},
 			Features: DynamicFeatureFlags{RedirectDiscovery: true, PlaybackInfo: true, HLS: true, DASH: true},
 		},
+	}
+}
+func dynamicDefaultPolicy() DynamicDefaultPolicy {
+	sources, _ := dynamicDiscoverySourcesForProfile(dynamicProfileSafe)
+	return DynamicDefaultPolicy{
+		DynamicDiscoveryEnabled:    true,
+		DynamicProfile:             dynamicProfileSafe,
+		DynamicDiscoverySources:    sources,
+		DynamicDomainRules:         []DynamicDomainRule{},
+		DynamicAllowHTTPSDowngrade: false,
 	}
 }
 
@@ -536,6 +567,16 @@ func dynamicDomainRuleMatches(host string, rules []DynamicDomainRule) bool {
 	}
 	return false
 }
+func dynamicSafeDomainAllowed(host string, rules []DynamicDomainRule) bool {
+	normalizedHost, isIP, err := normalizeDynamicHost(host)
+	if err != nil || isIP {
+		return false
+	}
+	if len(rules) == 0 {
+		return true
+	}
+	return dynamicDomainRuleMatches(normalizedHost, rules)
+}
 
 func decodeDynamicDomainRules(raw string) ([]DynamicDomainRule, error) {
 	decoder := json.NewDecoder(strings.NewReader(raw))
@@ -551,6 +592,32 @@ func decodeDynamicDomainRules(raw string) ([]DynamicDomainRule, error) {
 		return nil, fmt.Errorf("invalid dynamic_domain_rules JSON: %w", err)
 	}
 	return rules, nil
+}
+func decodeDynamicDomainRulesAPI(raw json.RawMessage) ([]DynamicDomainRule, bool, error) {
+	if len(raw) == 0 {
+		return nil, false, nil
+	}
+	rules, err := decodeDynamicDomainRules(string(raw))
+	if err != nil {
+		return nil, true, err
+	}
+	if rules == nil {
+		return nil, true, fmt.Errorf("dynamic_domain_rules must be a JSON array, not null")
+	}
+	return rules, true, nil
+}
+func decodeOptionalBoolAPI(raw json.RawMessage, field string) (bool, bool, error) {
+	if len(raw) == 0 {
+		return false, false, nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return false, true, fmt.Errorf("%s must be a JSON boolean, not null", field)
+	}
+	var value bool
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return false, true, fmt.Errorf("%s must be a JSON boolean", field)
+	}
+	return value, true, nil
 }
 
 func allDynamicDiscoverySources() []string {
@@ -570,6 +637,56 @@ func dynamicDiscoverySourcesForProfile(profile string) ([]string, bool) {
 	default:
 		return nil, false
 	}
+}
+
+func dynamicSelectableDiscoverySourceSetsForProfile(profile string) ([][]string, bool) {
+	full, ok := dynamicDiscoverySourcesForProfile(profile)
+	if !ok {
+		return nil, false
+	}
+	withoutPlaybackInfo := make([]string, 0, len(full))
+	for _, source := range full {
+		if source != dynamicDiscoverySourcePlaybackInfo {
+			withoutPlaybackInfo = append(withoutPlaybackInfo, source)
+		}
+	}
+	return [][]string{full, withoutPlaybackInfo}, true
+}
+
+func dynamicDiscoverySourcesEqual(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeDynamicDiscoverySourcesForAPI(profile string, sources []string) ([]string, error) {
+	normalized, err := normalizeDynamicDiscoverySources(sources)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateDynamicDiscoverySourcesForProfile(profile, normalized); err != nil {
+		return nil, err
+	}
+	return normalized, nil
+}
+
+func validateSelectableDynamicDiscoverySources(profile string, sources []string) error {
+	selectable, ok := dynamicSelectableDiscoverySourceSetsForProfile(profile)
+	if !ok {
+		return fmt.Errorf("unsupported dynamic discovery profile")
+	}
+	for _, allowed := range selectable {
+		if dynamicDiscoverySourcesEqual(sources, allowed) {
+			return nil
+		}
+	}
+	return fmt.Errorf("dynamic_discovery_sources must equal a selectable source set for profile %q", profile)
 }
 
 func validateDynamicDiscoverySourcesForProfile(profile string, sources []string) error {
@@ -681,6 +798,9 @@ func hydrateStoredDynamicSitePolicy(site *Site, dynamicEnabled, dynamicDowngrade
 	default:
 		return fmt.Errorf("stored dynamic_profile must be a canonical supported value")
 	}
+	if site.DynamicProfile == dynamicProfileSafe && downgrade {
+		return fmt.Errorf("stored safe dynamic policy must keep dynamic_allow_https_downgrade false")
+	}
 	if strings.TrimSpace(site.StoredDynamicDiscoverySources) == "" {
 		return fmt.Errorf("stored dynamic_discovery_sources must be a non-blank JSON array")
 	}
@@ -722,9 +842,6 @@ func hydrateStoredDynamicSitePolicy(site *Site, dynamicEnabled, dynamicDowngrade
 	if err != nil {
 		return fmt.Errorf("invalid stored dynamic_domain_rules: %w", err)
 	}
-	if enabled && site.DynamicProfile == dynamicProfileSafe && len(normalized) == 0 {
-		return fmt.Errorf("safe dynamic discovery requires at least one exact or suffix DNS rule")
-	}
 	canonical, err := json.Marshal(normalized)
 	if err != nil {
 		return err
@@ -748,6 +865,9 @@ func normalizeDynamicSitePolicy(site *Site) error {
 		return err
 	}
 	site.DynamicProfile = profile
+	if profile == dynamicProfileSafe && site.DynamicAllowHTTPSDowngrade {
+		return fmt.Errorf("safe dynamic profile requires dynamic_allow_https_downgrade=false")
+	}
 	sources := site.DynamicDiscoverySources
 	if sources == nil && strings.TrimSpace(site.StoredDynamicDiscoverySources) != "" {
 		sources, err = decodeDynamicDiscoverySources(site.StoredDynamicDiscoverySources)
@@ -788,9 +908,6 @@ func normalizeDynamicSitePolicy(site *Site) error {
 	if err != nil {
 		return err
 	}
-	if site.DynamicDiscoveryEnabled && profile == dynamicProfileSafe && len(rules) == 0 {
-		return fmt.Errorf("safe dynamic discovery requires at least one exact or suffix DNS rule")
-	}
 	raw, err := json.Marshal(rules)
 	if err != nil {
 		return err
@@ -801,6 +918,63 @@ func normalizeDynamicSitePolicy(site *Site) error {
 		site.DynamicPolicyRevision = 1
 	}
 	return nil
+}
+func mergeDynamicSitePolicyForAPI(current Site, enabled *bool, profile *string, sources []string, sourcesProvided bool, rules []DynamicDomainRule, rulesProvided bool, allowHTTPSDowngrade *bool) (Site, error) {
+	candidate := current
+	if enabled != nil {
+		candidate.DynamicDiscoveryEnabled = *enabled
+	}
+	targetProfile := current.DynamicProfile
+	if profile != nil {
+		var err error
+		targetProfile, err = normalizeDynamicProfile(*profile)
+		if err != nil {
+			return Site{}, err
+		}
+	}
+	profileChanged := targetProfile != current.DynamicProfile
+	enabling := !current.DynamicDiscoveryEnabled && candidate.DynamicDiscoveryEnabled
+	candidate.DynamicProfile = targetProfile
+	if rulesProvided {
+		candidate.DynamicDomainRules = rules
+	}
+	if allowHTTPSDowngrade != nil {
+		candidate.DynamicAllowHTTPSDowngrade = *allowHTTPSDowngrade
+	} else if profileChanged && targetProfile == dynamicProfileSafe {
+		candidate.DynamicAllowHTTPSDowngrade = false
+	}
+
+	fullSources, ok := dynamicDiscoverySourcesForProfile(targetProfile)
+	if !ok {
+		return Site{}, fmt.Errorf("unsupported dynamic discovery profile")
+	}
+	if profileChanged || enabling {
+		if !sourcesProvided {
+			candidate.DynamicDiscoverySources = fullSources
+		} else {
+			normalizedSources, err := normalizeDynamicDiscoverySourcesForAPI(targetProfile, sources)
+			if err != nil {
+				return Site{}, err
+			}
+			if err := validateSelectableDynamicDiscoverySources(targetProfile, normalizedSources); err != nil {
+				return Site{}, err
+			}
+			candidate.DynamicDiscoverySources = normalizedSources
+		}
+	} else if sourcesProvided {
+		normalizedSources, err := normalizeDynamicDiscoverySourcesForAPI(targetProfile, sources)
+		if err != nil {
+			return Site{}, err
+		}
+		if err := validateSelectableDynamicDiscoverySources(targetProfile, normalizedSources); err != nil && !dynamicDiscoverySourcesEqual(normalizedSources, current.DynamicDiscoverySources) {
+			return Site{}, fmt.Errorf("dynamic_discovery_sources must equal a selectable source set or the unchanged stored legacy subset")
+		}
+		candidate.DynamicDiscoverySources = normalizedSources
+	}
+	if err := normalizeDynamicSitePolicy(&candidate); err != nil {
+		return Site{}, err
+	}
+	return candidate, nil
 }
 
 func validateDynamicDiscoveryAPIEnablement(site Site, keyConfigured, alreadyEnabled bool) error {
@@ -1873,6 +2047,9 @@ func (d *DB) migrateOnce() error {
 		custom_client TEXT NOT NULL DEFAULT '',
 		custom_version TEXT NOT NULL DEFAULT '',
 		upstream_headers TEXT NOT NULL DEFAULT '[]',
+		ping_cache_enabled INTEGER NOT NULL DEFAULT 0,
+		image_cache_enabled INTEGER NOT NULL DEFAULT 0,
+		progress_coalescing_enabled INTEGER NOT NULL DEFAULT 0,
 		dynamic_discovery_enabled INTEGER NOT NULL DEFAULT 0,
 		dynamic_profile TEXT NOT NULL DEFAULT 'safe',
 		dynamic_discovery_sources TEXT NOT NULL DEFAULT '["redirect"]',
@@ -1894,6 +2071,14 @@ func (d *DB) migrateOnce() error {
 		recorded_at DATETIME NOT NULL
 	);
 	CREATE INDEX IF NOT EXISTS idx_traffic_site_time ON traffic_logs(site_id, recorded_at);
+	CREATE TABLE IF NOT EXISTS traffic_minute_logs (
+		site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+		minute_start_unix INTEGER NOT NULL,
+		bytes_in INTEGER NOT NULL DEFAULT 0,
+		bytes_out INTEGER NOT NULL DEFAULT 0,
+		requests INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY(site_id, minute_start_unix)
+	);
 	`); err != nil {
 		return err
 	}
@@ -1917,6 +2102,9 @@ func (d *DB) migrateOnce() error {
 		{"public_host", "ALTER TABLE sites ADD COLUMN public_host TEXT NOT NULL DEFAULT ''"},
 		{"ingress_mode", "ALTER TABLE sites ADD COLUMN ingress_mode TEXT NOT NULL DEFAULT 'port'"},
 		{"upstream_headers", "ALTER TABLE sites ADD COLUMN upstream_headers TEXT NOT NULL DEFAULT '[]'"},
+		{"ping_cache_enabled", "ALTER TABLE sites ADD COLUMN ping_cache_enabled INTEGER NOT NULL DEFAULT 0"},
+		{"image_cache_enabled", "ALTER TABLE sites ADD COLUMN image_cache_enabled INTEGER NOT NULL DEFAULT 0"},
+		{"progress_coalescing_enabled", "ALTER TABLE sites ADD COLUMN progress_coalescing_enabled INTEGER NOT NULL DEFAULT 0"},
 		{"dynamic_discovery_enabled", "ALTER TABLE sites ADD COLUMN dynamic_discovery_enabled INTEGER NOT NULL DEFAULT 0"},
 		{"dynamic_profile", "ALTER TABLE sites ADD COLUMN dynamic_profile TEXT NOT NULL DEFAULT 'safe'"},
 		{"dynamic_discovery_sources", "ALTER TABLE sites ADD COLUMN dynamic_discovery_sources TEXT NOT NULL DEFAULT '[\"redirect\"]'"},
@@ -2247,6 +2435,9 @@ type Site struct {
 	CustomVersion                 string               `json:"custom_version"`
 	StoredUpstreamHeaders         string               `json:"-"`
 	UpstreamHeaders               []UpstreamHeaderView `json:"upstream_headers"`
+	PingCacheEnabled              bool                 `json:"ping_cache_enabled"`
+	ImageCacheEnabled             bool                 `json:"image_cache_enabled"`
+	ProgressCoalescingEnabled     bool                 `json:"progress_coalescing_enabled"`
 	DynamicDiscoveryEnabled       bool                 `json:"dynamic_discovery_enabled"`
 	DynamicProfile                string               `json:"dynamic_profile"`
 	StoredDynamicDiscoverySources string               `json:"-"`
@@ -2270,7 +2461,10 @@ func sqliteBool(value bool) int {
 	return 0
 }
 
-func hydrateSiteConfiguration(site *Site, dynamicEnabled, dynamicDowngrade int) error {
+func hydrateSiteConfiguration(site *Site, pingCacheEnabled, imageCacheEnabled, progressCoalescingEnabled, dynamicEnabled, dynamicDowngrade int) error {
+	site.PingCacheEnabled = pingCacheEnabled == 1
+	site.ImageCacheEnabled = imageCacheEnabled == 1
+	site.ProgressCoalescingEnabled = progressCoalescingEnabled == 1
 	publicHost, err := normalizePublicHost(site.PublicHost)
 	if err != nil {
 		return err
@@ -2304,6 +2498,41 @@ type TrafficLog struct {
 	BytesIn    int64  `json:"bytes_in"`
 	BytesOut   int64  `json:"bytes_out"`
 	RecordedAt string `json:"recorded_at"`
+}
+
+const (
+	trafficMinuteSeconds        int64 = 60
+	trafficTimelineMaxMinutes         = 7 * 24 * 60
+	trafficMinuteRetention            = 7 * 24 * time.Hour
+	trafficMinutePruneBatchSize       = 256
+)
+
+// TrafficMinuteLog is deliberately identity-free: timeline responses expose
+// aggregate volume and request counts only, never a site/name/client field.
+type TrafficMinuteLog struct {
+	MinuteStartUnix int64 `json:"minute_start_unix"`
+	BytesIn         int64 `json:"bytes_in"`
+	BytesOut        int64 `json:"bytes_out"`
+	Requests        int64 `json:"requests"`
+}
+
+type trafficMinuteDelta struct {
+	BytesIn  int64
+	BytesOut int64
+	Requests int64
+}
+
+func trafficMinuteStart(at time.Time) int64 {
+	return at.UTC().Truncate(time.Minute).Unix()
+}
+
+func validTrafficTimelineMinutes(minutes int) bool {
+	switch minutes {
+	case 60, 360, 1440, trafficTimelineMaxMinutes:
+		return true
+	default:
+		return false
+	}
 }
 
 // SiteTraffic is the authoritative per-site traffic state: the persisted
@@ -2451,7 +2680,7 @@ func (d *DB) ResetAdminPassword(password string) error {
 }
 
 func (d *DB) ListSites() ([]Site, error) {
-	rows, err := d.db.Query("SELECT id, name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites ORDER BY id")
+	rows, err := d.db.Query("SELECT id, name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, ping_cache_enabled, image_cache_enabled, progress_coalescing_enabled, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -2459,12 +2688,12 @@ func (d *DB) ListSites() ([]Site, error) {
 	var sites []Site
 	for rows.Next() {
 		var s Site
-		var enabled, dynamicEnabled, dynamicDowngrade int
-		if err := rows.Scan(&s.ID, &s.Name, &s.ListenPort, &s.PublicHost, &s.IngressMode, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.StoredUpstreamHeaders, &dynamicEnabled, &s.DynamicProfile, &s.StoredDynamicDiscoverySources, &s.StoredDynamicDomainRules, &dynamicDowngrade, &s.DynamicPolicyRevision, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt); err != nil {
+		var enabled, pingCacheEnabled, imageCacheEnabled, progressCoalescingEnabled, dynamicEnabled, dynamicDowngrade int
+		if err := rows.Scan(&s.ID, &s.Name, &s.ListenPort, &s.PublicHost, &s.IngressMode, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.StoredUpstreamHeaders, &pingCacheEnabled, &imageCacheEnabled, &progressCoalescingEnabled, &dynamicEnabled, &s.DynamicProfile, &s.StoredDynamicDiscoverySources, &s.StoredDynamicDomainRules, &dynamicDowngrade, &s.DynamicPolicyRevision, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt); err != nil {
 			return nil, err
 		}
 		s.Enabled = enabled == 1
-		if err := hydrateSiteConfiguration(&s, dynamicEnabled, dynamicDowngrade); err != nil {
+		if err := hydrateSiteConfiguration(&s, pingCacheEnabled, imageCacheEnabled, progressCoalescingEnabled, dynamicEnabled, dynamicDowngrade); err != nil {
 			return nil, fmt.Errorf("site %d: %w", s.ID, err)
 		}
 		sites = append(sites, s)
@@ -2477,17 +2706,63 @@ func (d *DB) ListSites() ([]Site, error) {
 	}
 	return sites, nil
 }
+func (d *DB) DynamicRollbackReadiness() (DynamicRollbackReadiness, error) {
+	rows, err := d.db.Query("SELECT dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules FROM sites WHERE dynamic_discovery_enabled=1")
+	if err != nil {
+		return DynamicRollbackReadiness{}, err
+	}
+	defer rows.Close()
+
+	var readiness DynamicRollbackReadiness
+	for rows.Next() {
+		var profile, storedSources, storedRules string
+		if err := rows.Scan(&profile, &storedSources, &storedRules); err != nil {
+			return DynamicRollbackReadiness{}, err
+		}
+		sources, err := decodeDynamicDiscoverySources(storedSources)
+		if err != nil || sources == nil {
+			return DynamicRollbackReadiness{}, fmt.Errorf("invalid stored dynamic discovery sources")
+		}
+		sources, err = normalizeDynamicDiscoverySourcesForAPI(profile, sources)
+		if err != nil {
+			return DynamicRollbackReadiness{}, fmt.Errorf("invalid stored dynamic discovery sources: %w", err)
+		}
+		canonicalSources, ok := dynamicDiscoverySourcesForProfile(profile)
+		if !ok {
+			return DynamicRollbackReadiness{}, fmt.Errorf("invalid stored dynamic discovery profile")
+		}
+		if !dynamicDiscoverySourcesEqual(sources, canonicalSources) {
+			readiness.EnabledLegacySourceSubsets++
+		}
+
+		rules, err := decodeDynamicDomainRules(storedRules)
+		if err != nil || rules == nil {
+			return DynamicRollbackReadiness{}, fmt.Errorf("invalid stored dynamic domain rules")
+		}
+		rules, err = normalizeDynamicDomainRules(profile, rules)
+		if err != nil {
+			return DynamicRollbackReadiness{}, fmt.Errorf("invalid stored dynamic domain rules: %w", err)
+		}
+		if profile == dynamicProfileSafe && len(rules) == 0 {
+			readiness.EnabledSafeEmptyRules++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return DynamicRollbackReadiness{}, err
+	}
+	return readiness, nil
+}
 
 func (d *DB) GetSite(id int64) (*Site, error) {
 	var s Site
-	var enabled, dynamicEnabled, dynamicDowngrade int
-	err := d.db.QueryRow("SELECT id, name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites WHERE id=?", id).
-		Scan(&s.ID, &s.Name, &s.ListenPort, &s.PublicHost, &s.IngressMode, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.StoredUpstreamHeaders, &dynamicEnabled, &s.DynamicProfile, &s.StoredDynamicDiscoverySources, &s.StoredDynamicDomainRules, &dynamicDowngrade, &s.DynamicPolicyRevision, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt)
+	var enabled, pingCacheEnabled, imageCacheEnabled, progressCoalescingEnabled, dynamicEnabled, dynamicDowngrade int
+	err := d.db.QueryRow("SELECT id, name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, ping_cache_enabled, image_cache_enabled, progress_coalescing_enabled, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, enabled, traffic_quota, traffic_used, speed_limit, created_at, updated_at FROM sites WHERE id=?", id).
+		Scan(&s.ID, &s.Name, &s.ListenPort, &s.PublicHost, &s.IngressMode, &s.TargetURL, &s.PlaybackTargetURL, &s.PlaybackMode, &s.StreamHosts, &s.UAMode, &s.CustomUserAgent, &s.CustomClient, &s.CustomVersion, &s.StoredUpstreamHeaders, &pingCacheEnabled, &imageCacheEnabled, &progressCoalescingEnabled, &dynamicEnabled, &s.DynamicProfile, &s.StoredDynamicDiscoverySources, &s.StoredDynamicDomainRules, &dynamicDowngrade, &s.DynamicPolicyRevision, &enabled, &s.TrafficQuota, &s.TrafficUsed, &s.SpeedLimit, &s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
 	s.Enabled = enabled == 1
-	if err := hydrateSiteConfiguration(&s, dynamicEnabled, dynamicDowngrade); err != nil {
+	if err := hydrateSiteConfiguration(&s, pingCacheEnabled, imageCacheEnabled, progressCoalescingEnabled, dynamicEnabled, dynamicDowngrade); err != nil {
 		return nil, fmt.Errorf("site %d: %w", s.ID, err)
 	}
 	return &s, nil
@@ -2535,8 +2810,8 @@ func (d *DB) CreateSiteRecord(site Site) (*Site, error) {
 	}
 	site.DynamicPolicyRevision = 1
 	res, err := d.db.Exec(
-		"INSERT INTO sites (name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, traffic_quota, speed_limit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-		site.Name, site.ListenPort, site.PublicHost, site.IngressMode, site.TargetURL, site.PlaybackTargetURL, site.PlaybackMode, site.StreamHosts, site.UAMode, site.CustomUserAgent, site.CustomClient, site.CustomVersion, site.StoredUpstreamHeaders, sqliteBool(site.DynamicDiscoveryEnabled), site.DynamicProfile, site.StoredDynamicDiscoverySources, site.StoredDynamicDomainRules, sqliteBool(site.DynamicAllowHTTPSDowngrade), site.DynamicPolicyRevision, site.TrafficQuota, site.SpeedLimit,
+		"INSERT INTO sites (name, listen_port, public_host, ingress_mode, target_url, playback_target_url, playback_mode, stream_hosts, ua_mode, custom_user_agent, custom_client, custom_version, upstream_headers, ping_cache_enabled, image_cache_enabled, progress_coalescing_enabled, dynamic_discovery_enabled, dynamic_profile, dynamic_discovery_sources, dynamic_domain_rules, dynamic_allow_https_downgrade, dynamic_policy_revision, traffic_quota, speed_limit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		site.Name, site.ListenPort, site.PublicHost, site.IngressMode, site.TargetURL, site.PlaybackTargetURL, site.PlaybackMode, site.StreamHosts, site.UAMode, site.CustomUserAgent, site.CustomClient, site.CustomVersion, site.StoredUpstreamHeaders, sqliteBool(site.PingCacheEnabled), sqliteBool(site.ImageCacheEnabled), sqliteBool(site.ProgressCoalescingEnabled), sqliteBool(site.DynamicDiscoveryEnabled), site.DynamicProfile, site.StoredDynamicDiscoverySources, site.StoredDynamicDomainRules, sqliteBool(site.DynamicAllowHTTPSDowngrade), site.DynamicPolicyRevision, site.TrafficQuota, site.SpeedLimit,
 	)
 	if err != nil {
 		return nil, err
@@ -2631,11 +2906,15 @@ func (d *DB) updateSiteRecord(site Site, restoreRevision bool) error {
 	}
 	dynamicEnabled := sqliteBool(site.DynamicDiscoveryEnabled)
 	dynamicDowngrade := sqliteBool(site.DynamicAllowHTTPSDowngrade)
+	pingCacheEnabled := sqliteBool(site.PingCacheEnabled)
+	imageCacheEnabled := sqliteBool(site.ImageCacheEnabled)
+	progressCoalescingEnabled := sqliteBool(site.ProgressCoalescingEnabled)
 	revisionExpression := "dynamic_policy_revision=dynamic_policy_revision+CASE WHEN dynamic_discovery_enabled<>? OR dynamic_profile<>? OR dynamic_discovery_sources<>? OR dynamic_domain_rules<>? OR dynamic_allow_https_downgrade<>? THEN 1 ELSE 0 END"
 	args := []interface{}{
 		site.Name, site.ListenPort, site.PublicHost, site.IngressMode, site.TargetURL,
 		site.PlaybackTargetURL, site.PlaybackMode, site.StreamHosts, site.UAMode,
 		site.CustomUserAgent, site.CustomClient, site.CustomVersion, site.StoredUpstreamHeaders,
+		pingCacheEnabled, imageCacheEnabled, progressCoalescingEnabled,
 		dynamicEnabled, site.DynamicProfile, site.StoredDynamicDiscoverySources, site.StoredDynamicDomainRules, dynamicDowngrade,
 	}
 	if restoreRevision {
@@ -2646,7 +2925,7 @@ func (d *DB) updateSiteRecord(site Site, restoreRevision bool) error {
 	}
 	args = append(args, site.TrafficQuota, site.SpeedLimit, site.ID)
 	_, err = tx.Exec(
-		"UPDATE sites SET name=?, listen_port=?, public_host=?, ingress_mode=?, target_url=?, playback_target_url=?, playback_mode=?, stream_hosts=?, ua_mode=?, custom_user_agent=?, custom_client=?, custom_version=?, upstream_headers=?, dynamic_discovery_enabled=?, dynamic_profile=?, dynamic_discovery_sources=?, dynamic_domain_rules=?, dynamic_allow_https_downgrade=?, "+revisionExpression+", traffic_quota=?, speed_limit=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+		"UPDATE sites SET name=?, listen_port=?, public_host=?, ingress_mode=?, target_url=?, playback_target_url=?, playback_mode=?, stream_hosts=?, ua_mode=?, custom_user_agent=?, custom_client=?, custom_version=?, upstream_headers=?, ping_cache_enabled=?, image_cache_enabled=?, progress_coalescing_enabled=?, dynamic_discovery_enabled=?, dynamic_profile=?, dynamic_discovery_sources=?, dynamic_domain_rules=?, dynamic_allow_https_downgrade=?, "+revisionExpression+", traffic_quota=?, speed_limit=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
 		args...,
 	)
 	if err != nil {
@@ -2669,6 +2948,9 @@ func (d *DB) DeleteSite(id int64) error {
 	}
 	defer tx.Rollback()
 	if _, err := tx.Exec("DELETE FROM traffic_logs WHERE site_id=?", id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM traffic_minute_logs WHERE site_id=?", id); err != nil {
 		return err
 	}
 	if _, err := tx.Exec("DELETE FROM dynamic_observations WHERE site_id=?", id); err != nil {
@@ -2716,28 +2998,92 @@ func (d *DB) AddTraffic(siteID, bytesIn, bytesOut int64) {
 }
 
 func (d *DB) addTraffic(siteID, bytesIn, bytesOut int64) error {
-	hour := time.Now().Truncate(time.Hour).Format("2006-01-02 15:04:05")
+	now := time.Now()
+	buckets := make(map[int64]trafficMinuteDelta, 1)
+	if bytesIn != 0 || bytesOut != 0 {
+		buckets[trafficMinuteStart(now)] = trafficMinuteDelta{BytesIn: bytesIn, BytesOut: bytesOut}
+	}
+	return d.addTrafficMinuteBuckets(siteID, bytesIn, bytesOut, buckets, now)
+}
+
+// addTrafficMinuteBuckets is the only traffic persistence transaction. The
+// legacy hourly log and sites.traffic_used remain authoritative, while minute
+// UPSERTs commit atomically beside the exact same byte delta. Request handling
+// only populates the in-memory buckets; it never writes SQLite directly.
+func (d *DB) addTrafficMinuteBuckets(siteID, bytesIn, bytesOut int64, buckets map[int64]trafficMinuteDelta, now time.Time) error {
 	tx, err := d.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.Exec(
-		`INSERT INTO traffic_logs (site_id, bytes_in, bytes_out, recorded_at)
-		 VALUES (?,?,?,?)
-		 ON CONFLICT(site_id, recorded_at) DO UPDATE SET
-		 	bytes_in = traffic_logs.bytes_in + excluded.bytes_in,
-		 	bytes_out = traffic_logs.bytes_out + excluded.bytes_out`,
-		siteID, bytesIn, bytesOut, hour,
-	); err != nil {
-		return err
+	if bytesIn != 0 || bytesOut != 0 {
+		hour := now.Truncate(time.Hour).Format("2006-01-02 15:04:05")
+		if _, err := tx.Exec(
+			`INSERT INTO traffic_logs (site_id, bytes_in, bytes_out, recorded_at)
+			 VALUES (?,?,?,?)
+			 ON CONFLICT(site_id, recorded_at) DO UPDATE SET
+			bytes_in = traffic_logs.bytes_in + excluded.bytes_in,
+			bytes_out = traffic_logs.bytes_out + excluded.bytes_out`,
+			siteID, bytesIn, bytesOut, hour,
+		); err != nil {
+			return err
+		}
 	}
 
-	if _, err := tx.Exec(
-		"UPDATE sites SET traffic_used=traffic_used+?+?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-		bytesIn, bytesOut, siteID,
-	); err != nil {
+	minuteStarts := make([]int64, 0, len(buckets))
+	for minuteStart, delta := range buckets {
+		if minuteStart%trafficMinuteSeconds != 0 {
+			return fmt.Errorf("traffic minute %d is not aligned", minuteStart)
+		}
+		if delta.BytesIn < 0 || delta.BytesOut < 0 || delta.Requests < 0 {
+			return fmt.Errorf("traffic minute %d contains a negative counter", minuteStart)
+		}
+		if delta.BytesIn != 0 || delta.BytesOut != 0 || delta.Requests != 0 {
+			minuteStarts = append(minuteStarts, minuteStart)
+		}
+	}
+	sort.Slice(minuteStarts, func(i, j int) bool { return minuteStarts[i] < minuteStarts[j] })
+	for _, minuteStart := range minuteStarts {
+		delta := buckets[minuteStart]
+		if _, err := tx.Exec(
+			`INSERT INTO traffic_minute_logs (site_id, minute_start_unix, bytes_in, bytes_out, requests)
+			 VALUES (?,?,?,?,?)
+			 ON CONFLICT(site_id, minute_start_unix) DO UPDATE SET
+			bytes_in = traffic_minute_logs.bytes_in + excluded.bytes_in,
+			bytes_out = traffic_minute_logs.bytes_out + excluded.bytes_out,
+			requests = traffic_minute_logs.requests + excluded.requests`,
+			siteID, minuteStart, delta.BytesIn, delta.BytesOut, delta.Requests,
+		); err != nil {
+			return err
+		}
+	}
+
+	if bytesIn != 0 || bytesOut != 0 {
+		result, err := tx.Exec(
+			"UPDATE sites SET traffic_used=traffic_used+?+?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+			bytesIn, bytesOut, siteID,
+		)
+		if err != nil {
+			return err
+		}
+		if rows, err := result.RowsAffected(); err != nil {
+			return err
+		} else if rows != 1 {
+			return fmt.Errorf("updated %d site traffic rows, want 1", rows)
+		}
+	}
+
+	cutoff := trafficMinuteStart(now.Add(-trafficMinuteRetention))
+	if _, err := tx.Exec(`
+		DELETE FROM traffic_minute_logs
+		WHERE (site_id, minute_start_unix) IN (
+			SELECT site_id, minute_start_unix
+			FROM traffic_minute_logs
+			WHERE minute_start_unix < ?
+			ORDER BY minute_start_unix, site_id
+			LIMIT ?
+		)`, cutoff, trafficMinutePruneBatchSize); err != nil {
 		return err
 	}
 
@@ -2769,6 +3115,49 @@ func (d *DB) GetTrafficLogs(siteID int64, hours int) ([]TrafficLog, error) {
 		logs = []TrafficLog{}
 	}
 	return logs, nil
+}
+
+// GetTrafficTimeline returns a dense UTC epoch-minute series. Sparse database
+// rows are copied into their exact slot; missing minutes remain explicit zeroes.
+func (d *DB) GetTrafficTimeline(siteID int64, minutes int, now time.Time) ([]TrafficMinuteLog, error) {
+	if !validTrafficTimelineMinutes(minutes) {
+		return nil, fmt.Errorf("invalid traffic timeline range: %d", minutes)
+	}
+	end := trafficMinuteStart(now)
+	start := end - int64(minutes-1)*trafficMinuteSeconds
+	timeline := make([]TrafficMinuteLog, minutes)
+	for i := range timeline {
+		timeline[i].MinuteStartUnix = start + int64(i)*trafficMinuteSeconds
+	}
+
+	rows, err := d.db.Query(`
+		SELECT minute_start_unix, bytes_in, bytes_out, requests
+		FROM traffic_minute_logs
+		WHERE site_id=? AND minute_start_unix>=? AND minute_start_unix<=?
+		ORDER BY minute_start_unix`, siteID, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var bucket TrafficMinuteLog
+		if err := rows.Scan(&bucket.MinuteStartUnix, &bucket.BytesIn, &bucket.BytesOut, &bucket.Requests); err != nil {
+			return nil, err
+		}
+		offset := bucket.MinuteStartUnix - start
+		if offset < 0 || offset%trafficMinuteSeconds != 0 {
+			continue
+		}
+		index := int(offset / trafficMinuteSeconds)
+		if index >= len(timeline) {
+			continue
+		}
+		timeline[index] = bucket
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return timeline, nil
 }
 
 const (
@@ -2900,7 +3289,7 @@ func (p dynamicRedirectPolicy) validateTarget(previous, target *url.URL, selfTar
 			return dynamicObservationReasonPortDenied
 		}
 	}
-	if p.profile == dynamicProfileSafe && !dynamicDomainRuleMatches(target.Hostname(), p.domainRules) {
+	if p.profile == dynamicProfileSafe && !dynamicSafeDomainAllowed(target.Hostname(), p.domainRules) {
 		return dynamicObservationReasonDomainDenied
 	}
 	if previous != nil && strings.EqualFold(previous.Scheme, "https") && target.Scheme == "http" && !p.allowHTTPSDowngrade {
@@ -4351,6 +4740,12 @@ func rewriteDynamicStructuredResponseAccepted(resp *http.Response, issuer *dynam
 		contentTypeAllowed = true
 	}
 	if issuer == nil {
+		return nil
+	}
+	if expectedSource == dynamicDiscoverySourcePlaybackInfo && !required && !issuer.policy.sourceEnabled(dynamicDiscoverySourcePlaybackInfo) {
+		// PlaybackInfo inspection is the only optional structured source. A
+		// redirected response still uses the dynamic transport and response-header
+		// hardening, but its body must remain opaque when inspection is disabled.
 		return nil
 	}
 	authority := ""
@@ -9160,6 +9555,1492 @@ func stripSensitiveRedirectHeaders(header http.Header) {
 	}
 }
 
+const (
+	progressRequestBodyLimit     = 64 << 10
+	progressResponseBodyLimit    = 64 << 10
+	progressMaxKeyComponentBytes = 256
+	progressDebounceWindow       = time.Second
+	progressMaxDispatchDelay     = 5 * time.Second
+	progressIdleExpiry           = 5 * time.Minute
+	progressCleanupInterval      = time.Minute
+	progressMaxSiteKeys          = 1024
+	progressMaxGlobalKeys        = 4096
+	progressMaxWaitersPerKey     = 16
+	progressMaxGlobalWaiters     = 1024
+)
+
+var (
+	errProgressResponseTooLarge = errors.New("progress upstream response exceeds the coalescing limit")
+	errProgressDispatchPanicked = errors.New("progress upstream dispatch panicked")
+)
+
+type progressRequestKind uint8
+
+const (
+	progressRequestNone progressRequestKind = iota
+	progressRequestUpdate
+	progressRequestStopped
+)
+
+// progressIdentity is deliberately limited to the three protocol identifiers
+// needed for ordering. It is never logged or persisted.
+type progressIdentity struct {
+	SessionID     string
+	PlaySessionID string
+	ItemID        string
+}
+
+// progressInternalKey binds a protocol identity to an in-memory, process-keyed
+// credential digest. Responses can therefore never be shared across distinct
+// authenticated callers even if they submit the same protocol identifiers.
+type progressInternalKey struct {
+	Identity   progressIdentity
+	Credential [sha256.Size]byte
+}
+
+type progressGlobalRuntime struct {
+	mu                sync.Mutex
+	activeKeys        int
+	waiters           int
+	maxActiveKeys     int
+	maxWaiters        int
+	credentialKey     [sha256.Size]byte
+	credentialKeyGood bool
+}
+
+func newProgressGlobalRuntime(maxActiveKeys, maxWaiters int) *progressGlobalRuntime {
+	runtime := &progressGlobalRuntime{maxActiveKeys: maxActiveKeys, maxWaiters: maxWaiters}
+	_, runtimeErr := rand.Read(runtime.credentialKey[:])
+	runtime.credentialKeyGood = runtimeErr == nil
+	return runtime
+}
+
+func (r *progressGlobalRuntime) reserveKey() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.maxActiveKeys <= 0 || r.activeKeys >= r.maxActiveKeys {
+		return false
+	}
+	r.activeKeys++
+	return true
+}
+
+func (r *progressGlobalRuntime) releaseKey() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if r.activeKeys > 0 {
+		r.activeKeys--
+	}
+	r.mu.Unlock()
+}
+
+func (r *progressGlobalRuntime) reserveWaiter() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.maxWaiters <= 0 || r.waiters >= r.maxWaiters {
+		return false
+	}
+	r.waiters++
+	return true
+}
+
+func (r *progressGlobalRuntime) releaseWaiter() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if r.waiters > 0 {
+		r.waiters--
+	}
+	r.mu.Unlock()
+}
+
+func progressPathKind(r *http.Request) progressRequestKind {
+	if r == nil || r.Method != http.MethodPost || r.URL == nil {
+		return progressRequestNone
+	}
+	switch r.URL.Path {
+	case "/Sessions/Playing/Progress", "/emby/Sessions/Playing/Progress":
+		return progressRequestUpdate
+	case "/Sessions/Playing/Stopped", "/emby/Sessions/Playing/Stopped":
+		return progressRequestStopped
+	default:
+		return progressRequestNone
+	}
+}
+
+type progressReplayBody struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (b *progressReplayBody) Close() error {
+	if b == nil || b.closer == nil {
+		return nil
+	}
+	return b.closer.Close()
+}
+
+// readProgressRequestBody consumes no more than 64 KiB. Whenever completeness
+// cannot be proven, it restores the consumed prefix in front of the original
+// reader so the ordinary proxy path can fail open without changing the body.
+func readProgressRequestBody(r *http.Request) ([]byte, bool) {
+	if r == nil || r.Body == nil || r.ContentLength > progressRequestBodyLimit {
+		return nil, false
+	}
+	original := r.Body
+	limited := &io.LimitedReader{R: original, N: progressRequestBodyLimit}
+	payload, err := io.ReadAll(limited)
+	complete := err == nil
+	if complete {
+		switch {
+		case r.ContentLength >= 0:
+			complete = int64(len(payload)) == r.ContentLength
+		case len(payload) == progressRequestBodyLimit:
+			// With an unknown length, filling the entire allowance cannot prove EOF
+			// without reading a forbidden extra byte. Conservatively fail open.
+			complete = false
+		}
+	}
+	if !complete {
+		r.Body = &progressReplayBody{
+			Reader: io.MultiReader(bytes.NewReader(payload), original),
+			closer: original,
+		}
+		return nil, false
+	}
+	_ = original.Close()
+	r.Body = io.NopCloser(bytes.NewReader(payload))
+	return payload, true
+}
+
+func parseProgressIdentity(payload []byte) (progressIdentity, bool) {
+	var decoded struct {
+		SessionID     string `json:"SessionId"`
+		PlaySessionID string `json:"PlaySessionId"`
+		ItemID        string `json:"ItemId"`
+	}
+	if len(payload) == 0 || json.Unmarshal(payload, &decoded) != nil {
+		return progressIdentity{}, false
+	}
+	identity := progressIdentity{
+		SessionID:     decoded.SessionID,
+		PlaySessionID: decoded.PlaySessionID,
+		ItemID:        decoded.ItemID,
+	}
+	for _, component := range []string{identity.SessionID, identity.PlaySessionID, identity.ItemID} {
+		if component == "" || len(component) > progressMaxKeyComponentBytes {
+			return progressIdentity{}, false
+		}
+	}
+	return identity, true
+}
+
+var progressCredentialHeaders = []string{
+	"Authorization",
+	"Cookie",
+	"Proxy-Authorization",
+	"X-Api-Key",
+	"X-Emby-Authorization",
+	"X-Emby-Token",
+	"X-MediaBrowser-Token",
+}
+
+func progressCredentialDigest(runtime *progressGlobalRuntime, r *http.Request) ([sha256.Size]byte, bool) {
+	var digest [sha256.Size]byte
+	if runtime == nil || r == nil || !runtime.credentialKeyGood {
+		return digest, false
+	}
+	mac := hmac.New(sha256.New, runtime.credentialKey[:])
+	for index, name := range progressCredentialHeaders {
+		_, _ = mac.Write([]byte{byte(index + 1)})
+		for _, value := range r.Header.Values(name) {
+			valueDigest := sha256.Sum256([]byte(value))
+			_, _ = mac.Write([]byte{1})
+			_, _ = mac.Write(valueDigest[:])
+		}
+		_, _ = mac.Write([]byte{0})
+	}
+	if r.URL != nil {
+		queryDigest := sha256.Sum256([]byte(r.URL.RawQuery))
+		_, _ = mac.Write(queryDigest[:])
+		if r.URL.User != nil {
+			userDigest := sha256.Sum256([]byte(r.URL.User.String()))
+			_, _ = mac.Write(userDigest[:])
+		}
+	}
+	if r.TLS != nil {
+		for _, certificate := range r.TLS.PeerCertificates {
+			certificateDigest := sha256.Sum256(certificate.Raw)
+			_, _ = mac.Write(certificateDigest[:])
+		}
+	}
+	copy(digest[:], mac.Sum(nil))
+	return digest, true
+}
+
+type progressResponse struct {
+	Status int
+	Header http.Header
+	Body   []byte
+}
+
+type progressOutcome struct {
+	Response progressResponse
+	Err      error
+}
+
+type progressCaptureWriter struct {
+	header        http.Header
+	writtenHeader http.Header
+	status        int
+	body          bytes.Buffer
+	overflow      bool
+}
+
+func newProgressCaptureWriter() *progressCaptureWriter {
+	return &progressCaptureWriter{header: make(http.Header)}
+}
+
+func (w *progressCaptureWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *progressCaptureWriter) WriteHeader(status int) {
+	if status >= 100 && status < 200 && status != http.StatusSwitchingProtocols {
+		return
+	}
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.writtenHeader = w.header.Clone()
+}
+
+func (w *progressCaptureWriter) Write(payload []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	remaining := progressResponseBodyLimit - w.body.Len()
+	if remaining > 0 {
+		amount := len(payload)
+		if amount > remaining {
+			amount = remaining
+		}
+		_, _ = w.body.Write(payload[:amount])
+	}
+	if len(payload) > remaining {
+		w.overflow = true
+	}
+	return len(payload), nil
+}
+
+func (w *progressCaptureWriter) Flush() {}
+
+func (w *progressCaptureWriter) response() (progressResponse, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	if w.overflow {
+		return progressBadGatewayResponse(), errProgressResponseTooLarge
+	}
+	return progressResponse{
+		Status: w.status,
+		Header: w.writtenHeader.Clone(),
+		Body:   append([]byte(nil), w.body.Bytes()...),
+	}, nil
+}
+
+func progressBadGatewayResponse() progressResponse {
+	return progressResponse{
+		Status: http.StatusBadGateway,
+		Header: http.Header{"Content-Type": []string{"application/json"}},
+		Body:   []byte(`{"error":"upstream unavailable"}`),
+	}
+}
+
+func progressServiceUnavailableResponse() progressResponse {
+	return progressResponse{
+		Status: http.StatusServiceUnavailable,
+		Header: http.Header{"Content-Type": []string{"application/json"}},
+		Body:   []byte(`{"error":"site is stopping"}`),
+	}
+}
+
+func progressDispatchPanicError(recovered any) error {
+	if recoveredErr, ok := recovered.(error); ok && errors.Is(recoveredErr, http.ErrAbortHandler) {
+		return http.ErrAbortHandler
+	}
+	return errProgressDispatchPanicked
+}
+
+func writeProgressResponse(w http.ResponseWriter, response progressResponse) {
+	for name, values := range response.Header {
+		for _, value := range values {
+			w.Header().Add(name, value)
+		}
+	}
+	status := response.Status
+	if status == 0 {
+		status = http.StatusBadGateway
+	}
+	w.WriteHeader(status)
+	if len(response.Body) > 0 {
+		_, _ = w.Write(response.Body)
+	}
+}
+
+type progressDispatchErrorContextKey struct{}
+
+type progressDispatchErrorState struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (s *progressDispatchErrorState) record(err error) {
+	if s == nil || err == nil {
+		return
+	}
+	s.mu.Lock()
+	s.err = errors.Join(s.err, err)
+	s.mu.Unlock()
+}
+
+func (s *progressDispatchErrorState) load() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+func recordProgressDispatchError(r *http.Request, err error) {
+	if r == nil || err == nil {
+		return
+	}
+	if state, ok := r.Context().Value(progressDispatchErrorContextKey{}).(*progressDispatchErrorState); ok {
+		state.record(err)
+	}
+}
+
+type progressBufferedRequest struct {
+	request *http.Request
+	release func()
+}
+
+func newProgressBufferedRequest(runtimeCtx context.Context, r *http.Request, payload []byte) *progressBufferedRequest {
+	valueCtx := context.WithoutCancel(r.Context())
+	dispatchCtx, dispatchCancel := context.WithCancel(valueCtx)
+	stopRuntimeCancel := context.AfterFunc(runtimeCtx, dispatchCancel)
+	request := r.Clone(dispatchCtx)
+	request.Body = io.NopCloser(bytes.NewReader(payload))
+	request.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(payload)), nil
+	}
+	request.ContentLength = int64(len(payload))
+	request.TransferEncoding = nil
+	request.Trailer = nil
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			stopRuntimeCancel()
+			dispatchCancel()
+			if request.Body != nil {
+				_ = request.Body.Close()
+			}
+		})
+	}
+	return &progressBufferedRequest{request: request, release: release}
+}
+
+type progressDispatchFunc func(*http.Request) (progressResponse, error)
+
+type progressCoalescerConfig struct {
+	debounce         time.Duration
+	maxDispatchDelay time.Duration
+	idleExpiry       time.Duration
+	cleanupInterval  time.Duration
+	maxSiteKeys      int
+	maxWaitersPerKey int
+}
+
+func defaultProgressCoalescerConfig() progressCoalescerConfig {
+	return progressCoalescerConfig{
+		debounce:         progressDebounceWindow,
+		maxDispatchDelay: progressMaxDispatchDelay,
+		idleExpiry:       progressIdleExpiry,
+		cleanupInterval:  progressCleanupInterval,
+		maxSiteKeys:      progressMaxSiteKeys,
+		maxWaitersPerKey: progressMaxWaitersPerKey,
+	}
+}
+
+type progressWaiter struct {
+	result chan progressOutcome
+	batch  *progressBatch
+	entry  *progressEntry
+	active bool
+}
+
+type progressBatch struct {
+	request         *progressBufferedRequest
+	waiters         map[*progressWaiter]struct{}
+	firstArrival    time.Time
+	lastArrival     time.Time
+	ready           bool
+	timer           *time.Timer
+	timerGeneration uint64
+}
+
+type progressBarrier struct {
+	granted  chan struct{}
+	active   bool
+	canceled bool
+	released bool
+}
+
+type progressWork struct {
+	batch   *progressBatch
+	barrier *progressBarrier
+}
+
+type progressEntry struct {
+	queue         []*progressWork
+	activeBatch   *progressBatch
+	activeBarrier *progressBarrier
+	waiters       int
+	lastActivity  time.Time
+}
+
+type progressDrainCycle struct {
+	done chan struct{}
+	err  error
+}
+
+type progressCoalescerState uint8
+
+const (
+	progressCoalescerOpen progressCoalescerState = iota
+	progressCoalescerQuiescing
+	progressCoalescerDraining
+	progressCoalescerDrained
+	progressCoalescerClosed
+)
+
+type progressCoalescer struct {
+	mu              sync.Mutex
+	global          *progressGlobalRuntime
+	config          progressCoalescerConfig
+	dispatch        progressDispatchFunc
+	entries         map[progressInternalKey]*progressEntry
+	state           progressCoalescerState
+	drain           *progressDrainCycle
+	admissions      int
+	ctx             context.Context
+	cancel          context.CancelFunc
+	maintenanceDone chan struct{}
+}
+
+func newProgressCoalescer(global *progressGlobalRuntime, config progressCoalescerConfig, dispatch progressDispatchFunc) *progressCoalescer {
+	ctx, cancel := context.WithCancel(context.Background())
+	coalescer := &progressCoalescer{
+		global:          global,
+		config:          config,
+		dispatch:        dispatch,
+		entries:         make(map[progressInternalKey]*progressEntry),
+		ctx:             ctx,
+		cancel:          cancel,
+		maintenanceDone: make(chan struct{}),
+	}
+	if config.cleanupInterval <= 0 {
+		close(coalescer.maintenanceDone)
+	} else {
+		go coalescer.runMaintenance()
+	}
+	return coalescer
+}
+
+func (c *progressCoalescer) beginProgressIngress() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state != progressCoalescerOpen {
+		return false
+	}
+	c.admissions++
+	return true
+}
+
+func (c *progressCoalescer) endProgressIngress() {
+	c.mu.Lock()
+	if c.admissions > 0 {
+		c.admissions--
+	}
+	c.advanceDrainLocked()
+	c.mu.Unlock()
+}
+
+func (c *progressCoalescer) runMaintenance() {
+	defer close(c.maintenanceDone)
+	ticker := time.NewTicker(c.config.cleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case now := <-ticker.C:
+			c.cleanupIdle(now)
+		case <-c.ctx.Done():
+			return
+		}
+	}
+}
+
+func (c *progressCoalescer) cleanupIdle(now time.Time) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.config.idleExpiry <= 0 {
+		return
+	}
+	for key, entry := range c.entries {
+		if entry.activeBatch != nil || entry.activeBarrier != nil || len(entry.queue) != 0 || entry.waiters != 0 {
+			continue
+		}
+		if now.Sub(entry.lastActivity) < c.config.idleExpiry {
+			continue
+		}
+		delete(c.entries, key)
+		c.global.releaseKey()
+	}
+}
+
+func (c *progressCoalescer) getOrCreateEntryLocked(key progressInternalKey, now time.Time) (*progressEntry, bool) {
+	if entry := c.entries[key]; entry != nil {
+		return entry, false
+	}
+	if c.config.maxSiteKeys <= 0 || len(c.entries) >= c.config.maxSiteKeys || !c.global.reserveKey() {
+		return nil, false
+	}
+	entry := &progressEntry{lastActivity: now}
+	c.entries[key] = entry
+	return entry, true
+}
+
+func (c *progressCoalescer) releaseEmptyNewEntryLocked(key progressInternalKey, entry *progressEntry, created bool) {
+	if !created || entry == nil || entry.activeBatch != nil || entry.activeBarrier != nil || len(entry.queue) != 0 || entry.waiters != 0 {
+		return
+	}
+	if c.entries[key] == entry {
+		delete(c.entries, key)
+		c.global.releaseKey()
+	}
+}
+
+func (c *progressCoalescer) reserveWaiterLocked(entry *progressEntry) bool {
+	if entry == nil || c.config.maxWaitersPerKey <= 0 || entry.waiters >= c.config.maxWaitersPerKey || !c.global.reserveWaiter() {
+		return false
+	}
+	entry.waiters++
+	return true
+}
+
+func (c *progressCoalescer) releaseWaiterLocked(entry *progressEntry) {
+	if entry != nil && entry.waiters > 0 {
+		entry.waiters--
+		c.global.releaseWaiter()
+	}
+}
+
+func (c *progressCoalescer) scheduleBatchLocked(key progressInternalKey, entry *progressEntry, batch *progressBatch, now time.Time) {
+	if batch.ready {
+		return
+	}
+	deadline := now.Add(c.config.debounce)
+	maxDeadline := batch.firstArrival.Add(c.config.maxDispatchDelay)
+	if deadline.After(maxDeadline) {
+		deadline = maxDeadline
+	}
+	if !deadline.After(now) {
+		batch.ready = true
+		if batch.timer != nil {
+			batch.timer.Stop()
+			batch.timer = nil
+		}
+		return
+	}
+	if batch.timer != nil {
+		batch.timer.Stop()
+	}
+	batch.timerGeneration++
+	generation := batch.timerGeneration
+	batch.timer = time.AfterFunc(deadline.Sub(now), func() {
+		c.markBatchReady(key, entry, batch, generation)
+	})
+}
+
+func (c *progressCoalescer) markBatchReady(key progressInternalKey, entry *progressEntry, batch *progressBatch, generation uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries[key] != entry || batch.timerGeneration != generation || batch.ready || c.state == progressCoalescerClosed {
+		return
+	}
+	batch.ready = true
+	batch.timer = nil
+	c.advanceEntryLocked(key, entry)
+}
+
+func (c *progressCoalescer) forceQueuedBatchesLocked(entry *progressEntry) {
+	for _, work := range entry.queue {
+		if work.batch == nil {
+			continue
+		}
+		work.batch.ready = true
+		work.batch.timerGeneration++
+		if work.batch.timer != nil {
+			work.batch.timer.Stop()
+			work.batch.timer = nil
+		}
+	}
+}
+
+func (c *progressCoalescer) advanceEntryLocked(key progressInternalKey, entry *progressEntry) {
+	if entry == nil || entry.activeBatch != nil || entry.activeBarrier != nil || len(entry.queue) == 0 {
+		return
+	}
+	work := entry.queue[0]
+	if work.batch != nil && !work.batch.ready {
+		return
+	}
+	entry.queue = entry.queue[1:]
+	if work.batch != nil {
+		entry.activeBatch = work.batch
+		go c.dispatchBatch(key, entry, work.batch)
+		return
+	}
+	entry.activeBarrier = work.barrier
+	work.barrier.active = true
+	close(work.barrier.granted)
+}
+
+func (c *progressCoalescer) dispatchBufferedRequest(buffered *progressBufferedRequest) (response progressResponse, dispatchErr error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			response = progressBadGatewayResponse()
+			dispatchErr = progressDispatchPanicError(recovered)
+		}
+	}()
+	defer func() {
+		if buffered != nil && buffered.release != nil {
+			buffered.release()
+		}
+	}()
+	if buffered == nil || buffered.request == nil || c.dispatch == nil {
+		return progressBadGatewayResponse(), errProgressDispatchPanicked
+	}
+	return c.dispatch(buffered.request)
+}
+
+func (c *progressCoalescer) dispatchBatch(key progressInternalKey, entry *progressEntry, batch *progressBatch) {
+	response, dispatchErr := c.dispatchBufferedRequest(batch.request)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries[key] != entry || entry.activeBatch != batch {
+		return
+	}
+	entry.activeBatch = nil
+	entry.lastActivity = time.Now()
+	if dispatchErr != nil && c.drain != nil && (c.state == progressCoalescerQuiescing || c.state == progressCoalescerDraining) {
+		c.drain.err = errors.Join(c.drain.err, dispatchErr)
+	}
+	outcome := progressOutcome{Response: response, Err: dispatchErr}
+	for waiter := range batch.waiters {
+		if !waiter.active {
+			continue
+		}
+		waiter.active = false
+		c.releaseWaiterLocked(entry)
+		waiter.result <- outcome
+	}
+	if c.state == progressCoalescerDraining {
+		c.forceQueuedBatchesLocked(entry)
+	}
+	c.advanceEntryLocked(key, entry)
+	c.completeDrainLocked()
+}
+
+func (c *progressCoalescer) enqueueUpdate(key progressInternalKey, request *progressBufferedRequest, now time.Time) (*progressWaiter, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state != progressCoalescerOpen && c.state != progressCoalescerQuiescing {
+		return nil, false
+	}
+	entry, created := c.getOrCreateEntryLocked(key, now)
+	if entry == nil {
+		return nil, false
+	}
+	if !c.reserveWaiterLocked(entry) {
+		c.releaseEmptyNewEntryLocked(key, entry, created)
+		return nil, false
+	}
+	waiter := &progressWaiter{result: make(chan progressOutcome, 1), entry: entry, active: true}
+	var batch *progressBatch
+	if len(entry.queue) > 0 {
+		batch = entry.queue[len(entry.queue)-1].batch
+	}
+	if batch == nil {
+		batch = &progressBatch{
+			request:      request,
+			waiters:      make(map[*progressWaiter]struct{}),
+			firstArrival: now,
+			lastArrival:  now,
+		}
+		entry.queue = append(entry.queue, &progressWork{batch: batch})
+	} else {
+		batch.request.release()
+		batch.request = request
+		batch.lastArrival = now
+	}
+	waiter.batch = batch
+	batch.waiters[waiter] = struct{}{}
+	entry.lastActivity = now
+	c.scheduleBatchLocked(key, entry, batch, now)
+	c.advanceEntryLocked(key, entry)
+	return waiter, true
+}
+
+func (c *progressCoalescer) resolveCanceledWaiter(key progressInternalKey, entry *progressEntry, waiter *progressWaiter) (progressOutcome, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if waiter == nil {
+		return progressOutcome{}, false
+	}
+	if !waiter.active {
+		select {
+		case outcome := <-waiter.result:
+			return outcome, true
+		default:
+			return progressOutcome{}, false
+		}
+	}
+	if c.entries[key] != entry {
+		return progressOutcome{}, false
+	}
+	waiter.active = false
+	delete(waiter.batch.waiters, waiter)
+	c.releaseWaiterLocked(entry)
+	entry.lastActivity = time.Now()
+	return progressOutcome{}, false
+}
+
+func (c *progressCoalescer) waitForProgressOutcome(ctx context.Context, key progressInternalKey, waiter *progressWaiter) (progressOutcome, bool) {
+	select {
+	case outcome := <-waiter.result:
+		return outcome, true
+	default:
+	}
+	select {
+	case outcome := <-waiter.result:
+		return outcome, true
+	case <-ctx.Done():
+		return c.resolveCanceledWaiter(key, waiter.entry, waiter)
+	}
+}
+
+func (c *progressCoalescer) enqueueBarrier(key progressInternalKey, now time.Time) (*progressEntry, *progressBarrier, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state != progressCoalescerOpen && c.state != progressCoalescerQuiescing {
+		return nil, nil, false
+	}
+	entry, created := c.getOrCreateEntryLocked(key, now)
+	if entry == nil {
+		return nil, nil, false
+	}
+	if !c.reserveWaiterLocked(entry) {
+		c.releaseEmptyNewEntryLocked(key, entry, created)
+		return nil, nil, false
+	}
+	barrier := &progressBarrier{granted: make(chan struct{})}
+	c.forceQueuedBatchesLocked(entry)
+	entry.queue = append(entry.queue, &progressWork{barrier: barrier})
+	entry.lastActivity = now
+	c.advanceEntryLocked(key, entry)
+	return entry, barrier, true
+}
+
+func (c *progressCoalescer) removeBarrierLocked(entry *progressEntry, barrier *progressBarrier) bool {
+	for index, work := range entry.queue {
+		if work.barrier != barrier {
+			continue
+		}
+		entry.queue = append(entry.queue[:index], entry.queue[index+1:]...)
+		return true
+	}
+	return false
+}
+
+func (c *progressCoalescer) waitForBarrier(ctx context.Context, key progressInternalKey, entry *progressEntry, barrier *progressBarrier) bool {
+	select {
+	case <-barrier.granted:
+		return true
+	case <-ctx.Done():
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.entries[key] != entry || barrier.released {
+			return false
+		}
+		if barrier.active {
+			return true
+		}
+		if c.removeBarrierLocked(entry, barrier) {
+			barrier.canceled = true
+			c.releaseWaiterLocked(entry)
+			entry.lastActivity = time.Now()
+			c.advanceEntryLocked(key, entry)
+			c.completeDrainLocked()
+		}
+		return false
+	}
+}
+
+func (c *progressCoalescer) releaseBarrier(key progressInternalKey, entry *progressEntry, barrier *progressBarrier) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries[key] != entry || entry.activeBarrier != barrier || barrier.released {
+		return
+	}
+	barrier.released = true
+	barrier.active = false
+	entry.activeBarrier = nil
+	c.releaseWaiterLocked(entry)
+	entry.lastActivity = time.Now()
+	if c.state == progressCoalescerDraining {
+		c.forceQueuedBatchesLocked(entry)
+	}
+	c.advanceEntryLocked(key, entry)
+	c.completeDrainLocked()
+}
+
+func (c *progressCoalescer) serveProgressFallback(w http.ResponseWriter, r *http.Request, ordinary http.Handler) {
+	c.mu.Lock()
+	failOpen := c.state == progressCoalescerOpen
+	c.mu.Unlock()
+	if failOpen {
+		ordinary.ServeHTTP(w, r)
+		return
+	}
+	writeProgressResponse(w, progressServiceUnavailableResponse())
+}
+
+func (c *progressCoalescer) ServeHTTP(w http.ResponseWriter, r *http.Request, ordinary http.Handler) bool {
+	if c == nil || ordinary == nil {
+		return false
+	}
+	kind := progressPathKind(r)
+	if kind == progressRequestNone {
+		return false
+	}
+	if !c.beginProgressIngress() {
+		writeProgressResponse(w, progressServiceUnavailableResponse())
+		return true
+	}
+	admissionActive := true
+	releaseAdmission := func() {
+		if admissionActive {
+			admissionActive = false
+			c.endProgressIngress()
+		}
+	}
+	defer releaseAdmission()
+
+	payload, complete := readProgressRequestBody(r)
+	if !complete {
+		c.serveProgressFallback(w, r, ordinary)
+		return true
+	}
+	identity, valid := parseProgressIdentity(payload)
+	if !valid {
+		c.serveProgressFallback(w, r, ordinary)
+		return true
+	}
+	credential, valid := progressCredentialDigest(c.global, r)
+	if !valid {
+		c.serveProgressFallback(w, r, ordinary)
+		return true
+	}
+	key := progressInternalKey{Identity: identity, Credential: credential}
+	now := time.Now()
+
+	if kind == progressRequestStopped {
+		entry, barrier, accepted := c.enqueueBarrier(key, now)
+		if !accepted {
+			c.serveProgressFallback(w, r, ordinary)
+			return true
+		}
+		releaseAdmission()
+		if !c.waitForBarrier(r.Context(), key, entry, barrier) {
+			return true
+		}
+		defer c.releaseBarrier(key, entry, barrier)
+		if r.Context().Err() != nil {
+			return true
+		}
+		ordinary.ServeHTTP(w, r)
+		return true
+	}
+
+	request := newProgressBufferedRequest(c.ctx, r, payload)
+	waiter, accepted := c.enqueueUpdate(key, request, now)
+	if !accepted {
+		request.release()
+		c.serveProgressFallback(w, r, ordinary)
+		return true
+	}
+	releaseAdmission()
+	outcome, published := c.waitForProgressOutcome(r.Context(), key, waiter)
+	if published {
+		writeProgressResponse(w, outcome.Response)
+	}
+	return true
+}
+
+func (c *progressCoalescer) advanceDrainLocked() {
+	if c.state != progressCoalescerQuiescing || c.drain == nil || c.admissions != 0 {
+		return
+	}
+	c.state = progressCoalescerDraining
+	for key, entry := range c.entries {
+		c.forceQueuedBatchesLocked(entry)
+		c.advanceEntryLocked(key, entry)
+	}
+	c.completeDrainLocked()
+}
+
+func (c *progressCoalescer) completeDrainLocked() {
+	if c.state != progressCoalescerDraining || c.drain == nil || c.admissions != 0 {
+		return
+	}
+	for _, entry := range c.entries {
+		if entry.activeBatch != nil || entry.activeBarrier != nil || len(entry.queue) != 0 {
+			return
+		}
+	}
+	cycle := c.drain
+	c.drain = nil
+	if cycle.err == nil {
+		c.state = progressCoalescerDrained
+	} else {
+		c.state = progressCoalescerOpen
+	}
+	close(cycle.done)
+}
+
+func (c *progressCoalescer) Drain(ctx context.Context) error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	switch c.state {
+	case progressCoalescerClosed, progressCoalescerDrained:
+		c.mu.Unlock()
+		return nil
+	case progressCoalescerQuiescing, progressCoalescerDraining:
+		cycle := c.drain
+		c.mu.Unlock()
+		select {
+		case <-cycle.done:
+			return cycle.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	cycle := &progressDrainCycle{done: make(chan struct{})}
+	c.state = progressCoalescerQuiescing
+	c.drain = cycle
+	c.advanceDrainLocked()
+	c.mu.Unlock()
+
+	select {
+	case <-cycle.done:
+		return cycle.err
+	case <-ctx.Done():
+		c.mu.Lock()
+		if (c.state == progressCoalescerQuiescing || c.state == progressCoalescerDraining) && c.drain == cycle {
+			c.state = progressCoalescerOpen
+			c.drain = nil
+		}
+		c.mu.Unlock()
+		return ctx.Err()
+	}
+}
+
+func (c *progressCoalescer) Close() {
+	if c == nil {
+		return
+	}
+	c.cancel()
+	c.mu.Lock()
+	if c.state == progressCoalescerClosed {
+		done := c.maintenanceDone
+		c.mu.Unlock()
+		<-done
+		return
+	}
+	c.state = progressCoalescerClosed
+	for key, entry := range c.entries {
+		for _, work := range entry.queue {
+			if work.batch != nil {
+				work.batch.timerGeneration++
+				if work.batch.timer != nil {
+					work.batch.timer.Stop()
+				}
+				work.batch.request.release()
+			}
+		}
+		delete(c.entries, key)
+		c.global.releaseKey()
+	}
+	c.mu.Unlock()
+	<-c.maintenanceDone
+}
+
+func (c *progressCoalescer) activeCounts() (keys, waiters int) {
+	if c == nil {
+		return 0, 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, entry := range c.entries {
+		waiters += entry.waiters
+	}
+	return len(c.entries), waiters
+}
+
+const (
+	pingCacheTTL          = 2 * time.Second
+	pingCacheMaxBodyBytes = 64 << 10
+	pingCacheMaxEntries   = 256
+)
+
+type pingCacheRoute uint8
+
+const (
+	pingCacheRouteSystem pingCacheRoute = iota + 1
+	pingCacheRouteEmbySystem
+)
+
+type pingCacheRequestContextKey struct{}
+
+func pingCacheRouteForRequest(r *http.Request) (pingCacheRoute, bool) {
+	if r == nil || r.URL == nil || r.Method != http.MethodGet && r.Method != http.MethodHead || hasUpgradeIntent(r) {
+		return 0, false
+	}
+	if r.ContentLength != 0 || len(r.TransferEncoding) != 0 || cacheRequestForcesRevalidation(r) {
+		return 0, false
+	}
+	if cacheHeaderPresent(r.Header, "Range") || cacheHeaderPresent(r.Header, "If-Range") {
+		return 0, false
+	}
+	if r.URL.EscapedPath() != r.URL.Path {
+		return 0, false
+	}
+	switch r.URL.Path {
+	case "/System/Ping":
+		return pingCacheRouteSystem, true
+	case "/emby/System/Ping":
+		return pingCacheRouteEmbySystem, true
+	default:
+		return 0, false
+	}
+}
+
+type pingCacheKey struct {
+	siteID                      int64
+	primaryAuthority            string
+	route                       pingCacheRoute
+	method                      string
+	forceQuery                  bool
+	representationQueryDigest   [sha256.Size]byte
+	representationHeadersDigest [sha256.Size]byte
+	credentialIdentityDigest    [sha256.Size]byte
+}
+
+type pingCacheEntry struct {
+	key           pingCacheKey
+	header        http.Header
+	body          []byte
+	contentLength int64
+	responseAt    time.Time
+	initialAge    time.Duration
+	expiresAt     time.Time
+}
+
+type pingCacheFlight struct {
+	done       chan struct{}
+	generation uint64
+	waiters    int
+}
+
+type pingCache struct {
+	mu               sync.Mutex
+	siteID           int64
+	primaryAuthority string
+	credentialKey    [sha256.Size]byte
+	now              func() time.Time
+	generation       uint64
+	entries          map[pingCacheKey]*list.Element
+	lru              list.List
+	inflight         map[pingCacheKey]*pingCacheFlight
+}
+
+func newPingCache(siteID int64, primary *url.URL, now func() time.Time) (*pingCache, error) {
+	authority := redirectHostKey(primary)
+	if siteID <= 0 || authority == "" {
+		return nil, fmt.Errorf("ping cache requires a site ID and normalized primary authority")
+	}
+	if now == nil {
+		now = time.Now
+	}
+	cache := &pingCache{
+		siteID:           siteID,
+		primaryAuthority: authority,
+		now:              now,
+		entries:          make(map[pingCacheKey]*list.Element),
+		inflight:         make(map[pingCacheKey]*pingCacheFlight),
+	}
+	if _, err := rand.Read(cache.credentialKey[:]); err != nil {
+		return nil, fmt.Errorf("initialize ping cache credential key: %w", err)
+	}
+	return cache, nil
+}
+
+func (c *pingCache) requestKey(req *http.Request) (pingCacheKey, bool) {
+	if c == nil || req == nil || req.URL == nil || req.Context().Err() != nil {
+		return pingCacheKey{}, false
+	}
+	route, ok := req.Context().Value(pingCacheRequestContextKey{}).(pingCacheRoute)
+	if !ok || route != pingCacheRouteSystem && route != pingCacheRouteEmbySystem ||
+		req.Method != http.MethodGet && req.Method != http.MethodHead || redirectHostKey(req.URL) != c.primaryAuthority ||
+		req.ContentLength != 0 || len(req.TransferEncoding) != 0 ||
+		cacheRequestForcesRevalidation(req) || cacheHeaderPresent(req.Header, "Range") || cacheHeaderPresent(req.Header, "If-Range") {
+		return pingCacheKey{}, false
+	}
+	representationQuery, credentialQuery, ok := splitCanonicalCacheQuery(req.URL.RawQuery)
+	if !ok {
+		return pingCacheKey{}, false
+	}
+	representationHeaders, ok := cacheHeaderDigest(req.Header,
+		"Accept", "Accept-Charset", "Accept-Encoding", "Accept-Language", "Origin", "User-Agent",
+		"X-Emby-Client", "X-Emby-Client-Version", "X-Emby-Device-Id", "X-Emby-Device-Name")
+	if !ok {
+		return pingCacheKey{}, false
+	}
+	credentialIdentity, ok := cacheCredentialDigest(c.credentialKey, credentialQuery, req.Header)
+	if !ok {
+		return pingCacheKey{}, false
+	}
+	return pingCacheKey{
+		siteID:                      c.siteID,
+		primaryAuthority:            c.primaryAuthority,
+		route:                       route,
+		method:                      req.Method,
+		forceQuery:                  req.URL.ForceQuery,
+		representationQueryDigest:   sha256.Sum256([]byte(representationQuery)),
+		representationHeadersDigest: representationHeaders,
+		credentialIdentityDigest:    credentialIdentity,
+	}, true
+}
+
+func (c *pingCache) removeEntryLocked(element *list.Element) {
+	if element == nil {
+		return
+	}
+	if entry, ok := element.Value.(*pingCacheEntry); ok && entry != nil {
+		delete(c.entries, entry.key)
+	}
+	c.lru.Remove(element)
+}
+
+func (c *pingCache) lookupLocked(key pingCacheKey, now time.Time) *pingCacheEntry {
+	element := c.entries[key]
+	if element == nil {
+		return nil
+	}
+	entry, _ := element.Value.(*pingCacheEntry)
+	if entry == nil || !now.Before(entry.expiresAt) {
+		c.removeEntryLocked(element)
+		return nil
+	}
+	c.lru.MoveToFront(element)
+	return entry
+}
+
+func pingCacheResponseFromEntry(req *http.Request, entry *pingCacheEntry, now time.Time) *http.Response {
+	body := io.ReadCloser(http.NoBody)
+	if req.Method == http.MethodGet {
+		body = io.NopCloser(bytes.NewReader(entry.body))
+	}
+	header := entry.header.Clone()
+	header.Set("Age", cacheResponseAgeValue(entry.initialAge, entry.responseAt, now))
+	return &http.Response{
+		Status:        "200 OK",
+		StatusCode:    http.StatusOK,
+		Header:        header,
+		Body:          body,
+		ContentLength: entry.contentLength,
+		Request:       req,
+	}
+}
+
+func (c *pingCache) cachedResponse(key pingCacheKey, req *http.Request) (*http.Response, bool) {
+	c.mu.Lock()
+	now := c.now()
+	entry := c.lookupLocked(key, now)
+	if entry == nil {
+		c.mu.Unlock()
+		return nil, false
+	}
+	response := pingCacheResponseFromEntry(req, entry, now)
+	c.mu.Unlock()
+	return response, true
+}
+
+func pingCacheVarySafe(header http.Header) bool {
+	values, ok := cacheHeaderValues(header, "Vary")
+	if !ok {
+		return false
+	}
+	for _, value := range values {
+		if strings.TrimSpace(value) == "" {
+			continue
+		}
+		for _, raw := range strings.Split(value, ",") {
+			switch strings.ToLower(strings.TrimSpace(raw)) {
+			case "accept", "accept-charset", "accept-encoding", "accept-language", "origin", "user-agent",
+				"x-emby-client", "x-emby-client-version", "x-emby-device-id", "x-emby-device-name":
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func pingCacheResponseHeadersSafe(resp *http.Response, method string) bool {
+	if resp == nil || resp.StatusCode != http.StatusOK || cacheHeaderPresent(resp.Header, "Set-Cookie") ||
+		cacheHeaderPresent(resp.Header, "Content-Range") || cacheHeaderPresent(resp.Header, "Trailer") ||
+		len(resp.Trailer) != 0 || !pingCacheVarySafe(resp.Header) {
+		return false
+	}
+	directives, ok := parseCacheControlDirectives(resp.Header, "Cache-Control")
+	if !ok || cacheDirectivePresent(directives, "private") || cacheDirectivePresent(directives, "no-store") || cacheDirectivePresent(directives, "no-cache") || cachePragmaNoCache(resp.Header) {
+		return false
+	}
+	return method == http.MethodHead || resp.ContentLength <= pingCacheMaxBodyBytes
+}
+
+func pingCacheReplayHeaders(header http.Header, contentLength int64) (http.Header, bool) {
+	replay, _, ok := safeCachedResponseHeaders(header, []string{
+		"Access-Control-Allow-Credentials", "Access-Control-Allow-Origin", "Access-Control-Expose-Headers",
+		"Cache-Control", "Content-Encoding", "Content-Language", "Content-Type", "Date", "ETag", "Expires", "Last-Modified", "Vary",
+	})
+	if !ok {
+		return nil, false
+	}
+	if contentLength >= 0 {
+		replay.Set("Content-Length", strconv.FormatInt(contentLength, 10))
+	}
+	return replay, true
+}
+
+type pingCacheJoinedBody struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (body *pingCacheJoinedBody) Close() error { return body.closer.Close() }
+
+type pingCacheFailedBody struct {
+	prefix *bytes.Reader
+	err    error
+}
+
+func (body *pingCacheFailedBody) Read(p []byte) (int, error) {
+	if body.prefix.Len() != 0 {
+		return body.prefix.Read(p)
+	}
+	if body.err != nil {
+		err := body.err
+		body.err = nil
+		return 0, err
+	}
+	return 0, io.EOF
+}
+
+func (*pingCacheFailedBody) Close() error { return nil }
+
+// prepareResponse publishes only a complete EOF-backed body. Oversized bodies
+// keep streaming through a bounded prefix plus the untouched remainder, while
+// read failures replay the consumed prefix followed by the original error.
+func (c *pingCache) prepareResponse(req *http.Request, resp *http.Response, responseAt time.Time) (*pingCacheEntry, *http.Response) {
+	if !pingCacheResponseHeadersSafe(resp, req.Method) {
+		return nil, resp
+	}
+	originalBody := resp.Body
+	if originalBody == nil {
+		originalBody = http.NoBody
+	}
+	originalLength := resp.ContentLength
+	body, readErr := io.ReadAll(io.LimitReader(originalBody, pingCacheMaxBodyBytes+1))
+	if readErr != nil {
+		_ = originalBody.Close()
+		resp.Body = &pingCacheFailedBody{prefix: bytes.NewReader(body), err: readErr}
+		return nil, resp
+	}
+	if len(body) > pingCacheMaxBodyBytes {
+		resp.Body = &pingCacheJoinedBody{Reader: io.MultiReader(bytes.NewReader(body), originalBody), closer: originalBody}
+		return nil, resp
+	}
+	closeErr := originalBody.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	if resp.Header == nil {
+		resp.Header = make(http.Header)
+	}
+	if req.Method == http.MethodGet {
+		resp.ContentLength = int64(len(body))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		if originalLength >= 0 && originalLength != int64(len(body)) {
+			return nil, resp
+		}
+	} else if len(body) != 0 {
+		return nil, resp
+	}
+	if closeErr != nil {
+		return nil, resp
+	}
+	contentLength := resp.ContentLength
+	if req.Method == http.MethodGet {
+		contentLength = int64(len(body))
+	}
+	expiresAt, initialAge, fresh := cacheResponseFreshness(resp.Header, responseAt, pingCacheTTL)
+	if !fresh {
+		return nil, resp
+	}
+	header, ok := pingCacheReplayHeaders(resp.Header, contentLength)
+	if !ok {
+		return nil, resp
+	}
+	return &pingCacheEntry{
+		header: header, body: body, contentLength: contentLength,
+		responseAt: responseAt, initialAge: initialAge, expiresAt: expiresAt,
+	}, resp
+}
+
+func (c *pingCache) finishFlight(key pingCacheKey, flight *pingCacheFlight, entry *pingCacheEntry) {
+	c.mu.Lock()
+	if c.inflight[key] == flight {
+		if entry != nil && flight.generation == c.generation && c.now().Before(entry.expiresAt) {
+			entry.key = key
+			if previous := c.entries[key]; previous != nil {
+				c.removeEntryLocked(previous)
+			}
+			c.entries[key] = c.lru.PushFront(entry)
+			for len(c.entries) > pingCacheMaxEntries {
+				c.removeEntryLocked(c.lru.Back())
+			}
+		}
+		delete(c.inflight, key)
+		close(flight.done)
+	}
+	c.mu.Unlock()
+}
+
+func (c *pingCache) roundTrip(req *http.Request, upstream http.RoundTripper) (*http.Response, error) {
+	key, ok := c.requestKey(req)
+	if !ok {
+		return upstream.RoundTrip(req)
+	}
+	if response, hit := c.cachedResponse(key, req); hit {
+		return response, nil
+	}
+	c.mu.Lock()
+	now := c.now()
+	if entry := c.lookupLocked(key, now); entry != nil {
+		response := pingCacheResponseFromEntry(req, entry, now)
+		c.mu.Unlock()
+		return response, nil
+	}
+	if flight := c.inflight[key]; flight != nil {
+		flight.waiters++
+		done := flight.done
+		c.mu.Unlock()
+		select {
+		case <-done:
+			if response, hit := c.cachedResponse(key, req); hit {
+				return response, nil
+			}
+			if err := req.Context().Err(); err != nil {
+				return nil, err
+			}
+			return upstream.RoundTrip(req)
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		}
+	}
+	flight := &pingCacheFlight{done: make(chan struct{}), generation: c.generation}
+	c.inflight[key] = flight
+	c.mu.Unlock()
+
+	resp, err := upstream.RoundTrip(req)
+	if err != nil {
+		c.finishFlight(key, flight, nil)
+		return nil, err
+	}
+	responseAt := c.now()
+	entry, prepared := c.prepareResponse(req, resp, responseAt)
+	c.finishFlight(key, flight, entry)
+	return prepared, nil
+}
+
+func (c *pingCache) invalidate() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.generation++
+	for element := c.lru.Front(); element != nil; {
+		next := element.Next()
+		c.removeEntryLocked(element)
+		element = next
+	}
+	c.mu.Unlock()
+}
+
+type pingCacheTransport struct {
+	base  http.RoundTripper
+	cache *pingCache
+}
+
+func (transport *pingCacheTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if transport == nil || transport.base == nil {
+		return nil, fmt.Errorf("ping cache transport is not configured")
+	}
+	if transport.cache == nil {
+		return transport.base.RoundTrip(req)
+	}
+	return transport.cache.roundTrip(req, transport.base)
+}
+
 type ProxyInstance struct {
 	Site      Site
 	handler   http.Handler
@@ -9182,13 +11063,33 @@ type ProxyInstance struct {
 	// single-site history snapshot and the live overlay in global snapshots.
 	// Lock order is pm.mu -> trafficMu; helpers that take trafficMu (e.g.
 	// flushProxyTraffic) must never be called from code that already holds it.
-	trafficMu        sync.Mutex
-	bytesIn          atomic.Int64
-	bytesOut         atomic.Int64
-	reqCount         atomic.Int64
-	persistedTraffic atomic.Int64
-	trustedProxies   []*net.IPNet
-	dynamicState     *dynamicSiteState
+	trafficMu            sync.Mutex
+	bytesIn              atomic.Int64
+	bytesOut             atomic.Int64
+	reqCount             atomic.Int64
+	activeTrafficMeters  atomic.Int64
+	flushBytesIn         int64
+	flushBytesOut        int64
+	pendingMinuteTraffic map[int64]trafficMinuteDelta
+	persistedTraffic     atomic.Int64
+	trustedProxies       []*net.IPNet
+	dynamicState         *dynamicSiteState
+	progress             *progressCoalescer
+	pingCache            *pingCache
+	imageCache           *imageCacheSite
+}
+
+func (inst *ProxyInstance) drainProgress(ctx context.Context) error {
+	if inst == nil || inst.progress == nil {
+		return nil
+	}
+	return inst.progress.Drain(ctx)
+}
+
+func (inst *ProxyInstance) closeProgress() {
+	if inst != nil && inst.progress != nil {
+		inst.progress.Close()
+	}
 }
 
 type ProxyManager struct {
@@ -9203,6 +11104,8 @@ type ProxyManager struct {
 	shutdownStarted         atomic.Bool
 	database                *DB
 	dynamicRuntime          *dynamicRuntime
+	progressRuntime         *progressGlobalRuntime
+	imageCacheRuntime       *imageCacheRuntime
 	dynamicRouteKey         []byte
 	dynamicTransportFactory dynamicTransportFactory
 	dynamicAvailable        bool
@@ -9300,6 +11203,8 @@ func (inst *ProxyInstance) shutdown(ctx context.Context) error {
 		connections = append(connections, conn)
 	}
 	inst.lifecycleMu.Unlock()
+	inst.pingCache.invalidate()
+	inst.imageCache.close()
 
 	if inst.listener != nil {
 		_ = inst.listener.Close()
@@ -9330,11 +11235,13 @@ func (inst *ProxyInstance) shutdown(ctx context.Context) error {
 
 func NewProxyManager(db *DB, upstreamHeaderKey []byte) *ProxyManager {
 	pm := &ProxyManager{
-		proxies:         make(map[int64]*ProxyInstance),
-		publicHosts:     make(map[string]int64),
-		publicHostModes: make(map[string]string),
-		dynamicRuntime:  newDynamicRuntime(),
-		database:        db,
+		proxies:           make(map[int64]*ProxyInstance),
+		publicHosts:       make(map[string]int64),
+		publicHostModes:   make(map[string]string),
+		dynamicRuntime:    newDynamicRuntime(),
+		progressRuntime:   newProgressGlobalRuntime(progressMaxGlobalKeys, progressMaxGlobalWaiters),
+		imageCacheRuntime: newImageCacheRuntime(upstreamHeaderKey),
+		database:          db,
 	}
 	pm.upstreamHeaderKey = append([]byte(nil), upstreamHeaderKey...)
 	return pm
@@ -9534,20 +11441,164 @@ func (pm *ProxyManager) PublicHostSiteID(host string) (int64, bool) {
 	return id, ok
 }
 
+// requestTrafficMeter keeps ordinary HTTP bytes request-local until completion,
+// while global pending totals continue to update on every read/write. A request
+// promotes to streaming on Flush or a UTC-minute crossing; promoted traffic is
+// aggregated immediately by occurrence minute so long-lived streams and
+// WebSockets do not disappear until they close.
+type requestTrafficMeter struct {
+	inst          *ProxyInstance
+	mu            sync.Mutex
+	startedMinute int64
+	localIn       int64
+	localOut      int64
+	streaming     bool
+	finished      bool
+}
+
+func newRequestTrafficMeter(inst *ProxyInstance) *requestTrafficMeter {
+	return newRequestTrafficMeterAt(inst, time.Now())
+}
+
+func newRequestTrafficMeterAt(inst *ProxyInstance, at time.Time) *requestTrafficMeter {
+	inst.trafficMu.Lock()
+	inst.activeTrafficMeters.Add(1)
+	inst.trafficMu.Unlock()
+	return &requestTrafficMeter{inst: inst, startedMinute: trafficMinuteStart(at)}
+}
+
+func (inst *ProxyInstance) addMinuteTraffic(minuteStart, bytesIn, bytesOut, requests int64, addGlobal bool) {
+	if bytesIn == 0 && bytesOut == 0 && requests == 0 {
+		return
+	}
+	inst.trafficMu.Lock()
+	defer inst.trafficMu.Unlock()
+	if addGlobal {
+		inst.bytesIn.Add(bytesIn)
+		inst.bytesOut.Add(bytesOut)
+	}
+	if inst.pendingMinuteTraffic == nil {
+		inst.pendingMinuteTraffic = make(map[int64]trafficMinuteDelta)
+	}
+	delta := inst.pendingMinuteTraffic[minuteStart]
+	delta.BytesIn += bytesIn
+	delta.BytesOut += bytesOut
+	delta.Requests += requests
+	inst.pendingMinuteTraffic[minuteStart] = delta
+	inst.flushBytesIn += bytesIn
+	inst.flushBytesOut += bytesOut
+}
+
+func (m *requestTrafficMeter) promoteLocked() {
+	if m.streaming {
+		return
+	}
+	m.streaming = true
+	if m.localIn != 0 || m.localOut != 0 {
+		m.inst.addMinuteTraffic(m.startedMinute, m.localIn, m.localOut, 0, false)
+		m.localIn = 0
+		m.localOut = 0
+	}
+}
+
+func (m *requestTrafficMeter) promote() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.promoteLocked()
+}
+
+func (m *requestTrafficMeter) add(bytesIn, bytesOut int64, at time.Time) {
+	if m == nil || (bytesIn == 0 && bytesOut == 0) {
+		return
+	}
+	minuteStart := trafficMinuteStart(at)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.finished {
+		return
+	}
+	if !m.streaming && minuteStart == m.startedMinute {
+		m.inst.bytesIn.Add(bytesIn)
+		m.inst.bytesOut.Add(bytesOut)
+		m.localIn += bytesIn
+		m.localOut += bytesOut
+		return
+	}
+	if !m.streaming {
+		m.promoteLocked()
+	}
+	m.inst.addMinuteTraffic(minuteStart, bytesIn, bytesOut, 0, true)
+}
+
+func (m *requestTrafficMeter) addIn(n int64) {
+	m.add(n, 0, time.Now())
+}
+
+func (m *requestTrafficMeter) addOut(n int64) {
+	m.add(0, n, time.Now())
+}
+
+// finish attributes an ordinary request's bytes and every request count to the
+// completion minute. Stream bytes were already attributed by occurrence time.
+func (m *requestTrafficMeter) finish(at time.Time) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	if m.finished {
+		m.mu.Unlock()
+		return
+	}
+	m.finished = true
+	minuteStart := trafficMinuteStart(at)
+	if m.streaming {
+		m.inst.addMinuteTraffic(minuteStart, 0, 0, 1, false)
+	} else {
+		m.inst.addMinuteTraffic(minuteStart, m.localIn, m.localOut, 1, false)
+		m.localIn = 0
+		m.localOut = 0
+	}
+	m.inst.reqCount.Add(1)
+	m.mu.Unlock()
+	m.inst.activeTrafficMeters.Add(-1)
+}
+
+func addMeteredBytes(counter *atomic.Int64, meter *requestTrafficMeter, inbound bool, n int64) {
+	if n <= 0 {
+		return
+	}
+	if meter != nil {
+		if inbound {
+			meter.addIn(n)
+		} else {
+			meter.addOut(n)
+		}
+		return
+	}
+	if counter != nil {
+		counter.Add(n)
+	}
+}
+
 // metered response writer
 type meteredWriter struct {
 	http.ResponseWriter
 	written *atomic.Int64
+	meter   *requestTrafficMeter
 }
 
 func (m *meteredWriter) Write(b []byte) (int, error) {
 	n, err := m.ResponseWriter.Write(b)
-	m.written.Add(int64(n))
+	addMeteredBytes(m.written, m.meter, false, int64(n))
 	return n, err
 }
 
 // Flush support for streaming
 func (m *meteredWriter) Flush() {
+	m.meter.promote()
 	if f, ok := m.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
@@ -9564,12 +11615,13 @@ func (m *meteredWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 // metered request body reader
 type meteredReader struct {
 	io.ReadCloser
-	read *atomic.Int64
+	read  *atomic.Int64
+	meter *requestTrafficMeter
 }
 
 func (m *meteredReader) Read(p []byte) (int, error) {
 	n, err := m.ReadCloser.Read(p)
-	m.read.Add(int64(n))
+	addMeteredBytes(m.read, m.meter, true, int64(n))
 	return n, err
 }
 
@@ -9577,6 +11629,7 @@ type rateLimitedWriter struct {
 	http.ResponseWriter
 	bytesPerSec    int64
 	written        *atomic.Int64
+	meter          *requestTrafficMeter
 	requestWritten int64
 	start          time.Time
 }
@@ -9584,7 +11637,7 @@ type rateLimitedWriter struct {
 func (w *rateLimitedWriter) Write(b []byte) (int, error) {
 	if w.bytesPerSec <= 0 {
 		n, err := w.ResponseWriter.Write(b)
-		w.written.Add(int64(n))
+		addMeteredBytes(w.written, w.meter, false, int64(n))
 		return n, err
 	}
 	totalWritten := 0
@@ -9603,7 +11656,7 @@ func (w *rateLimitedWriter) Write(b []byte) (int, error) {
 			chunk = b[:allowed]
 		}
 		n, err := w.ResponseWriter.Write(chunk)
-		w.written.Add(int64(n))
+		addMeteredBytes(w.written, w.meter, false, int64(n))
 		w.requestWritten += int64(n)
 		totalWritten += n
 		b = b[n:]
@@ -9618,6 +11671,7 @@ func (w *rateLimitedWriter) Write(b []byte) (int, error) {
 }
 
 func (w *rateLimitedWriter) Flush() {
+	w.meter.promote()
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
@@ -9631,12 +11685,13 @@ func (w *rateLimitedWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 }
 
 // tunnelWriter meters, and optionally paces, bytes copied through a hijacked
-// WebSocket tunnel. Accounting has to happen per chunk rather than once the copy
-// returns, otherwise a long-lived tunnel stays invisible to the quota gate and
-// exempt from the site's speed limit for as long as it is open.
+// WebSocket tunnel. Its request meter is promoted before the tunnel starts, so
+// every chunk reaches an occurrence-minute bucket while the connection is live.
 type tunnelWriter struct {
 	dst         io.Writer
 	counter     *atomic.Int64
+	meter       *requestTrafficMeter
+	inbound     bool
 	bytesPerSec int64
 	written     int64
 	start       time.Time
@@ -9645,7 +11700,7 @@ type tunnelWriter struct {
 func (t *tunnelWriter) Write(b []byte) (int, error) {
 	if t.bytesPerSec <= 0 {
 		n, err := t.dst.Write(b)
-		t.counter.Add(int64(n))
+		addMeteredBytes(t.counter, t.meter, t.inbound, int64(n))
 		return n, err
 	}
 	total := 0
@@ -9664,7 +11719,7 @@ func (t *tunnelWriter) Write(b []byte) (int, error) {
 			chunk = b[:allowed]
 		}
 		n, err := t.dst.Write(chunk)
-		t.counter.Add(int64(n))
+		addMeteredBytes(t.counter, t.meter, t.inbound, int64(n))
 		t.written += int64(n)
 		total += n
 		b = b[n:]
@@ -10476,6 +12531,1144 @@ func isReservedDynamicRoute(requestPath string) bool {
 	return requestPath == strings.TrimSuffix(dynamicRoutePrefix, "/") || strings.HasPrefix(requestPath, dynamicRoutePrefix)
 }
 
+const (
+	imageCacheTTL               = time.Hour
+	imageCacheMaxBodyBytes      = int64(8 << 20)
+	imageCacheMaxSiteBytes      = int64(64 << 20)
+	imageCacheMaxProcessBytes   = int64(256 << 20)
+	maxCacheReplayHeaderBytes   = int64(64 << 10)
+	imageCacheEntryOverhead     = int64(512)
+	maxCanonicalCacheQueryBytes = 64 << 10
+)
+
+func cacheHeaderValues(header http.Header, name string) ([]string, bool) {
+	var values []string
+	found := false
+	for key, candidate := range header {
+		if !strings.EqualFold(key, name) {
+			continue
+		}
+		if found {
+			return nil, false
+		}
+		found = true
+		values = candidate
+	}
+	return values, true
+}
+
+func cacheHeaderPresent(header http.Header, name string) bool {
+	for key := range header {
+		if strings.EqualFold(key, name) {
+			return true
+		}
+	}
+	return false
+}
+
+type cacheControlDirectives map[string][]string
+
+func parseCacheControlDirectives(header http.Header, name string) (cacheControlDirectives, bool) {
+	values, ok := cacheHeaderValues(header, name)
+	if !ok {
+		return nil, false
+	}
+	directives := make(cacheControlDirectives)
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				return nil, false
+			}
+			key, directiveValue, hasValue := strings.Cut(part, "=")
+			key = strings.TrimSpace(key)
+			if key == "" {
+				return nil, false
+			}
+			for i := 0; i < len(key); i++ {
+				if !isHTTPTokenByte(key[i]) {
+					return nil, false
+				}
+			}
+			if hasValue {
+				directiveValue = strings.TrimSpace(directiveValue)
+			}
+			key = strings.ToLower(key)
+			directives[key] = append(directives[key], directiveValue)
+		}
+	}
+	return directives, true
+}
+
+func cacheDirectivePresent(directives cacheControlDirectives, name string) bool {
+	_, ok := directives[strings.ToLower(name)]
+	return ok
+}
+
+func cacheDirectiveValue(directives cacheControlDirectives, name string) (string, bool, bool) {
+	values, exists := directives[strings.ToLower(name)]
+	if !exists {
+		return "", false, true
+	}
+	if len(values) == 0 {
+		return "", true, false
+	}
+	for _, value := range values[1:] {
+		if value != values[0] {
+			return "", true, false
+		}
+	}
+	return values[0], true, true
+}
+
+func cachePragmaNoCache(header http.Header) bool {
+	values, ok := cacheHeaderValues(header, "Pragma")
+	if !ok {
+		return true
+	}
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), "no-cache") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func cacheRequestForcesRevalidation(r *http.Request) bool {
+	if r == nil {
+		return true
+	}
+	for _, name := range []string{"If-Match", "If-Modified-Since", "If-None-Match", "If-Unmodified-Since"} {
+		if cacheHeaderPresent(r.Header, name) {
+			return true
+		}
+	}
+	directives, ok := parseCacheControlDirectives(r.Header, "Cache-Control")
+	if !ok {
+		return true
+	}
+	for _, name := range []string{"no-cache", "no-store", "max-age", "min-fresh", "max-stale", "only-if-cached"} {
+		if cacheDirectivePresent(directives, name) {
+			return true
+		}
+	}
+	return cachePragmaNoCache(r.Header)
+}
+
+func cacheCredentialQueryName(name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	switch lower {
+	case "api_key", "apikey", "access_token", "auth", "authorization", "key", "sig", "signature", "token",
+		"x-emby-token", "x-mediabrowser-token", "x_emby_token", "x_mediabrowser_token",
+		"x-amz-credential", "x-amz-security-token", "x-amz-signature", "x-goog-credential", "x-goog-signature":
+		return true
+	default:
+		return strings.HasSuffix(lower, "_token") || strings.HasSuffix(lower, "-token")
+	}
+}
+
+func splitCanonicalCacheQuery(rawQuery string) (string, string, bool) {
+	if len(rawQuery) > maxCanonicalCacheQueryBytes {
+		return "", "", false
+	}
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return "", "", false
+	}
+	representation := make(url.Values)
+	credentials := make(url.Values)
+	for name, original := range values {
+		if cacheCredentialQueryName(name) {
+			credentials[name] = original
+		} else {
+			representation[name] = original
+		}
+	}
+	return representation.Encode(), credentials.Encode(), true
+}
+
+func writeCacheIdentityField(dst io.Writer, value string) {
+	_, _ = io.WriteString(dst, strconv.Itoa(len(value)))
+	_, _ = io.WriteString(dst, ":")
+	_, _ = io.WriteString(dst, value)
+}
+
+func deriveCacheCredentialKey(master []byte, purpose string) [sha256.Size]byte {
+	mac := hmac.New(sha256.New, master)
+	writeCacheIdentityField(mac, "meridian-memory-cache-v1")
+	writeCacheIdentityField(mac, purpose)
+	var key [sha256.Size]byte
+	copy(key[:], mac.Sum(nil))
+	return key
+}
+
+func cacheCredentialDigest(key [sha256.Size]byte, credentialQuery string, header http.Header) ([sha256.Size]byte, bool) {
+	mac := hmac.New(sha256.New, key[:])
+	writeCacheIdentityField(mac, credentialQuery)
+	effective := header.Clone()
+	stripCookieByName(effective, sessionCookieName)
+	for _, name := range []string{"Authorization", "Cookie", "Proxy-Authorization", "X-Api-Key", "X-Emby-Authorization", "X-Emby-Token", "X-MediaBrowser-Token"} {
+		values, ok := cacheHeaderValues(effective, name)
+		if !ok {
+			return [sha256.Size]byte{}, false
+		}
+		writeCacheIdentityField(mac, strings.ToLower(name))
+		writeCacheIdentityField(mac, strconv.Itoa(len(values)))
+		for _, value := range values {
+			writeCacheIdentityField(mac, value)
+		}
+	}
+	var digest [sha256.Size]byte
+	copy(digest[:], mac.Sum(nil))
+	return digest, true
+}
+
+func cacheHeaderDigest(header http.Header, names ...string) ([sha256.Size]byte, bool) {
+	digest := sha256.New()
+	for _, name := range names {
+		values, ok := cacheHeaderValues(header, name)
+		if !ok {
+			return [sha256.Size]byte{}, false
+		}
+		writeCacheIdentityField(digest, strings.ToLower(name))
+		writeCacheIdentityField(digest, strconv.Itoa(len(values)))
+		for _, value := range values {
+			writeCacheIdentityField(digest, value)
+		}
+	}
+	var result [sha256.Size]byte
+	copy(result[:], digest.Sum(nil))
+	return result, true
+}
+
+func safeCachedResponseHeaders(header http.Header, allowed []string) (http.Header, int64, bool) {
+	return safeCachedResponseHeadersWithin(header, allowed, maxCacheReplayHeaderBytes)
+}
+
+func safeCachedResponseHeadersWithin(header http.Header, allowed []string, maxBytes int64) (http.Header, int64, bool) {
+	if maxBytes < 0 || maxBytes > maxCacheReplayHeaderBytes {
+		return nil, 0, false
+	}
+	replay := make(http.Header)
+	var retained int64
+	for _, name := range allowed {
+		values, ok := cacheHeaderValues(header, name)
+		if !ok {
+			return nil, 0, false
+		}
+		for _, value := range values {
+			retained += int64(len(name) + len(value) + 16)
+			if retained > maxBytes {
+				return nil, 0, false
+			}
+			replay.Add(name, value)
+		}
+	}
+	return replay, retained, true
+}
+
+type imageCacheKey struct {
+	siteID             int64
+	primaryAuthority   string
+	canonicalPath      string
+	canonicalQuery     string
+	forceQuery         bool
+	credentialIdentity [sha256.Size]byte
+	representation     [sha256.Size]byte
+}
+
+const imageCacheContentLengthReservationBytes = int64(len("Content-Length") + 20 + 16)
+
+func imageCacheKeyBytes(key imageCacheKey) int64 {
+	return int64(len(key.primaryAuthority)) + int64(len(key.canonicalPath)) + int64(len(key.canonicalQuery))
+}
+
+func imageCacheMaximumFlightReservation(key imageCacheKey) int64 {
+	return imageCacheMaxBodyBytes + maxCacheReplayHeaderBytes + imageCacheEntryOverhead + imageCacheKeyBytes(key)
+}
+
+type imageCacheEntry struct {
+	key                    imageCacheKey
+	owner                  *imageCacheSite
+	header                 http.Header
+	body                   []byte
+	responseAt             time.Time
+	initialAge             time.Duration
+	expiresAt              time.Time
+	cost                   int64
+	globalPrev, globalNext *imageCacheEntry
+	sitePrev, siteNext     *imageCacheEntry
+}
+
+type imageCacheFlight struct {
+	done           chan struct{}
+	stored         bool
+	reservedBytes  int64
+	captureStarted bool
+}
+
+type imageCacheRuntime struct {
+	mu              sync.Mutex
+	maxProcessBytes int64
+	maxSiteBytes    int64
+	ttl             time.Duration
+	now             func() time.Time
+	credentialKey   [sha256.Size]byte
+	bytes           int64
+	globalHead      *imageCacheEntry
+	globalTail      *imageCacheEntry
+}
+
+type imageCacheSite struct {
+	runtime *imageCacheRuntime
+	siteID  int64
+	closed  bool
+	entries map[imageCacheKey]*imageCacheEntry
+	flights map[imageCacheKey]*imageCacheFlight
+	bytes   int64
+	head    *imageCacheEntry
+	tail    *imageCacheEntry
+}
+
+func newImageCacheRuntime(masterKey []byte) *imageCacheRuntime {
+	return newImageCacheRuntimeWithLimits(imageCacheMaxProcessBytes, imageCacheMaxSiteBytes, imageCacheTTL, masterKey)
+}
+
+func newImageCacheRuntimeWithLimits(processBytes, siteBytes int64, ttl time.Duration, masterKey []byte) *imageCacheRuntime {
+	return &imageCacheRuntime{
+		maxProcessBytes: processBytes,
+		maxSiteBytes:    siteBytes,
+		ttl:             ttl,
+		now:             time.Now,
+		credentialKey:   deriveCacheCredentialKey(masterKey, "emby-image"),
+	}
+}
+
+func (runtime *imageCacheRuntime) currentTime() time.Time {
+	if runtime != nil && runtime.now != nil {
+		return runtime.now()
+	}
+	return time.Now()
+}
+
+func (runtime *imageCacheRuntime) newSite(siteID int64) *imageCacheSite {
+	if runtime == nil {
+		return nil
+	}
+	return &imageCacheSite{
+		runtime: runtime,
+		siteID:  siteID,
+		entries: make(map[imageCacheKey]*imageCacheEntry),
+		flights: make(map[imageCacheKey]*imageCacheFlight),
+	}
+}
+
+func (runtime *imageCacheRuntime) unlinkGlobal(entry *imageCacheEntry) {
+	if entry.globalPrev != nil {
+		entry.globalPrev.globalNext = entry.globalNext
+	} else {
+		runtime.globalHead = entry.globalNext
+	}
+	if entry.globalNext != nil {
+		entry.globalNext.globalPrev = entry.globalPrev
+	} else {
+		runtime.globalTail = entry.globalPrev
+	}
+	entry.globalPrev, entry.globalNext = nil, nil
+}
+
+func (runtime *imageCacheRuntime) linkGlobalFront(entry *imageCacheEntry) {
+	entry.globalNext = runtime.globalHead
+	entry.globalPrev = nil
+	if runtime.globalHead != nil {
+		runtime.globalHead.globalPrev = entry
+	} else {
+		runtime.globalTail = entry
+	}
+	runtime.globalHead = entry
+}
+
+func (site *imageCacheSite) unlink(entry *imageCacheEntry) {
+	if entry.sitePrev != nil {
+		entry.sitePrev.siteNext = entry.siteNext
+	} else {
+		site.head = entry.siteNext
+	}
+	if entry.siteNext != nil {
+		entry.siteNext.sitePrev = entry.sitePrev
+	} else {
+		site.tail = entry.sitePrev
+	}
+	entry.sitePrev, entry.siteNext = nil, nil
+}
+
+func (site *imageCacheSite) linkFront(entry *imageCacheEntry) {
+	entry.siteNext = site.head
+	entry.sitePrev = nil
+	if site.head != nil {
+		site.head.sitePrev = entry
+	} else {
+		site.tail = entry
+	}
+	site.head = entry
+}
+
+func (runtime *imageCacheRuntime) remove(entry *imageCacheEntry) {
+	if entry == nil || entry.owner == nil || entry.owner.entries[entry.key] != entry {
+		return
+	}
+	site := entry.owner
+	delete(site.entries, entry.key)
+	runtime.unlinkGlobal(entry)
+	site.unlink(entry)
+	runtime.bytes -= entry.cost
+	site.bytes -= entry.cost
+	if runtime.bytes < 0 {
+		runtime.bytes = 0
+	}
+	if site.bytes < 0 {
+		site.bytes = 0
+	}
+}
+
+func (site *imageCacheSite) getLocked(key imageCacheKey, now time.Time) *imageCacheEntry {
+	entry := site.entries[key]
+	if entry == nil {
+		return nil
+	}
+	if !now.Before(entry.expiresAt) {
+		site.runtime.remove(entry)
+		return nil
+	}
+	site.runtime.unlinkGlobal(entry)
+	site.runtime.linkGlobalFront(entry)
+	site.unlink(entry)
+	site.linkFront(entry)
+	return entry
+}
+
+func (site *imageCacheSite) storeLocked(key imageCacheKey, entry *imageCacheEntry, now time.Time) bool {
+	runtime := site.runtime
+	if site.closed || entry == nil || !now.Before(entry.expiresAt) || runtime.maxProcessBytes <= 0 || runtime.maxSiteBytes <= 0 {
+		return false
+	}
+	entry.key, entry.owner = key, site
+	entry.cost += imageCacheKeyBytes(key)
+	if entry.cost > runtime.maxSiteBytes || entry.cost > runtime.maxProcessBytes {
+		return false
+	}
+	if old := site.entries[key]; old != nil {
+		runtime.remove(old)
+	}
+	site.entries[key] = entry
+	site.linkFront(entry)
+	runtime.linkGlobalFront(entry)
+	site.bytes += entry.cost
+	runtime.bytes += entry.cost
+	for site.bytes > runtime.maxSiteBytes && site.tail != nil {
+		runtime.remove(site.tail)
+	}
+	for runtime.bytes > runtime.maxProcessBytes && runtime.globalTail != nil {
+		runtime.remove(runtime.globalTail)
+	}
+	return site.entries[key] == entry
+}
+
+func (site *imageCacheSite) reserveFlightLocked(key imageCacheKey) int64 {
+	runtime := site.runtime
+	if runtime.maxProcessBytes <= 0 || runtime.maxSiteBytes <= 0 {
+		return 0
+	}
+	keyBytes := imageCacheKeyBytes(key)
+	minimum := imageCacheEntryOverhead + keyBytes + imageCacheContentLengthReservationBytes
+	target := imageCacheMaximumFlightReservation(key)
+	if target > runtime.maxSiteBytes {
+		target = runtime.maxSiteBytes
+	}
+	if target > runtime.maxProcessBytes {
+		target = runtime.maxProcessBytes
+	}
+	if target <= minimum {
+		return 0
+	}
+	for {
+		siteAvailable := runtime.maxSiteBytes - site.bytes
+		processAvailable := runtime.maxProcessBytes - runtime.bytes
+		available := siteAvailable
+		if processAvailable < available {
+			available = processAvailable
+		}
+		if available > minimum {
+			reservation := target
+			if reservation > available {
+				reservation = available
+			}
+			site.bytes += reservation
+			runtime.bytes += reservation
+			return reservation
+		}
+		if siteAvailable <= minimum {
+			if site.tail == nil {
+				return 0
+			}
+			runtime.remove(site.tail)
+			continue
+		}
+		if processAvailable <= minimum {
+			if runtime.globalTail == nil {
+				return 0
+			}
+			runtime.remove(runtime.globalTail)
+			continue
+		}
+		return 0
+	}
+}
+
+func (site *imageCacheSite) releaseFlightReservationLocked(flight *imageCacheFlight) {
+	if flight == nil || flight.reservedBytes <= 0 {
+		return
+	}
+	reservation := flight.reservedBytes
+	flight.reservedBytes = 0
+	site.bytes -= reservation
+	site.runtime.bytes -= reservation
+	if site.bytes < 0 {
+		site.bytes = 0
+	}
+	if site.runtime.bytes < 0 {
+		site.runtime.bytes = 0
+	}
+}
+
+func (site *imageCacheSite) lookup(key imageCacheKey, now time.Time) (*imageCacheEntry, *imageCacheFlight, bool) {
+	if site == nil || site.runtime == nil {
+		return nil, nil, false
+	}
+	site.runtime.mu.Lock()
+	defer site.runtime.mu.Unlock()
+	if site.closed {
+		return nil, nil, false
+	}
+	return site.getLocked(key, now), site.flights[key], true
+}
+
+func (site *imageCacheSite) lookupOrBegin(key imageCacheKey, now time.Time) (*imageCacheEntry, *imageCacheFlight, bool, bool) {
+	if site == nil || site.runtime == nil {
+		return nil, nil, false, false
+	}
+	site.runtime.mu.Lock()
+	defer site.runtime.mu.Unlock()
+	if site.closed {
+		return nil, nil, false, false
+	}
+	if entry := site.getLocked(key, now); entry != nil {
+		return entry, nil, false, true
+	}
+	if flight := site.flights[key]; flight != nil {
+		return nil, flight, false, true
+	}
+	reservation := site.reserveFlightLocked(key)
+	if reservation <= 0 {
+		return nil, nil, false, false
+	}
+	flight := &imageCacheFlight{done: make(chan struct{}), reservedBytes: reservation}
+	site.flights[key] = flight
+	return nil, flight, true, true
+}
+
+func (site *imageCacheSite) beginFlightCapture(key imageCacheKey, flight *imageCacheFlight) (int64, bool) {
+	if site == nil || site.runtime == nil || flight == nil {
+		return 0, false
+	}
+	site.runtime.mu.Lock()
+	defer site.runtime.mu.Unlock()
+	if site.closed || site.flights[key] != flight || flight.reservedBytes <= 0 {
+		return 0, false
+	}
+	flight.captureStarted = true
+	return flight.reservedBytes, true
+}
+
+func (site *imageCacheSite) finishFlight(key imageCacheKey, flight *imageCacheFlight, entry *imageCacheEntry, now time.Time) {
+	if site == nil || site.runtime == nil || flight == nil {
+		return
+	}
+	site.runtime.mu.Lock()
+	defer site.runtime.mu.Unlock()
+	if site.flights[key] != flight {
+		site.releaseFlightReservationLocked(flight)
+		return
+	}
+	keyBytes := imageCacheKeyBytes(key)
+	entryFits := entry != nil && entry.cost <= flight.reservedBytes && keyBytes <= flight.reservedBytes-entry.cost
+	site.releaseFlightReservationLocked(flight)
+	if entryFits {
+		flight.stored = site.storeLocked(key, entry, now)
+	}
+	delete(site.flights, key)
+	close(flight.done)
+}
+
+func (site *imageCacheSite) close() {
+	if site == nil || site.runtime == nil {
+		return
+	}
+	site.runtime.mu.Lock()
+	defer site.runtime.mu.Unlock()
+	if site.closed {
+		return
+	}
+	site.closed = true
+	for site.tail != nil {
+		site.runtime.remove(site.tail)
+	}
+	for key, flight := range site.flights {
+		if !flight.captureStarted {
+			site.releaseFlightReservationLocked(flight)
+		}
+		delete(site.flights, key)
+		close(flight.done)
+	}
+}
+
+func normalizeEmbyImageCachePath(requestURL *url.URL) (string, bool) {
+	if requestURL == nil || requestURL.Opaque != "" || requestURL.Fragment != "" || requestURL.RawFragment != "" {
+		return "", false
+	}
+	if requestURL.RawPath != "" {
+		decoded, err := url.PathUnescape(requestURL.RawPath)
+		if err != nil || decoded != requestURL.Path {
+			return "", false
+		}
+	}
+	escaped := requestURL.EscapedPath()
+	if !strings.HasPrefix(escaped, "/") {
+		return "", false
+	}
+	rawSegments := strings.Split(strings.TrimPrefix(escaped, "/"), "/")
+	if len(rawSegments) < 4 {
+		return "", false
+	}
+	segments := make([]string, len(rawSegments))
+	for i, raw := range rawSegments {
+		decoded, err := url.PathUnescape(raw)
+		if err != nil || decoded == "" || decoded == "." || decoded == ".." || !utf8.ValidString(decoded) || strings.ContainsAny(decoded, "/\\") || strings.IndexFunc(decoded, unicode.IsControl) >= 0 {
+			return "", false
+		}
+		segments[i] = decoded
+	}
+	base := 0
+	if strings.EqualFold(segments[0], "emby") {
+		if len(segments) < 5 {
+			return "", false
+		}
+		segments[0] = "emby"
+		base = 1
+	}
+	if !strings.EqualFold(segments[base], "Items") || !strings.EqualFold(segments[base+2], "Images") || len(segments) <= base+3 {
+		return "", false
+	}
+	segments[base] = "Items"
+	segments[base+2] = "Images"
+	for i, segment := range segments {
+		segments[i] = url.PathEscape(segment)
+	}
+	return "/" + strings.Join(segments, "/"), true
+}
+
+func imageCacheRequestKeyFor(site *imageCacheSite, primary *url.URL, r *http.Request) (imageCacheKey, bool) {
+	if site == nil || site.runtime == nil || primary == nil || r == nil || r.URL == nil || r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return imageCacheKey{}, false
+	}
+	if r.ContentLength != 0 || len(r.TransferEncoding) > 0 || r.Body != nil && r.Body != http.NoBody || hasUpgradeIntent(r) || isReservedDynamicRoute(r.URL.Path) || cacheRequestForcesRevalidation(r) {
+		return imageCacheKey{}, false
+	}
+	if cacheHeaderPresent(r.Header, "Range") || cacheHeaderPresent(r.Header, "If-Range") {
+		return imageCacheKey{}, false
+	}
+	canonicalRoute, ok := normalizeEmbyImageCachePath(r.URL)
+	if !ok {
+		return imageCacheKey{}, false
+	}
+	decodedRoute, err := url.PathUnescape(canonicalRoute)
+	if err != nil {
+		return imageCacheKey{}, false
+	}
+	upstreamURL := &url.URL{Path: decodedRoute, RawPath: canonicalRoute, RawQuery: r.URL.RawQuery, ForceQuery: r.URL.ForceQuery}
+	applyUpstreamURL(upstreamURL, primary)
+	representationQuery, credentialQuery, ok := splitCanonicalCacheQuery(upstreamURL.RawQuery)
+	if !ok {
+		return imageCacheKey{}, false
+	}
+	credentialIdentity, ok := cacheCredentialDigest(site.runtime.credentialKey, credentialQuery, r.Header)
+	if !ok {
+		return imageCacheKey{}, false
+	}
+	representation, ok := cacheHeaderDigest(r.Header, "Accept", "Accept-Encoding")
+	if !ok {
+		return imageCacheKey{}, false
+	}
+	authority := redirectHostKey(primary)
+	if authority == "" {
+		return imageCacheKey{}, false
+	}
+	return imageCacheKey{
+		siteID: site.siteID, primaryAuthority: authority, canonicalPath: upstreamURL.EscapedPath(),
+		canonicalQuery: representationQuery, forceQuery: upstreamURL.ForceQuery,
+		credentialIdentity: credentialIdentity, representation: representation,
+	}, true
+}
+
+var imageCacheReplayHeaderNames = []string{
+	"Accept-Ranges", "Access-Control-Allow-Credentials", "Access-Control-Allow-Headers",
+	"Access-Control-Allow-Methods", "Access-Control-Allow-Origin", "Access-Control-Expose-Headers",
+	"Cache-Control", "Content-Disposition", "Content-Encoding", "Content-Language", "Content-Type", "Date",
+	"Cross-Origin-Resource-Policy", "ETag", "Expires", "Last-Modified", "Timing-Allow-Origin", "Vary",
+	"X-Content-Type-Options",
+}
+
+func imageCacheSafeVary(header http.Header) bool {
+	values, ok := cacheHeaderValues(header, "Vary")
+	if !ok {
+		return false
+	}
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			name := strings.TrimSpace(part)
+			if name == "" {
+				return false
+			}
+			for i := 0; i < len(name); i++ {
+				if !isHTTPTokenByte(name[i]) {
+					return false
+				}
+			}
+			if !strings.EqualFold(name, "Accept") && !strings.EqualFold(name, "Accept-Encoding") {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func parseCacheDeltaSeconds(value string) (time.Duration, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	const maxSeconds = uint64((1<<63 - 1) / int64(time.Second))
+	var seconds uint64
+	for i := range len(value) {
+		if value[i] < '0' || value[i] > '9' {
+			return 0, false
+		}
+		digit := uint64(value[i] - '0')
+		if seconds > (maxSeconds-digit)/10 {
+			return 0, false
+		}
+		seconds = seconds*10 + digit
+	}
+	return time.Duration(seconds * uint64(time.Second)), true
+}
+
+func cacheResponseFreshness(header http.Header, now time.Time, ttl time.Duration) (time.Time, time.Duration, bool) {
+	if ttl <= 0 {
+		return time.Time{}, 0, false
+	}
+	directives, ok := parseCacheControlDirectives(header, "Cache-Control")
+	if !ok {
+		return time.Time{}, 0, false
+	}
+	for _, name := range []string{"private", "no-store", "no-cache"} {
+		if cacheDirectivePresent(directives, name) {
+			return time.Time{}, 0, false
+		}
+	}
+
+	initialAge := time.Duration(0)
+	ageValues, ok := cacheHeaderValues(header, "Age")
+	if !ok || len(ageValues) > 1 {
+		return time.Time{}, 0, false
+	}
+	if len(ageValues) == 1 {
+		initialAge, ok = parseCacheDeltaSeconds(ageValues[0])
+		if !ok {
+			return time.Time{}, 0, false
+		}
+	}
+
+	var dateValue time.Time
+	hasDate := false
+	dateValues, ok := cacheHeaderValues(header, "Date")
+	if !ok || len(dateValues) > 1 {
+		return time.Time{}, 0, false
+	}
+	if len(dateValues) == 1 {
+		dateValue, _ = http.ParseTime(strings.TrimSpace(dateValues[0]))
+		if dateValue.IsZero() {
+			return time.Time{}, 0, false
+		}
+		hasDate = true
+		if apparentAge := now.Sub(dateValue); apparentAge > initialAge {
+			initialAge = apparentAge
+		}
+	}
+	const maxAgeDuration = time.Duration(1<<63 - 1)
+	if initialAge < 0 {
+		initialAge = 0
+	} else if initialAge == maxAgeDuration {
+		return time.Time{}, 0, false
+	}
+
+	remaining := ttl
+	maxAge, exists, valid := cacheDirectiveValue(directives, "s-maxage")
+	if !exists {
+		maxAge, exists, valid = cacheDirectiveValue(directives, "max-age")
+	}
+	if !valid {
+		return time.Time{}, 0, false
+	}
+	if exists {
+		freshnessLifetime, valid := parseCacheDeltaSeconds(maxAge)
+		if !valid || freshnessLifetime <= initialAge {
+			return time.Time{}, 0, false
+		}
+		if originRemaining := freshnessLifetime - initialAge; originRemaining < remaining {
+			remaining = originRemaining
+		}
+	} else {
+		expiresValues, valid := cacheHeaderValues(header, "Expires")
+		if !valid || len(expiresValues) > 1 {
+			return time.Time{}, 0, false
+		}
+		if len(expiresValues) == 1 {
+			expiresValue, err := http.ParseTime(strings.TrimSpace(expiresValues[0]))
+			if err != nil {
+				return time.Time{}, 0, false
+			}
+			freshnessLifetime := expiresValue.Sub(now)
+			if hasDate {
+				freshnessLifetime = expiresValue.Sub(dateValue)
+			}
+			if freshnessLifetime <= initialAge {
+				return time.Time{}, 0, false
+			}
+			if originRemaining := freshnessLifetime - initialAge; originRemaining < remaining {
+				remaining = originRemaining
+			}
+		}
+	}
+	if remaining <= 0 {
+		return time.Time{}, 0, false
+	}
+	return now.Add(remaining), initialAge, true
+}
+
+func cacheResponseAgeValue(initialAge time.Duration, responseAt, now time.Time) string {
+	if initialAge < 0 {
+		initialAge = 0
+	}
+	resident := now.Sub(responseAt)
+	if resident < 0 {
+		resident = 0
+	}
+	const maxAgeDuration = time.Duration(1<<63 - 1)
+	if initialAge > maxAgeDuration-resident {
+		initialAge = maxAgeDuration
+	} else {
+		initialAge += resident
+	}
+	seconds := int64(initialAge / time.Second)
+	if initialAge%time.Second != 0 {
+		seconds++
+	}
+	return strconv.FormatInt(seconds, 10)
+}
+
+type imageCacheMetadata struct {
+	header            http.Header
+	declaredLength    int64
+	hasDeclaredLength bool
+	expiresAt         time.Time
+	initialAge        time.Duration
+	replayHeaderBytes int64
+}
+
+func imageCacheResponseMetadata(header http.Header, status int, now time.Time, ttl time.Duration, maxHeaderBytes int64) (imageCacheMetadata, bool) {
+	if status != http.StatusOK || cacheHeaderPresent(header, "Set-Cookie") || cacheHeaderPresent(header, "Content-Range") || cacheHeaderPresent(header, "Trailer") || cacheHeaderPresent(header, "Warning") || cachePragmaNoCache(header) || !imageCacheSafeVary(header) {
+		return imageCacheMetadata{}, false
+	}
+	contentTypes, ok := cacheHeaderValues(header, "Content-Type")
+	if !ok || len(contentTypes) != 1 {
+		return imageCacheMetadata{}, false
+	}
+	mediaType, _, err := mime.ParseMediaType(contentTypes[0])
+	mediaType = strings.ToLower(mediaType)
+	if err != nil || !strings.HasPrefix(mediaType, "image/") || len(mediaType) <= len("image/") || strings.TrimPrefix(mediaType, "image/") == "*" {
+		return imageCacheMetadata{}, false
+	}
+	for _, name := range []string{"Surrogate-Control", "CDN-Cache-Control"} {
+		directives, valid := parseCacheControlDirectives(header, name)
+		if !valid {
+			return imageCacheMetadata{}, false
+		}
+		for _, forbidden := range []string{"private", "no-store", "no-cache"} {
+			if cacheDirectivePresent(directives, forbidden) {
+				return imageCacheMetadata{}, false
+			}
+		}
+	}
+	declaredLength := int64(0)
+	hasDeclaredLength := false
+	lengths, ok := cacheHeaderValues(header, "Content-Length")
+	if !ok || len(lengths) > 1 {
+		return imageCacheMetadata{}, false
+	}
+	if len(lengths) == 1 {
+		declaredLength, err = strconv.ParseInt(strings.TrimSpace(lengths[0]), 10, 64)
+		if err != nil || declaredLength < 0 || declaredLength > imageCacheMaxBodyBytes {
+			return imageCacheMetadata{}, false
+		}
+		hasDeclaredLength = true
+	}
+	expiresAt, initialAge, fresh := cacheResponseFreshness(header, now, ttl)
+	if !fresh {
+		return imageCacheMetadata{}, false
+	}
+	replay, headerBytes, safe := safeCachedResponseHeadersWithin(header, imageCacheReplayHeaderNames, maxHeaderBytes)
+	if !safe {
+		return imageCacheMetadata{}, false
+	}
+	return imageCacheMetadata{
+		header: replay, declaredLength: declaredLength, hasDeclaredLength: hasDeclaredLength,
+		expiresAt: expiresAt, initialAge: initialAge, replayHeaderBytes: headerBytes,
+	}, true
+}
+
+type imageCacheCaptureWriter struct {
+	http.ResponseWriter
+	runtime           *imageCacheRuntime
+	reservedBytes     int64
+	keyBytes          int64
+	captureLimit      int64
+	wroteFinal        bool
+	sawInformational  bool
+	cacheable         bool
+	complete          bool
+	declaredLength    int64
+	hasDeclaredLength bool
+	responseAt        time.Time
+	initialAge        time.Duration
+	expiresAt         time.Time
+	replayHeader      http.Header
+	replayHeaderBytes int64
+	body              []byte
+}
+
+func newImageCacheCaptureWriter(w http.ResponseWriter, runtime *imageCacheRuntime, reservedBytes, keyBytes int64) *imageCacheCaptureWriter {
+	return &imageCacheCaptureWriter{
+		ResponseWriter: w, runtime: runtime, reservedBytes: reservedBytes, keyBytes: keyBytes, complete: true,
+	}
+}
+
+func (w *imageCacheCaptureWriter) discard() {
+	w.cacheable = false
+	w.complete = false
+	w.captureLimit = 0
+	w.body = nil
+	w.replayHeader = nil
+}
+
+func (w *imageCacheCaptureWriter) WriteHeader(status int) {
+	if status >= 100 && status < 200 {
+		w.sawInformational = true
+		w.ResponseWriter.WriteHeader(status)
+		return
+	}
+	if w.wroteFinal {
+		w.ResponseWriter.WriteHeader(status)
+		return
+	}
+	w.wroteFinal = true
+	if w.runtime != nil {
+		w.responseAt = w.runtime.currentTime()
+		maxHeaderBytes := w.reservedBytes - w.keyBytes - imageCacheEntryOverhead - imageCacheContentLengthReservationBytes
+		if maxHeaderBytes > maxCacheReplayHeaderBytes {
+			maxHeaderBytes = maxCacheReplayHeaderBytes
+		}
+		metadata, cacheable := imageCacheResponseMetadata(w.Header(), status, w.responseAt, w.runtime.ttl, maxHeaderBytes)
+		w.cacheable = cacheable && !w.sawInformational
+		if w.cacheable {
+			w.declaredLength = metadata.declaredLength
+			w.hasDeclaredLength = metadata.hasDeclaredLength
+			w.expiresAt = metadata.expiresAt
+			w.initialAge = metadata.initialAge
+			w.replayHeader = metadata.header
+			w.replayHeaderBytes = metadata.replayHeaderBytes
+			w.captureLimit = w.reservedBytes - w.keyBytes - imageCacheEntryOverhead - w.replayHeaderBytes - imageCacheContentLengthReservationBytes
+			if w.captureLimit > imageCacheMaxBodyBytes {
+				w.captureLimit = imageCacheMaxBodyBytes
+			}
+			if w.captureLimit < 0 || w.hasDeclaredLength && w.declaredLength > w.captureLimit {
+				w.discard()
+			} else {
+				capacity := w.captureLimit
+				if w.hasDeclaredLength {
+					capacity = w.declaredLength
+				}
+				if capacity > 0 {
+					w.body = make([]byte, 0, int(capacity))
+				}
+			}
+		}
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *imageCacheCaptureWriter) Write(payload []byte) (int, error) {
+	if !w.wroteFinal {
+		w.WriteHeader(http.StatusOK)
+	}
+	n, err := w.ResponseWriter.Write(payload)
+	if w.cacheable {
+		captured := int64(len(w.body)) + int64(n)
+		if err != nil || n != len(payload) || captured > w.captureLimit || w.hasDeclaredLength && captured > w.declaredLength {
+			w.discard()
+		} else if n > 0 {
+			w.body = append(w.body, payload[:n]...)
+		}
+	}
+	return n, err
+}
+
+func (w *imageCacheCaptureWriter) Flush() {
+	if !w.wroteFinal {
+		w.WriteHeader(http.StatusOK)
+	}
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *imageCacheCaptureWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (w *imageCacheCaptureWriter) entry() *imageCacheEntry {
+	if !w.wroteFinal || !w.cacheable || !w.complete || int64(len(w.body)) > w.captureLimit || w.hasDeclaredLength && int64(len(w.body)) != w.declaredLength || w.replayHeader == nil {
+		return nil
+	}
+	w.replayHeader.Set("Content-Length", strconv.Itoa(len(w.body)))
+	headerBytes := w.replayHeaderBytes + int64(len("Content-Length")+len(w.replayHeader.Get("Content-Length"))+16)
+	if headerBytes > maxCacheReplayHeaderBytes {
+		return nil
+	}
+	cost := int64(cap(w.body)) + headerBytes + imageCacheEntryOverhead
+	if cost > w.reservedBytes || w.keyBytes > w.reservedBytes-cost {
+		return nil
+	}
+	body := w.body
+	w.body = nil
+	header := w.replayHeader
+	w.replayHeader = nil
+	return &imageCacheEntry{
+		header: header, body: body, responseAt: w.responseAt, initialAge: w.initialAge, expiresAt: w.expiresAt,
+		cost: cost,
+	}
+}
+
+func serveImageCacheEntry(w http.ResponseWriter, r *http.Request, entry *imageCacheEntry, now time.Time) {
+	header := w.Header()
+	for name := range header {
+		delete(header, name)
+	}
+	for name, values := range entry.header {
+		for _, value := range values {
+			header.Add(name, value)
+		}
+	}
+	header.Set("Age", cacheResponseAgeValue(entry.initialAge, entry.responseAt, now))
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodGet {
+		_, _ = w.Write(entry.body)
+	}
+}
+
+func (site *imageCacheSite) serve(w http.ResponseWriter, r *http.Request, primary *url.URL, next http.Handler) {
+	key, eligible := imageCacheRequestKeyFor(site, primary, r)
+	if !eligible {
+		next.ServeHTTP(w, r)
+		return
+	}
+	now := site.runtime.currentTime()
+	if r.Method == http.MethodHead {
+		entry, flight, available := site.lookup(key, now)
+		if !available {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if entry != nil {
+			serveImageCacheEntry(w, r, entry, now)
+			return
+		}
+		if flight != nil {
+			select {
+			case <-flight.done:
+				hitNow := site.runtime.currentTime()
+				if entry, _, available := site.lookup(key, hitNow); available && entry != nil {
+					serveImageCacheEntry(w, r, entry, hitNow)
+					return
+				}
+			case <-r.Context().Done():
+			}
+		}
+		next.ServeHTTP(w, r)
+		return
+	}
+
+	entry, flight, leader, available := site.lookupOrBegin(key, now)
+	if !available {
+		next.ServeHTTP(w, r)
+		return
+	}
+	if entry != nil {
+		serveImageCacheEntry(w, r, entry, now)
+		return
+	}
+	if !leader {
+		select {
+		case <-flight.done:
+			hitNow := site.runtime.currentTime()
+			if entry, _, available := site.lookup(key, hitNow); available && entry != nil {
+				serveImageCacheEntry(w, r, entry, hitNow)
+				return
+			}
+		case <-r.Context().Done():
+		}
+		next.ServeHTTP(w, r)
+		return
+	}
+
+	var candidate *imageCacheEntry
+	defer func() {
+		site.finishFlight(key, flight, candidate, site.runtime.currentTime())
+	}()
+	reservedBytes, captureAllowed := site.beginFlightCapture(key, flight)
+	if !captureAllowed {
+		next.ServeHTTP(w, r)
+		return
+	}
+	capture := newImageCacheCaptureWriter(w, site.runtime, reservedBytes, imageCacheKeyBytes(key))
+	next.ServeHTTP(capture, r)
+	// Publication happens only after ReverseProxy returns from a complete body
+	// copy. Panics, short writes, client disconnects and length mismatches leave
+	// candidate nil and merely wake identical waiters.
+	candidate = capture.entry()
+}
+
 func requestPublicHost(hostport string) string {
 	hostport = strings.TrimSpace(hostport)
 	if hostport == "" || strings.HasPrefix(hostport, "[") {
@@ -10858,6 +14051,13 @@ func writeWebSocketGatewayError(conn net.Conn) {
 }
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request, target, primaryTarget *url.URL, policy UAHeaderPolicy, inst *ProxyInstance, speedLimitBytes int64, upstreamPolicies ...upstreamHeaderPolicy) {
+	meter := newRequestTrafficMeter(inst)
+	defer func() { meter.finish(time.Now()) }()
+	handleWebSocketMetered(w, r, target, primaryTarget, policy, inst, meter, speedLimitBytes, upstreamPolicies...)
+}
+
+func handleWebSocketMetered(w http.ResponseWriter, r *http.Request, target, primaryTarget *url.URL, policy UAHeaderPolicy, inst *ProxyInstance, meter *requestTrafficMeter, speedLimitBytes int64, upstreamPolicies ...upstreamHeaderPolicy) {
+	meter.promote()
 	// Nothing on this path reads r.Body, so a body would be left sitting in the
 	// hijacked buffer and relayed verbatim to the upstream.
 	if r.ContentLength != 0 || len(r.TransferEncoding) > 0 {
@@ -10998,11 +14198,11 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target, primaryTarg
 	// download direction is paced, matching rateLimitedWriter on the HTTP path.
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(&tunnelWriter{dst: upstreamConn, counter: &inst.bytesIn, start: time.Now()}, clientBuf)
+		_, _ = io.Copy(&tunnelWriter{dst: upstreamConn, counter: &inst.bytesIn, meter: meter, inbound: true, start: time.Now()}, clientBuf)
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(&tunnelWriter{dst: clientConn, counter: &inst.bytesOut, bytesPerSec: speedLimitBytes, start: time.Now()}, upstreamReader)
+		_, _ = io.Copy(&tunnelWriter{dst: clientConn, counter: &inst.bytesOut, meter: meter, bytesPerSec: speedLimitBytes, start: time.Now()}, upstreamReader)
 		done <- struct{}{}
 	}()
 	// The first closed direction must tear down its counterpart, then both copy
@@ -11081,6 +14281,17 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			upstreamHeaderPolicy:  configuredHeaders,
 		}
 	}
+	var pingCacheState *pingCache
+	if site.PingCacheEnabled {
+		pingCacheState, err = newPingCache(site.ID, target, nil)
+		if err != nil {
+			return err
+		}
+	}
+	var imageCacheState *imageCacheSite
+	if site.ImageCacheEnabled && pm.imageCacheRuntime != nil {
+		imageCacheState = pm.imageCacheRuntime.newSite(site.ID)
+	}
 	instanceCtx, instanceCancel := context.WithCancel(context.Background())
 	inst := &ProxyInstance{
 		Site:           site,
@@ -11090,10 +14301,14 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		hijackedConns:  make(map[net.Conn]struct{}),
 		trustedProxies: append([]*net.IPNet(nil), pm.trustedProxies...),
 		dynamicState:   dynamicState,
+		pingCache:      pingCacheState,
+		imageCache:     imageCacheState,
 	}
 	installed := false
 	defer func() {
 		if !installed {
+			inst.closeProgress()
+			inst.imageCache.close()
 			instanceCancel()
 			if dynamicState != nil {
 				dynamicState.close()
@@ -11108,12 +14323,16 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	proxyTransport.ResponseHeaderTimeout = 30 * time.Second
 	proxyTransport.MaxIdleConnsPerHost = 32
 	inst.transport = proxyTransport
+	baseTransport := http.RoundTripper(proxyTransport)
+	if inst.pingCache != nil {
+		baseTransport = &pingCacheTransport{base: baseTransport, cache: inst.pingCache}
+	}
 	if dynamicIssuer != nil {
 		dynamicIssuer.configuredTransport = proxyTransport
 	}
 
 	proxy := &httputil.ReverseProxy{
-		Transport: proxyTransport,
+		Transport: baseTransport,
 		Rewrite: func(proxyReq *httputil.ProxyRequest) {
 			if redirectPolicy.configured {
 				eligible := isDynamicRedirectEligibleRequest(proxyReq.In)
@@ -11176,6 +14395,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			recordProgressDispatchError(r, err)
 			var discoveryErr *dynamicProxyError
 			if errors.As(err, &discoveryErr) {
 				log.Printf("[%s] dynamic discovery denied: %s", site.Name, discoveryErr.reasonCode)
@@ -11191,7 +14411,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 
 	if isRedirectMode || redirectPolicy.configured {
 		proxy.Transport = &redirectFollowTransport{
-			base:                    proxyTransport,
+			base:                    baseTransport,
 			playbackHosts:           playbackHostsSet,
 			configuredAuthorities:   configuredAuthorities,
 			disableLegacyRedirects:  !isRedirectMode,
@@ -11205,6 +14425,17 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		}
 	}
 
+	if site.ProgressCoalescingEnabled {
+		inst.progress = newProgressCoalescer(pm.progressRuntime, defaultProgressCoalescerConfig(), func(request *http.Request) (progressResponse, error) {
+			capture := newProgressCaptureWriter()
+			dispatchErrors := &progressDispatchErrorState{}
+			request = request.WithContext(context.WithValue(request.Context(), progressDispatchErrorContextKey{}, dispatchErrors))
+			proxy.ServeHTTP(capture, request) // #nosec G704 -- this uses the same validated, administrator-configured proxy as the ordinary request path.
+			response, captureErr := capture.response()
+			return response, errors.Join(captureErr, dispatchErrors.load())
+		})
+	}
+
 	// Speed limit in bytes/sec (field is in Mbps, 0 = unlimited)
 	speedLimitBytes := int64(site.SpeedLimit) * 125000 // Mbps -> bytes/sec
 
@@ -11216,6 +14447,8 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			return
 		}
 		defer inst.endRequest()
+		meter := newRequestTrafficMeter(inst)
+		defer func() { meter.finish(time.Now()) }()
 		requestCtx, requestCancel := context.WithCancel(r.Context())
 		stopInstanceCancel := context.AfterFunc(inst.ctx, requestCancel)
 		defer func() {
@@ -11223,7 +14456,6 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			requestCancel()
 		}()
 		r = r.WithContext(requestCtx)
-		inst.reqCount.Add(1)
 
 		if site.TrafficQuota > 0 {
 			currentUsed := inst.persistedTraffic.Load() + inst.bytesIn.Load() + inst.bytesOut.Load()
@@ -11241,10 +14473,11 @@ func (pm *ProxyManager) StartSite(site Site) error {
 					ResponseWriter: w,
 					bytesPerSec:    speedLimitBytes,
 					written:        &inst.bytesOut,
+					meter:          meter,
 					start:          time.Now(),
 				}
 			} else {
-				rw = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut}
+				rw = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut, meter: meter}
 			}
 			if dynamicIssuer == nil {
 				writeDynamicCapabilityUnavailable(rw)
@@ -11265,12 +14498,12 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			if isRedirectMode {
 				wsTarget = target
 			}
-			handleWebSocket(w, r, wsTarget, target, policy, inst, speedLimitBytes, configuredHeaders)
+			handleWebSocketMetered(w, r, wsTarget, target, policy, inst, meter, speedLimitBytes, configuredHeaders)
 			return
 		}
 
-		if r.Body != nil {
-			r.Body = &meteredReader{ReadCloser: r.Body, read: &inst.bytesIn}
+		if r.Body != nil && r.Body != http.NoBody {
+			r.Body = &meteredReader{ReadCloser: r.Body, read: &inst.bytesIn, meter: meter}
 		}
 		if redirectPolicy.profile == dynamicProfileExtreme && isExtremeDynamicRedirectEligibleRequest(r) {
 			releaseReplayBody, err := prepareExtremeRedirectReplayBody(r, dynamicState, redirectPolicy.limits.MaxBodyBytes)
@@ -11291,10 +14524,21 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				ResponseWriter: w,
 				bytesPerSec:    speedLimitBytes,
 				written:        &inst.bytesOut,
+				meter:          meter,
 				start:          time.Now(),
 			}
 		} else {
-			rw = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut}
+			rw = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut, meter: meter}
+		}
+		if route, eligible := pingCacheRouteForRequest(r); eligible && inst.pingCache != nil {
+			r = r.WithContext(context.WithValue(r.Context(), pingCacheRequestContextKey{}, route))
+		}
+		if inst.progress != nil && inst.progress.ServeHTTP(rw, r, proxy) {
+			return
+		}
+		if inst.imageCache != nil {
+			inst.imageCache.serve(rw, r, target, proxy)
+			return
 		}
 		proxy.ServeHTTP(rw, r) // #nosec G704 -- forwarding to the administrator-configured, validated upstream is the product's purpose.
 	})
@@ -11348,6 +14592,11 @@ func (pm *ProxyManager) StartSite(site Site) error {
 
 	if existing != nil {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := existing.drainProgress(shutdownCtx); err != nil {
+			shutdownCancel()
+			closeNewListener()
+			return fmt.Errorf("flush progress of the instance being replaced: %w", err)
+		}
 		shutdownErr := existing.shutdown(shutdownCtx)
 		shutdownCancel()
 		if shutdownErr != nil {
@@ -11361,6 +14610,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			closeNewListener()
 			return fmt.Errorf("final traffic flush of the instance being replaced: %w", err)
 		}
+		existing.closeProgress()
 		if flushed := existing.Site.TrafficUsed; flushed > inst.persistedTraffic.Load() {
 			inst.persistedTraffic.Store(flushed)
 			inst.Site.TrafficUsed = flushed
@@ -11442,6 +14692,13 @@ func (pm *ProxyManager) StopSite(id int64) error {
 	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if err := inst.drainProgress(shutdownCtx); err != nil {
+		shutdownCancel()
+		if ingressAlreadyClosed {
+			return &siteIngressClosedError{siteID: id, drainErr: err}
+		}
+		return fmt.Errorf("flush pending progress updates: %w", err)
+	}
 	shutdownErr := inst.shutdown(shutdownCtx)
 	shutdownCancel()
 	finalFlushErr := pm.flushProxyTraffic(inst)
@@ -11450,6 +14707,7 @@ func (pm *ProxyManager) StopSite(id int64) error {
 		// subsequent StopSite/GracefulShutdown can retry the final persistence.
 		return &siteIngressClosedError{siteID: id, drainErr: shutdownErr, flushErr: finalFlushErr}
 	}
+	inst.closeProgress()
 	nextSelfTargets, snapshotErr := pm.buildDynamicSelfTargetPolicy()
 	pm.mu.Lock()
 	if pm.proxies[id] == inst {
@@ -11514,32 +14772,50 @@ func (pm *ProxyManager) FlushTraffic() {
 	}
 }
 
-// flushProxyTraffic persists inst's pending bytes into the DB and moves them
-// into the persisted baseline. The caller must pin inst through lifecycleMu, a
-// pm.mu snapshot, or another stable reference; inst.trafficMu is acquired here.
-// On failure the pending counters are fully restored so the next flush retries
-// the same bytes. Never call this while already holding inst.trafficMu.
+// flushProxyTraffic persists only bytes that already have an in-memory minute
+// attribution. Ordinary in-flight HTTP bytes stay in the global live counters
+// until request completion; promoted streams attribute each chunk immediately.
+// The caller must pin inst through lifecycleMu, a pm.mu snapshot, or another
+// stable reference. Never call this while already holding inst.trafficMu.
 func (pm *ProxyManager) flushProxyTraffic(inst *ProxyInstance) error {
 	inst.trafficMu.Lock()
 	defer inst.trafficMu.Unlock()
 	return pm.flushProxyTrafficLocked(inst)
 }
 
-// flushProxyTrafficLocked is the body of flushProxyTraffic and assumes
-// inst.trafficMu is held. Order is swap -> DB -> persisted baseline: the
-// pending counters are zeroed first, the baseline moves only after the DB
-// transaction commits, and the counters are restored verbatim on any error.
+// flushProxyTrafficLocked commits the flushable byte counters and their exact
+// minute buckets in one SQLite transaction. Nothing is cleared on failure, so
+// a concurrent or later flush retries the same deltas exactly once.
 func (pm *ProxyManager) flushProxyTrafficLocked(inst *ProxyInstance) error {
-	in := inst.bytesIn.Swap(0)
-	out := inst.bytesOut.Swap(0)
-	if in == 0 && out == 0 {
+	in := inst.flushBytesIn
+	out := inst.flushBytesOut
+	buckets := inst.pendingMinuteTraffic
+
+	// Keep direct counter users (including legacy integrations) working without
+	// deriving real request buckets from globals: this fallback is allowed only
+	// when no request meter is active and no attributed delta exists.
+	if in == 0 && out == 0 && len(buckets) == 0 && inst.activeTrafficMeters.Load() == 0 {
+		in = inst.bytesIn.Load()
+		out = inst.bytesOut.Load()
+		if in != 0 || out != 0 {
+			buckets = map[int64]trafficMinuteDelta{
+				trafficMinuteStart(time.Now()): {BytesIn: in, BytesOut: out},
+			}
+		}
+	}
+	if in == 0 && out == 0 && len(buckets) == 0 {
 		return nil
 	}
-	if err := pm.database.addTraffic(inst.Site.ID, in, out); err != nil {
-		inst.bytesIn.Add(in)
-		inst.bytesOut.Add(out)
+	now := time.Now()
+	if err := pm.database.addTrafficMinuteBuckets(inst.Site.ID, in, out, buckets, now); err != nil {
 		return err
 	}
+
+	inst.flushBytesIn = 0
+	inst.flushBytesOut = 0
+	clear(inst.pendingMinuteTraffic)
+	inst.bytesIn.Add(-in)
+	inst.bytesOut.Add(-out)
 	delta := in + out
 	inst.persistedTraffic.Add(delta)
 	inst.Site.TrafficUsed += delta
@@ -11644,6 +14920,47 @@ func (pm *ProxyManager) SiteTrafficHistory(site Site, hours int) (*TrafficHistor
 	snap.Requests = inst.reqCount.Load()
 	logs = mergePendingIntoLogs(logs, site.ID, snap.BytesIn, snap.BytesOut)
 	return &TrafficHistory{Snapshot: snap, Logs: logs}, nil
+}
+
+func mergePendingMinuteTraffic(timeline []TrafficMinuteLog, pending map[int64]trafficMinuteDelta) {
+	if len(timeline) == 0 || len(pending) == 0 {
+		return
+	}
+	start := timeline[0].MinuteStartUnix
+	for minuteStart, delta := range pending {
+		offset := minuteStart - start
+		if offset < 0 || offset%trafficMinuteSeconds != 0 {
+			continue
+		}
+		index := int(offset / trafficMinuteSeconds)
+		if index >= len(timeline) {
+			continue
+		}
+		timeline[index].BytesIn += delta.BytesIn
+		timeline[index].BytesOut += delta.BytesOut
+		timeline[index].Requests += delta.Requests
+	}
+}
+
+// SiteTrafficTimeline captures persisted rows and unflushed completed/stream
+// buckets under the same instance lock used by FlushTraffic. The dense return
+// type contains no identity fields and is safe to serialize directly.
+func (pm *ProxyManager) SiteTrafficTimeline(siteID int64, minutes int, now time.Time) ([]TrafficMinuteLog, error) {
+	pm.mu.RLock()
+	inst, present := pm.proxies[siteID]
+	if !present {
+		pm.mu.RUnlock()
+		return pm.database.GetTrafficTimeline(siteID, minutes, now)
+	}
+	inst.trafficMu.Lock()
+	defer inst.trafficMu.Unlock()
+	defer pm.mu.RUnlock()
+	timeline, err := pm.database.GetTrafficTimeline(siteID, minutes, now)
+	if err != nil {
+		return nil, err
+	}
+	mergePendingMinuteTraffic(timeline, inst.pendingMinuteTraffic)
+	return timeline, nil
 }
 
 // overlaySiteTrafficLocked fills st with the authoritative live per-instance
@@ -11773,7 +15090,9 @@ func (pm *ProxyManager) GracefulShutdown(ctx context.Context) {
 			// shutdown closes the request gate and every listener/connection before
 			// waiting, so launching all instances in parallel stops every ingress
 			// promptly instead of spending the shared deadline site by site.
-			results <- shutdownResult{id: id, inst: inst, err: inst.shutdown(ctx)}
+			progressErr := inst.drainProgress(ctx)
+			shutdownErr := inst.shutdown(ctx)
+			results <- shutdownResult{id: id, inst: inst, err: errors.Join(progressErr, shutdownErr)}
 		}(id, inst)
 	}
 
@@ -11809,6 +15128,7 @@ func (pm *ProxyManager) GracefulShutdown(ctx context.Context) {
 			delete(pm.proxies, id)
 		}
 		pm.mu.Unlock()
+		inst.closeProgress()
 	}
 }
 
@@ -13059,10 +16379,13 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			CustomClient               string                `json:"custom_client"`
 			CustomVersion              string                `json:"custom_version"`
 			UpstreamHeaders            []UpstreamHeaderInput `json:"upstream_headers"`
-			DynamicDiscoveryEnabled    bool                  `json:"dynamic_discovery_enabled"`
+			PingCacheEnabled           bool                  `json:"ping_cache_enabled"`
+			ImageCacheEnabled          bool                  `json:"image_cache_enabled"`
+			ProgressCoalescingEnabled  bool                  `json:"progress_coalescing_enabled"`
+			DynamicDiscoveryEnabled    json.RawMessage       `json:"dynamic_discovery_enabled"`
 			DynamicProfile             string                `json:"dynamic_profile"`
 			DynamicDiscoverySources    json.RawMessage       `json:"dynamic_discovery_sources"`
-			DynamicDomainRules         []DynamicDomainRule   `json:"dynamic_domain_rules"`
+			DynamicDomainRules         json.RawMessage       `json:"dynamic_domain_rules"`
 			DynamicAllowHTTPSDowngrade bool                  `json:"dynamic_allow_https_downgrade"`
 			Quota                      int64                 `json:"traffic_quota"`
 			SpeedLimit                 int                   `json:"speed_limit"`
@@ -13071,27 +16394,51 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, 400, "invalid request")
 			return
 		}
-		dynamicSources, _, err := decodeDynamicDiscoverySourcesAPI(req.DynamicDiscoverySources)
+		dynamicEnabledValue, dynamicEnabledProvided, err := decodeOptionalBoolAPI(req.DynamicDiscoveryEnabled, "dynamic_discovery_enabled")
 		if err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
+		}
+		dynamicSources, dynamicSourcesProvided, err := decodeDynamicDiscoverySourcesAPI(req.DynamicDiscoverySources)
+		if err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		dynamicRules, dynamicRulesProvided, err := decodeDynamicDomainRulesAPI(req.DynamicDomainRules)
+		if err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if !dynamicRulesProvided {
+			dynamicRules = []DynamicDomainRule{}
 		}
 		if req.Name == "" || req.ListenPort == 0 || req.TargetURL == "" {
 			a.jsonErr(w, 400, "name, listen_port, and target_url are required")
 			return
 		}
+		keyConfigured := len(a.dynamicRouteKey) == sha256.Size
+		dynamicEnabled := keyConfigured
+		if dynamicEnabledProvided {
+			dynamicEnabled = dynamicEnabledValue
+		}
 		dynamicPolicy := Site{
-			DynamicDiscoveryEnabled:    req.DynamicDiscoveryEnabled,
+			DynamicDiscoveryEnabled:    dynamicEnabled,
 			DynamicProfile:             req.DynamicProfile,
 			DynamicDiscoverySources:    dynamicSources,
-			DynamicDomainRules:         req.DynamicDomainRules,
+			DynamicDomainRules:         dynamicRules,
 			DynamicAllowHTTPSDowngrade: req.DynamicAllowHTTPSDowngrade,
 		}
 		if err := normalizeDynamicSitePolicy(&dynamicPolicy); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if err := validateDynamicDiscoveryAPIEnablement(dynamicPolicy, len(a.dynamicRouteKey) == sha256.Size, false); err != nil {
+		if dynamicSourcesProvided {
+			if err := validateSelectableDynamicDiscoverySources(dynamicPolicy.DynamicProfile, dynamicPolicy.DynamicDiscoverySources); err != nil {
+				a.jsonErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+		if err := validateDynamicDiscoveryAPIEnablement(dynamicPolicy, keyConfigured, false); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -13166,6 +16513,9 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			CustomClient:                  req.CustomClient,
 			CustomVersion:                 req.CustomVersion,
 			StoredUpstreamHeaders:         storedHeaders,
+			PingCacheEnabled:              req.PingCacheEnabled,
+			ImageCacheEnabled:             req.ImageCacheEnabled,
+			ProgressCoalescingEnabled:     req.ProgressCoalescingEnabled,
 			DynamicDiscoveryEnabled:       dynamicPolicy.DynamicDiscoveryEnabled,
 			DynamicProfile:                dynamicPolicy.DynamicProfile,
 			StoredDynamicDiscoverySources: dynamicPolicy.StoredDynamicDiscoverySources,
@@ -13348,10 +16698,13 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			CustomClient               *string                `json:"custom_client"`
 			CustomVersion              *string                `json:"custom_version"`
 			UpstreamHeaders            *[]UpstreamHeaderInput `json:"upstream_headers"`
-			DynamicDiscoveryEnabled    *bool                  `json:"dynamic_discovery_enabled"`
+			PingCacheEnabled           *bool                  `json:"ping_cache_enabled"`
+			ImageCacheEnabled          *bool                  `json:"image_cache_enabled"`
+			ProgressCoalescingEnabled  *bool                  `json:"progress_coalescing_enabled"`
+			DynamicDiscoveryEnabled    json.RawMessage        `json:"dynamic_discovery_enabled"`
 			DynamicProfile             *string                `json:"dynamic_profile"`
 			DynamicDiscoverySources    json.RawMessage        `json:"dynamic_discovery_sources"`
-			DynamicDomainRules         *[]DynamicDomainRule   `json:"dynamic_domain_rules"`
+			DynamicDomainRules         json.RawMessage        `json:"dynamic_domain_rules"`
 			DynamicAllowHTTPSDowngrade *bool                  `json:"dynamic_allow_https_downgrade"`
 			Quota                      *int64                 `json:"traffic_quota"`
 			SpeedLimit                 *int                   `json:"speed_limit"`
@@ -13360,7 +16713,21 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, 400, "invalid request")
 			return
 		}
+		requestedDynamicEnabledValue, dynamicEnabledProvided, err := decodeOptionalBoolAPI(req.DynamicDiscoveryEnabled, "dynamic_discovery_enabled")
+		if err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		var requestedDynamicEnabled *bool
+		if dynamicEnabledProvided {
+			requestedDynamicEnabled = &requestedDynamicEnabledValue
+		}
 		requestedDynamicSources, dynamicSourcesProvided, err := decodeDynamicDiscoverySourcesAPI(req.DynamicDiscoverySources)
+		if err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		requestedDynamicRules, dynamicRulesProvided, err := decodeDynamicDomainRulesAPI(req.DynamicDomainRules)
 		if err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
@@ -13471,22 +16838,17 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		candidate.CustomClient = customClient
 		candidate.CustomVersion = customVersion
 		candidate.StoredUpstreamHeaders = storedHeaders
-		if req.DynamicDiscoveryEnabled != nil {
-			candidate.DynamicDiscoveryEnabled = *req.DynamicDiscoveryEnabled
+		if req.PingCacheEnabled != nil {
+			candidate.PingCacheEnabled = *req.PingCacheEnabled
 		}
-		if req.DynamicProfile != nil {
-			candidate.DynamicProfile = *req.DynamicProfile
+		if req.ImageCacheEnabled != nil {
+			candidate.ImageCacheEnabled = *req.ImageCacheEnabled
 		}
-		if dynamicSourcesProvided {
-			candidate.DynamicDiscoverySources = requestedDynamicSources
+		if req.ProgressCoalescingEnabled != nil {
+			candidate.ProgressCoalescingEnabled = *req.ProgressCoalescingEnabled
 		}
-		if req.DynamicDomainRules != nil {
-			candidate.DynamicDomainRules = *req.DynamicDomainRules
-		}
-		if req.DynamicAllowHTTPSDowngrade != nil {
-			candidate.DynamicAllowHTTPSDowngrade = *req.DynamicAllowHTTPSDowngrade
-		}
-		if err := normalizeDynamicSitePolicy(&candidate); err != nil {
+		candidate, err = mergeDynamicSitePolicyForAPI(candidate, requestedDynamicEnabled, req.DynamicProfile, requestedDynamicSources, dynamicSourcesProvided, requestedDynamicRules, dynamicRulesProvided, req.DynamicAllowHTTPSDowngrade)
+		if err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -13645,7 +17007,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// GET /api/traffic/{site_id} and GET /api/traffic/{site_id}/snapshot
+// GET /api/traffic/{site_id}, /snapshot and /timeline
 func (a *App) handleTraffic(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/traffic/")
 
@@ -13659,6 +17021,14 @@ func (a *App) handleTraffic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	timelineRequest := strings.HasSuffix(path, "/timeline")
+	if timelineRequest {
+		path = strings.TrimSuffix(path, "/timeline")
+		if r.Method != http.MethodGet {
+			a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+	}
 	envelope := false
 	if strings.HasSuffix(path, "/snapshot") {
 		envelope = true
@@ -13666,8 +17036,32 @@ func (a *App) handleTraffic(w http.ResponseWriter, r *http.Request) {
 	}
 
 	siteID, err := strconv.ParseInt(path, 10, 64)
-	if err != nil {
-		a.jsonErr(w, 400, "invalid site id")
+	if err != nil || siteID <= 0 {
+		a.jsonErr(w, http.StatusBadRequest, "invalid site id")
+		return
+	}
+
+	if timelineRequest {
+		minutes, err := strconv.Atoi(r.URL.Query().Get("minutes"))
+		if err != nil || !validTrafficTimelineMinutes(minutes) {
+			a.jsonErr(w, http.StatusBadRequest, "minutes must be one of 60, 360, 1440, 10080")
+			return
+		}
+		if _, err := a.db.GetSite(siteID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				a.jsonErr(w, http.StatusNotFound, "site not found")
+				return
+			}
+			a.jsonErr(w, http.StatusInternalServerError, "traffic timeline unavailable")
+			return
+		}
+		buckets, err := a.pm.SiteTrafficTimeline(siteID, minutes, time.Now())
+		if err != nil {
+			a.jsonErr(w, http.StatusInternalServerError, "traffic timeline unavailable")
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		a.jsonOK(w, buckets)
 		return
 	}
 
@@ -13693,13 +17087,13 @@ func (a *App) handleTraffic(w http.ResponseWriter, r *http.Request) {
 			a.jsonOK(w, []TrafficLog{})
 			return
 		}
-		a.jsonErr(w, 500, err.Error())
+		a.jsonErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	history, err := a.pm.SiteTrafficHistory(*site, hours)
 	if err != nil {
-		a.jsonErr(w, 500, err.Error())
+		a.jsonErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if envelope {
@@ -13726,13 +17120,21 @@ func (a *App) handleDynamicProfiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
+	readiness, err := a.db.DynamicRollbackReadiness()
+	if err != nil {
+		a.jsonErr(w, http.StatusInternalServerError, "dynamic policy readiness unavailable")
+		return
+	}
 	keyConfigured := len(a.dynamicRouteKey) == sha256.Size
 	a.jsonOK(w, DynamicProfilesResponse{
-		Stage:         "structured-discovery",
-		Available:     keyConfigured,
-		KeyConfigured: keyConfigured,
-		Profiles:      dynamicProfilesCatalog(),
-		GlobalLimits:  dynamicGlobalLimits(),
+		Stage:               "structured-discovery",
+		Available:           keyConfigured,
+		KeyConfigured:       keyConfigured,
+		DefaultPolicy:       dynamicDefaultPolicy(),
+		EmptyRulesSemantics: "public_dns_https_443",
+		RollbackReadiness:   readiness,
+		Profiles:            dynamicProfilesCatalog(),
+		GlobalLimits:        dynamicGlobalLimits(),
 	})
 }
 
@@ -13792,7 +17194,7 @@ func (a *App) sendSSEEvent(w http.ResponseWriter, flusher http.Flusher) error {
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.8.0"
+var appVersion = "v1.9.0"
 
 func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, error) {
 	if len(args) == 0 {

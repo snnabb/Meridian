@@ -69,6 +69,9 @@ const API = {
   getTraffic(siteId, hours) { return this.request('GET', '/api/traffic/' + siteId + '?hours=' + (hours || 24)); },
   // Live-merged traffic page payload: { snapshot: SiteTraffic, logs: TrafficLog[] }.
   getTrafficSnapshot(siteId, hours) { return this.request('GET', '/api/traffic/' + siteId + '/snapshot?hours=' + (hours || 24)); },
+	getTrafficTimeline(siteId, minutes) {
+		return this.request('GET', '/api/traffic/' + encodeURIComponent(siteId) + '/timeline?minutes=' + (minutes || 1440));
+	},
 
   // UA Profiles
   getProfiles() { return this.request('GET', '/api/ua-profiles'); },

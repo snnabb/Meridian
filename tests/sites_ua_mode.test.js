@@ -7,10 +7,11 @@ const test = require('node:test');
 const vm = require('node:vm');
 
 const STATIC_JS = path.join(__dirname, '..', 'web', 'static', 'js');
+const STYLE_CSS = path.join(__dirname, '..', 'web', 'static', 'css', 'style.css');
 
 function loadSiteHelpers() {
   const source = fs.readFileSync(path.join(STATIC_JS, 'pages', 'sites.js'), 'utf8');
-  const sandbox = { window: {} };
+  const sandbox = { window: {}, esc: value => String(value) };
   vm.createContext(sandbox);
   vm.runInContext(source, sandbox, { filename: 'sites.js' });
   return sandbox;
@@ -43,19 +44,35 @@ test('custom UA form state exposes and hydrates all fields', () => {
   assert.equal(state.customVersion, '1.0.0');
 });
 
-test('preset form state hides and clears custom UA values', () => {
+test('every non-custom UA mode hides, unrequires and clears custom identity', () => {
   const { customUAFormState } = loadSiteHelpers();
-  const state = customUAFormState('web', {
-    custom_user_agent: 'stale',
-    custom_client: 'stale',
-    custom_version: 'stale',
-  });
+  for (const mode of ['infuse', 'web', 'client', 'passthrough']) {
+    const state = customUAFormState(mode, {
+      custom_user_agent: 'stale',
+      custom_client: 'stale',
+      custom_version: 'stale',
+    });
+    assert.equal(state.visible, false, mode);
+    assert.equal(state.required, false, mode);
+    assert.equal(state.customUserAgent, '', mode);
+    assert.equal(state.customClient, '', mode);
+    assert.equal(state.customVersion, '', mode);
+  }
+});
 
-  assert.equal(state.visible, false);
-  assert.equal(state.required, false);
-  assert.equal(state.customUserAgent, '');
-  assert.equal(state.customClient, '');
-  assert.equal(state.customVersion, '');
+test('hidden semantics override display utilities for the custom identity group', () => {
+  const css = fs.readFileSync(STYLE_CSS, 'utf8');
+  assert.match(css, /\[hidden\]\s*\{[^}]*display:\s*none\s*!important;[^}]*\}/);
+  assert.match(css, /\.form-input-stack\s*\{[^}]*display:\s*flex;/);
+  const valueRule = /\.site-row-value\s*\{([^}]*)\}/.exec(css)?.[1] || '';
+  assert.match(valueRule, /font-size:/);
+  assert.match(valueRule, /font-weight:/);
+  assert.match(valueRule, /color:\s*var\(--white-60\)/);
+
+  const source = fs.readFileSync(path.join(STATIC_JS, 'pages', 'sites.js'), 'utf8');
+  assert.match(source, /id="m-custom-ua-group" hidden/);
+  assert.match(source, /customUAGroup\.hidden = !state\.visible/);
+  assert.match(source, /input\.required = state\.required/);
 });
 
 test('custom UA payload trims custom values and preset payload clears them', () => {
@@ -106,6 +123,19 @@ test('upstream header payload keeps configured rows write-only', () => {
 		{ name: 'EMOS-PROXY-ID', value: '' },
 		{ name: 'X-New-Header', value: 'new-value' },
 	]);
+});
+
+test('configured upstream header rows stay write-only and use semantic responsive markup', () => {
+  const { renderUpstreamHeaderRows } = loadSiteHelpers();
+  const html = renderUpstreamHeaderRows([
+    { name: 'X-Origin-Secret', value: 'must-not-render', configured: true },
+  ], true);
+
+  assert.ok(!html.includes('must-not-render'));
+  assert.match(html, /<fieldset class="form-list-row upstream-header-row">/);
+  assert.match(html, /type="password"[^>]*value=""/);
+  assert.match(html, /placeholder="已配置；留空保持不变"/);
+  assert.match(html, /aria-label="删除上游请求头 1"/);
 });
 
 test('passthrough mode label maps to 透传 with an existing pill class', () => {

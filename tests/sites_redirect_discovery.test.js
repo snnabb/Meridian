@@ -45,10 +45,14 @@ function discoveryProfile(id, overrides = {}) {
     extreme: [10, 4096, 65536, 4096, 64 * 1024 * 1024, 64, 1200, 512, 24 * 60 * 60, 7 * 24 * 60 * 60],
   }[id];
   const anyPort = id !== 'safe';
+  const discoverySources = id === 'safe'
+    ? ['redirect', 'playback_info']
+    : ['redirect', 'playback_info', 'hls', 'dash'];
   return {
     id,
     label: id[0].toUpperCase() + id.slice(1),
     recommended: id === 'safe',
+    discovery_sources: discoverySources,
     limits: {
       allowed_schemes: anyPort ? ['http', 'https'] : ['https'],
       allowed_ports: anyPort ? [] : [443],
@@ -82,6 +86,14 @@ function structuredDiscoveryResponse(overrides = {}) {
     stage: 'structured-discovery',
     available: true,
     key_configured: true,
+    empty_rules_semantics: 'public_dns_https_443',
+    default_policy: {
+      dynamic_discovery_enabled: true,
+      dynamic_profile: 'safe',
+      dynamic_discovery_sources: ['redirect', 'playback_info'],
+      dynamic_domain_rules: [],
+      dynamic_allow_https_downgrade: false,
+    },
     profiles: [
       discoveryProfile('safe'),
       discoveryProfile('compatible'),
@@ -107,6 +119,32 @@ function structuredDiscoveryResponse(overrides = {}) {
   };
 }
 
+function existingSite(overrides = {}) {
+  return {
+    id: 17,
+    name: 'Media',
+    target_url: 'https://origin.example',
+    ingress_mode: 'port',
+    listen_port: 8096,
+    public_host: '',
+    ua_mode: 'infuse',
+    playback_mode: 'direct',
+    playback_target_url: '',
+    stream_hosts: [],
+    upstream_headers: [],
+    dynamic_discovery_enabled: true,
+    dynamic_profile: 'safe',
+    dynamic_domain_rules: [],
+    dynamic_allow_https_downgrade: false,
+    ping_cache_enabled: false,
+    image_cache_enabled: false,
+    progress_coalescing_enabled: false,
+    traffic_quota: 0,
+    speed_limit: 0,
+    ...overrides,
+  };
+}
+
 class FakeElement {
   constructor(ownerDocument, id = '') {
     this.ownerDocument = ownerDocument;
@@ -123,6 +161,7 @@ class FakeElement {
     this.hidden = false;
     this.required = false;
     this.title = '';
+    this.open = false;
   }
 
   set innerHTML(value) {
@@ -144,13 +183,15 @@ class FakeElement {
     this[`on${type}`] = handler;
   }
 
-  focus() {}
+  focus() {
+    this.ownerDocument.activeElement = this;
+  }
 }
 
 class FakeDocument {
   constructor() {
     this.elements = new Map();
-    for (const id of ['modal-title', 'modal-body', 'modal-footer']) {
+    for (const id of ['modal-title', 'modal-body', 'modal-footer', 'sites-count', 'sites-grid']) {
       this.elements.set(id, new FakeElement(this, id));
     }
   }
@@ -176,6 +217,9 @@ class FakeDocument {
       element.value = /\bvalue="([^"]*)"/.exec(attributes)?.[1] || '';
       element.checked = /(?:^|\s)checked(?:\s|$)/.test(attributes);
       element.disabled = /(?:^|\s)disabled(?:\s|$)/.test(attributes);
+      element.hidden = /(?:^|\s)hidden(?:\s|$)/.test(attributes);
+      element.open = /(?:^|\s)open(?:\s|$)/.test(attributes);
+      element.required = /(?:^|\s)required(?:\s|$)/.test(attributes);
       for (const match of attributes.matchAll(/\bdata-([a-z0-9-]+)="([^"]*)"/gi)) {
         const key = match[1].replace(/-([a-z])/g, (_, character) => character.toUpperCase());
         element.dataset[key] = match[2];
@@ -186,7 +230,7 @@ class FakeDocument {
   }
 }
 
-function loadModalHarness() {
+function loadModalHarness(options = {}) {
   const document = new FakeDocument();
   const state = {
     confirmationResult: false,
@@ -195,7 +239,10 @@ function loadModalHarness() {
     observationDeletes: [],
     successes: [],
     errors: [],
+    created: [],
+    updated: [],
     opened: 0,
+    closed: 0,
   };
   const sandbox = {
     document,
@@ -207,12 +254,17 @@ function loadModalHarness() {
     },
     URL,
     API: {
-      ingressCapabilities: async () => ({
+      ingressCapabilities: async () => options.siteCapabilities || ({
         host_only_available: true,
         upstream_headers_available: true,
         max_playback_addresses: 128,
       }),
-      getDynamicProfiles: async () => structuredDiscoveryResponse(),
+      listSites: async () => [],
+      getDynamicProfiles: async () => options.dynamicResponse === undefined
+        ? structuredDiscoveryResponse()
+        : options.dynamicResponse,
+      createSite: async data => { state.created.push(clone(data)); },
+      updateSite: async (siteId, data) => { state.updated.push({ siteId, data: clone(data) }); },
       getDynamicObservations: async siteId => {
         state.observationGets.push(siteId);
         return {
@@ -247,7 +299,7 @@ function loadModalHarness() {
       })[character]);
     },
     openModal() { state.opened++; },
-    closeModal() {},
+    closeModal() { state.closed++; },
     loadSites() {},
     formatBytes(value) { return String(value); },
     uaClassMap: {},
@@ -262,275 +314,382 @@ function loadModalHarness() {
   return { sandbox, document, state };
 }
 
-test('only the exact structured-discovery capability envelope is recognized', async () => {
+test('catalog recognition requires canonical sources, default policy, and empty-rule semantics', async () => {
   const sandbox = loadScripts('api.js', 'pages/sites.js');
   const accepted = structuredDiscoveryResponse();
-
   assert.equal(sandbox.isStructuredDiscoveryContract(accepted), true);
-  assert.deepEqual(plain(sandbox.normalizeDynamicProfiles(accepted)), {
-    stage: 'structured-discovery',
-    available: true,
-    key_configured: true,
-    recognized: true,
-    profiles: accepted.profiles,
-    global_limits: accepted.global_limits,
-  });
+  const normalized = sandbox.normalizeDynamicProfiles(accepted);
+  assert.equal(normalized.recognized, true);
+  assert.equal(normalized.empty_rules_semantics, 'public_dns_https_443');
+  assert.deepEqual(plain(sandbox.dynamicSourcesForProfile(normalized, 'safe')), ['redirect', 'playback_info']);
+  assert.deepEqual(plain(sandbox.dynamicSourcesForProfile(normalized, 'compatible')), ['redirect', 'playback_info', 'hls', 'dash']);
+  assert.deepEqual(plain(normalized.default_policy), accepted.default_policy);
 
-  const malformed = [];
-  malformed.push(null, {}, { ...accepted, stage: 'redirect-discovery' });
-  malformed.push({ ...accepted, available: false, key_configured: true });
-
+  const malformed = [null, {}, { ...accepted, stage: 'redirect-discovery' }, { ...accepted, available: false, key_configured: true }, { ...accepted, empty_rules_semantics: 'deny_all' }];
+  const missingDefault = clone(accepted);
+  delete missingDefault.default_policy;
+  malformed.push(missingDefault);
+  const wrongSafeSources = clone(accepted);
+  wrongSafeSources.profiles[0].discovery_sources.push('hls');
+  malformed.push(wrongSafeSources);
+  const wrongDefaultSources = clone(accepted);
+  wrongDefaultSources.default_policy.dynamic_discovery_sources = ['redirect'];
+  malformed.push(wrongDefaultSources);
   const missingGlobalLimit = clone(accepted);
   delete missingGlobalLimit.global_limits.max_dns_workers;
   malformed.push(missingGlobalLimit);
-
-  const duplicateProfile = clone(accepted);
-  duplicateProfile.profiles[2].id = 'compatible';
-  malformed.push(duplicateProfile);
-
-  const missingLimit = clone(accepted);
-  delete missingLimit.profiles[0].limits.max_redirects;
-  malformed.push(missingLimit);
-
-  const invalidPort = clone(accepted);
-  invalidPort.profiles[0].limits.allowed_ports = [0];
-  malformed.push(invalidPort);
-
-  const missingFeature = clone(accepted);
-  delete missingFeature.profiles[0].features.raw_fallback;
-  malformed.push(missingFeature);
-
-  const wrongRedirectFeature = clone(accepted);
-  wrongRedirectFeature.profiles[1].features.redirect_discovery = false;
-  malformed.push(wrongRedirectFeature);
-
-  const prematurelyEnabledLaterFeature = clone(accepted);
-  prematurelyEnabledLaterFeature.profiles[2].features.private_targets = true;
-  malformed.push(prematurelyEnabledLaterFeature);
-
-  const missingStructuredFeature = clone(accepted);
-  delete missingStructuredFeature.profiles[0].features.playback_info;
-  malformed.push(missingStructuredFeature);
-
-  const manifestEnabledInSafe = clone(accepted);
-  manifestEnabledInSafe.profiles[0].features.hls = true;
-  malformed.push(manifestEnabledInSafe);
-
   for (const value of malformed) {
     assert.equal(sandbox.isStructuredDiscoveryContract(value), false);
-    const normalized = sandbox.normalizeDynamicProfiles(value);
-    assert.equal(normalized.recognized, false);
-    assert.equal(normalized.available, false);
-    assert.equal(normalized.key_configured, false);
+    assert.equal(sandbox.normalizeDynamicProfiles(value).recognized, false);
   }
-
   vm.runInContext('API.getDynamicProfiles = async () => { throw new Error("missing"); }', sandbox);
-  const missing = await sandbox.loadDynamicProfiles();
-  assert.equal(missing.recognized, false);
-  assert.equal(missing.available, false);
-  assert.equal(missing.key_configured, false);
+  assert.equal((await sandbox.loadDynamicProfiles()).recognized, false);
 });
 
-test('availability and key status gate enablement without hiding legacy editing', () => {
+test('new-site discovery defaults only from a ready Safe catalog policy', () => {
   const sandbox = loadScripts('api.js', 'pages/sites.js');
-  const available = structuredDiscoveryResponse();
-  const unavailable = structuredDiscoveryResponse({ available: false, key_configured: false });
-  const policy = { dynamic_discovery_enabled: true };
-
-  const enabledControl = sandbox.renderDynamicEnableControl(available, policy);
-  assert.match(enabledControl, /id="m-dynamic-enabled"[^>]*checked/);
-  assert.doesNotMatch(enabledControl, /id="m-dynamic-enabled"[^>]*disabled/);
-
-  const disabledControl = sandbox.renderDynamicEnableControl(unavailable, policy);
-  assert.doesNotMatch(disabledControl, /id="m-dynamic-enabled"[^>]*disabled/);
-  assert.match(disabledControl, /id="m-dynamic-enabled"[^>]*checked/);
-  assert.match(disabledControl, /id="m-dynamic-source-redirect"[^>]*checked/);
-	assert.match(disabledControl, /id="m-dynamic-source-redirect"[^>]*disabled/);
-
-  const unavailablePayload = sandbox.buildDynamicPolicyPayload(policy, unavailable);
-  assert.equal(unavailablePayload.dynamic_discovery_enabled, true);
-  assert.deepEqual(plain(unavailablePayload.dynamic_discovery_sources), ['redirect', 'playback_info']);
-
-  const unavailableNewControl = sandbox.renderDynamicEnableControl(unavailable, {});
-  assert.match(unavailableNewControl, /id="m-dynamic-enabled"[^>]*disabled/);
-  assert.doesNotMatch(unavailableNewControl, /id="m-dynamic-enabled"[^>]*checked/);
-  assert.equal(sandbox.buildDynamicPolicyPayload({}, unavailable).dynamic_discovery_enabled, false);
-	const unrecognizedControl = sandbox.renderDynamicEnableControl({ stage: 'redirect-discovery' }, policy);
-	assert.match(unrecognizedControl, /id="m-dynamic-enabled"[^>]*disabled/);
-	assert.match(unrecognizedControl, /id="m-dynamic-source-redirect"[^>]*disabled/);
-  assert.deepEqual(plain(sandbox.buildDynamicPolicyPayload(policy, { stage: 'redirect-discovery' })), {});
-});
-
-test('structured-discovery status reports delivered sources and only unavailable opt-ins', () => {
-  const sandbox = loadScripts('api.js', 'pages/sites.js');
-  const capabilities = structuredDiscoveryResponse({
-    dynamic_route_key: 'raw-secret-must-not-render',
-    target_url: 'https://target-must-not-render.example/private?token=secret',
+  assert.deepEqual(plain(sandbox.defaultDynamicSitePolicy(structuredDiscoveryResponse())), {
+    dynamic_discovery_enabled: true,
+    dynamic_profile: 'safe',
+    dynamic_playback_info_enabled: true,
+    dynamic_domain_rules: [],
+    dynamic_allow_https_downgrade: false,
   });
-  const status = sandbox.renderDynamicStatus(capabilities);
-
-  assert.match(status, /自动播放后端发现/);
-  assert.match(status, /安全 HTTP 30x、PlaybackInfo、HLS 和 DASH/);
-  assert.match(status, /不扫描任意正文/);
-  assert.match(status, /DYNAMIC_ROUTE_KEY：已配置/);
-  for (const label of ['安全 30x 重定向发现', 'PlaybackInfo 改写', 'HLS 解析', 'DASH 解析']) {
-    assert.doesNotMatch(status, new RegExp(label + '：不可用'));
-  }
-  for (const label of ['私网目标', '自定义 CA', '原始响应回退']) {
-    assert.match(status, new RegExp(label + '：不可用'));
-  }
-  assert.ok(!status.includes('raw-secret-must-not-render'));
-  assert.ok(!status.includes('target-must-not-render'));
+  const unavailable = structuredDiscoveryResponse({ available: false, key_configured: false });
+  assert.equal(sandbox.defaultDynamicSitePolicy(unavailable).dynamic_discovery_enabled, false);
+  const defaultOff = structuredDiscoveryResponse();
+  defaultOff.default_policy.dynamic_discovery_enabled = false;
+  assert.equal(sandbox.isStructuredDiscoveryContract(defaultOff), true);
+  assert.equal(sandbox.defaultDynamicSitePolicy(defaultOff).dynamic_discovery_enabled, false);
 });
 
-test('profile risk notices and transition confirmations match the approved product gates', () => {
-  const sandbox = loadScripts('api.js', 'pages/sites.js');
-  assert.equal(discoveryProfile('extreme').limits.max_body_bytes, 64 * 1024 * 1024);
-
-  const safe = sandbox.renderDynamicProfileRisk('safe');
-  const compatible = sandbox.renderDynamicProfileRisk('compatible');
-  const extreme = sandbox.renderDynamicProfileRisk('extreme');
-  assert.match(safe, /data-profile-risk="safe"/);
-  assert.match(safe, /推荐/);
-  assert.match(compatible, /data-profile-risk="compatible"/);
-  assert.match(compatible, /黄色确认/);
-  assert.match(compatible, /任意公网域名和 1–65535 端口/);
-  assert.match(extreme, /data-profile-risk="extreme"/);
-  assert.match(extreme, /高风险/);
-  assert.match(extreme, /输入站点名称/);
-
-  const disabledSafe = { dynamic_discovery_enabled: false, dynamic_profile: 'safe' };
-  const enabledSafe = { dynamic_discovery_enabled: true, dynamic_profile: 'safe' };
-  const enabledCompatible = { dynamic_discovery_enabled: true, dynamic_profile: 'compatible' };
-  const enabledExtreme = { dynamic_discovery_enabled: true, dynamic_profile: 'extreme' };
-  assert.equal(sandbox.dynamicProfileConfirmationRequirement(disabledSafe, enabledCompatible), 'compatible');
-  assert.equal(sandbox.dynamicProfileConfirmationRequirement(enabledSafe, enabledCompatible), 'compatible');
-  assert.equal(sandbox.dynamicProfileConfirmationRequirement(enabledCompatible, enabledCompatible), 'none');
-  assert.equal(sandbox.dynamicProfileConfirmationRequirement(enabledExtreme, enabledCompatible), 'none');
-  assert.equal(sandbox.dynamicProfileConfirmationRequirement(enabledSafe, enabledExtreme), 'extreme');
-  assert.equal(sandbox.dynamicProfileConfirmationRequirement(enabledExtreme, enabledExtreme), 'none');
-
-  const prompts = [];
-  sandbox.window.confirm = message => {
-    prompts.push(message);
-    return true;
-  };
-  const compatibleAccepted = sandbox.confirmDynamicProfileChange(enabledSafe, enabledCompatible, 'media-site', false, '');
-  assert.equal(compatibleAccepted.ok, true);
-  assert.equal(compatibleAccepted.requirement, 'compatible');
-  assert.match(prompts.at(-1), /任意公网域名和 1–65535 端口/);
-
-  const missingAcknowledgement = sandbox.confirmDynamicProfileChange(enabledSafe, enabledExtreme, 'media-site', false, 'media-site');
-  assert.equal(missingAcknowledgement.ok, false);
-  assert.match(missingAcknowledgement.error, /勾选/);
-  const wrongName = sandbox.confirmDynamicProfileChange(enabledSafe, enabledExtreme, 'media-site', true, 'other-site');
-  assert.equal(wrongName.ok, false);
-  assert.match(wrongName.error, /准确输入站点名称/);
-  const extremeAccepted = sandbox.confirmDynamicProfileChange(enabledSafe, enabledExtreme, 'media-site', true, 'media-site');
-  assert.equal(extremeAccepted.ok, true);
-  assert.equal(extremeAccepted.requirement, 'extreme');
-  assert.match(prompts.at(-1), /显著放大公网发现/);
-
-  const unchangedExtreme = sandbox.confirmDynamicProfileChange(enabledExtreme, enabledExtreme, 'media-site', false, '');
-  assert.equal(unchangedExtreme.ok, true);
-  assert.equal(unchangedExtreme.requirement, 'none');
-});
-
-test('site modal keeps risk badges visible and reveals Extreme acknowledgements on transition', async () => {
+test('create modal defaults to Safe PlaybackInfo inspection without exposing a source matrix', async () => {
   const { sandbox, document } = loadModalHarness();
   await sandbox.showSiteModal(null);
-  const enabled = document.getElementById('m-dynamic-enabled');
-  const profile = document.getElementById('m-dynamic-profile');
-  const risk = document.getElementById('m-dynamic-profile-risk');
-  const extremeConfirmation = document.getElementById('m-dynamic-extreme-confirm');
+  assert.equal(document.getElementById('m-ingress-mode').value, 'port');
+  assert.equal(document.getElementById('m-dynamic-enabled').checked, true);
+  assert.equal(document.getElementById('m-dynamic-profile').value, 'safe');
+  assert.equal(document.getElementById('m-dynamic-playback-info').checked, true);
+  assert.equal(document.getElementById('m-dynamic-source-redirect'), null);
+  assert.equal(document.getElementById('m-dynamic-source-playback_info'), null);
+  assert.equal(document.getElementById('m-dynamic-source-hls'), null);
+  assert.equal(document.getElementById('m-dynamic-source-dash'), null);
+  assert.equal(document.getElementById('m-dynamic-policy-fields').disabled, false);
+  assert.equal(document.getElementById('m-dynamic-advanced').hidden, true);
+  assert.equal(document.getElementById('m-dynamic-downgrade').checked, false);
+  assert.match(document.getElementById('m-dynamic-domain-warning').textContent, /公网 DNS 主机名的 HTTPS:443/);
+  const modalMarkup = document.getElementById('modal-body').innerHTML;
+  assert.match(modalMarkup, /解析 PlaybackInfo/);
+  assert.match(modalMarkup, /PlaybackInfo 将原样透传/);
+  assert.match(modalMarkup, /HTTP 30x 后端发现仍保持启用/);
+  assert.match(modalMarkup, /外部 URL 不再封装为受控能力链接，可能直接交给客户端/);
+});
 
-  assert.match(risk.innerHTML, /data-profile-risk="safe"/);
-  assert.equal(document.getElementById('m-dynamic-source-hls').disabled, true);
-  assert.equal(document.getElementById('m-dynamic-source-dash').disabled, true);
-  enabled.checked = true;
-  enabled.onchange();
+test('create modal keeps discovery off and policy controls disabled when the catalog is unavailable', async () => {
+  const { sandbox, document } = loadModalHarness({ dynamicResponse: structuredDiscoveryResponse({ available: false, key_configured: false }) });
+  await sandbox.showSiteModal(null);
+  assert.equal(document.getElementById('m-dynamic-enabled').checked, false);
+  assert.equal(document.getElementById('m-dynamic-enabled').disabled, true);
+  assert.equal(document.getElementById('m-dynamic-playback-info').checked, true);
+  assert.equal(document.getElementById('m-dynamic-policy-fields').disabled, true);
+  assert.equal(document.getElementById('m-ingress-mode').value, 'port');
+  assert.match(document.getElementById('modal-body').innerHTML, /DYNAMIC_ROUTE_KEY 未配置/);
+});
+
+test('edit modal preserves stored state and auto-opens an enabled downgrade', async () => {
+  const { sandbox, document } = loadModalHarness();
+  await sandbox.showSiteModal(existingSite({
+    ingress_mode: 'both', public_host: 'media.example.com', dynamic_profile: 'compatible',
+    dynamic_domain_rules: [{ type: 'suffix', value: 'media.example.com' }], dynamic_allow_https_downgrade: true,
+    ping_cache_enabled: true, image_cache_enabled: true, progress_coalescing_enabled: true,
+  }));
+  assert.equal(document.getElementById('m-ingress-mode').value, 'both');
+  assert.equal(document.getElementById('m-dynamic-profile').value, 'compatible');
+  assert.equal(document.getElementById('m-dynamic-playback-info').checked, true, 'a missing source array keeps inspection on');
+  assert.equal(document.getElementById('m-dynamic-downgrade').checked, true);
+  assert.equal(document.getElementById('m-dynamic-advanced').hidden, false);
+  assert.equal(document.getElementById('m-dynamic-advanced').open, true);
+  assert.equal(document.getElementById('m-ping-cache-enabled').checked, true);
+  assert.equal(document.getElementById('m-image-cache-enabled').checked, true);
+  assert.equal(document.getElementById('m-progress-coalescing-enabled').checked, true);
+});
+
+test('edit modal hydrates canonical PlaybackInfo-off source sets for every profile', async () => {
+  const cases = [
+    ['safe', ['redirect']],
+    ['compatible', ['redirect', 'hls', 'dash']],
+    ['extreme', ['redirect', 'hls', 'dash']],
+  ];
+  for (const [profile, dynamicDiscoverySources] of cases) {
+    const { sandbox, document } = loadModalHarness();
+    await sandbox.showSiteModal(existingSite({
+      dynamic_profile: profile,
+      dynamic_discovery_sources: dynamicDiscoverySources,
+    }));
+    assert.equal(document.getElementById('m-dynamic-playback-info').checked, false, profile);
+  }
+});
+
+test('existing request limits hydrate the peer checkbox and revealed fields', async () => {
+  const { sandbox, document } = loadModalHarness();
+  await sandbox.showSiteModal(existingSite({
+    traffic_quota: 3 * 1073741824,
+    speed_limit: 24,
+  }));
+  assert.equal(document.getElementById('m-request-limits-enabled').checked, true);
+  assert.equal(document.getElementById('m-request-limit-fields').hidden, false);
+  assert.equal(document.getElementById('m-quota').value, '3');
+  assert.equal(document.getElementById('m-speed').value, '24');
+  assert.equal(document.getElementById('m-quota').disabled, false);
+  assert.equal(document.getElementById('m-speed').disabled, false);
+});
+
+test('selected-profile risk and approved transition gates remain active', () => {
+  const sandbox = loadScripts('api.js', 'pages/sites.js');
+  const capabilities = structuredDiscoveryResponse();
+  assert.match(sandbox.renderDynamicProfileRisk('safe', capabilities), /HTTP 30x、PlaybackInfo/);
+  assert.match(sandbox.renderDynamicProfileRisk('compatible', capabilities), /任意公网域名和端口/);
+  assert.match(sandbox.renderDynamicProfileRisk('extreme', capabilities), /重放有界请求体/);
+  const safe = { dynamic_discovery_enabled: true, dynamic_profile: 'safe' };
+  const compatible = { dynamic_discovery_enabled: true, dynamic_profile: 'compatible' };
+  const extreme = { dynamic_discovery_enabled: true, dynamic_profile: 'extreme' };
+  assert.equal(sandbox.dynamicProfileConfirmationRequirement(safe, compatible), 'compatible');
+  assert.equal(sandbox.dynamicProfileConfirmationRequirement(compatible, compatible), 'none');
+  assert.equal(sandbox.dynamicProfileConfirmationRequirement(safe, extreme), 'extreme');
+  const prompts = [];
+  sandbox.window.confirm = message => { prompts.push(message); return true; };
+  assert.equal(sandbox.confirmDynamicProfileChange(safe, compatible, 'Media', false, '').ok, true);
+  assert.match(prompts.at(-1), /1–65535/);
+  assert.match(sandbox.confirmDynamicProfileChange(safe, extreme, 'Media', false, 'Media').error, /勾选/);
+  assert.match(sandbox.confirmDynamicProfileChange(safe, extreme, 'Media', true, 'Other').error, /准确输入/);
+  assert.equal(sandbox.confirmDynamicProfileChange(safe, extreme, 'Media', true, 'Media').ok, true);
+});
+
+test('profile interaction preserves PlaybackInfo choice and conditionally reveals risk controls', async () => {
+  const { sandbox, document } = loadModalHarness();
+  await sandbox.showSiteModal(null);
+  const profile = document.getElementById('m-dynamic-profile');
+  const playbackInfo = document.getElementById('m-dynamic-playback-info');
+  const profileRisk = document.getElementById('m-dynamic-profile-risk');
+  const downgrade = document.getElementById('m-dynamic-downgrade');
+  const advanced = document.getElementById('m-dynamic-advanced');
+  const extremeConfirmation = document.getElementById('m-dynamic-extreme-confirm');
+  assert.equal(playbackInfo.checked, true);
+  playbackInfo.checked = false;
+  playbackInfo.onchange();
+  assert.doesNotMatch(profileRisk.innerHTML, /PlaybackInfo/);
   profile.value = 'compatible';
   profile.onchange();
-  assert.match(risk.innerHTML, /data-profile-risk="compatible"/);
-  assert.equal(document.getElementById('m-dynamic-source-hls').disabled, false);
-  assert.equal(document.getElementById('m-dynamic-source-dash').disabled, false);
-  assert.equal(extremeConfirmation.hidden, true);
-
+  assert.equal(playbackInfo.checked, false);
+  assert.match(profileRisk.innerHTML, /HTTP 30x、HLS、DASH/);
+  assert.equal(advanced.hidden, false);
+  downgrade.checked = true;
+  profile.value = 'safe';
+  profile.onchange();
+  assert.equal(playbackInfo.checked, false);
+  assert.equal(advanced.hidden, true);
+  assert.equal(downgrade.checked, false);
   profile.value = 'extreme';
   profile.onchange();
-  assert.match(risk.innerHTML, /data-profile-risk="extreme"/);
+  assert.equal(playbackInfo.checked, false);
+  assert.equal(advanced.hidden, false);
   assert.equal(extremeConfirmation.hidden, false);
-
-  enabled.checked = false;
-  enabled.onchange();
-  assert.equal(extremeConfirmation.hidden, true);
 });
 
-test('enabled discovery policy normalizes sources and rules and omits the response-only revision', () => {
+test('policy normalization and payload use only canonical PlaybackInfo ON or OFF source sets', () => {
   const sandbox = loadScripts('api.js', 'pages/sites.js');
+  const capabilities = structuredDiscoveryResponse();
   const hydrated = sandbox.normalizeDynamicSitePolicy({
-    dynamic_discovery_enabled: true,
-    dynamic_profile: ' COMPATIBLE ',
-    dynamic_domain_rules: [
-      { type: ' EXACT ', value: ' Media.Example.COM ' },
-      { type: 'suffix', value: ' CDN.Example.COM ' },
-      { type: 'wildcard', value: 'ignored.example' },
-      null,
-    ],
-    dynamic_allow_https_downgrade: true,
-    dynamic_policy_revision: 9,
+    dynamic_discovery_enabled: true, dynamic_profile: ' COMPATIBLE ', dynamic_discovery_sources: ['redirect'],
+    dynamic_domain_rules: [{ type: ' EXACT ', value: ' Media.Example.COM ' }, { type: 'suffix', value: ' CDN.Example.COM ' }],
+    dynamic_allow_https_downgrade: true, dynamic_policy_revision: 9,
   });
-
-  assert.equal(hydrated.dynamic_policy_revision, 9);
-  assert.deepEqual(plain(hydrated.dynamic_discovery_sources), ['redirect', 'playback_info', 'hls', 'dash']);
-  const payload = sandbox.buildDynamicPolicyPayload(hydrated, structuredDiscoveryResponse());
+  assert.equal(hydrated.dynamic_playback_info_enabled, false);
+  assert.equal(sandbox.normalizeDynamicSitePolicy({ dynamic_discovery_sources: ['playback_info'] }).dynamic_playback_info_enabled, true);
+  assert.equal(sandbox.normalizeDynamicSitePolicy({}).dynamic_playback_info_enabled, true, 'missing arrays default inspection on');
+  assert.equal(sandbox.normalizeDynamicSitePolicy({ dynamic_discovery_sources: 'playback_info' }).dynamic_playback_info_enabled, true, 'invalid arrays default inspection on');
+  const payload = sandbox.buildDynamicPolicyPayload(hydrated, capabilities);
   assert.deepEqual(plain(payload), {
-    dynamic_discovery_enabled: true,
-    dynamic_profile: 'compatible',
-    dynamic_discovery_sources: ['redirect', 'playback_info', 'hls', 'dash'],
-    dynamic_domain_rules: [
-      { type: 'exact', value: 'media.example.com' },
-      { type: 'suffix', value: 'cdn.example.com' },
-    ],
+    dynamic_discovery_enabled: true, dynamic_profile: 'compatible',
+    dynamic_discovery_sources: ['redirect', 'hls', 'dash'],
+    dynamic_domain_rules: [{ type: 'exact', value: 'media.example.com' }, { type: 'suffix', value: 'cdn.example.com' }],
     dynamic_allow_https_downgrade: true,
   });
-  assert.equal(Object.hasOwn(payload, 'dynamic_policy_revision'), false, 'revision is response-only');
+  assert.equal(Object.hasOwn(payload, 'dynamic_playback_info_enabled'), false);
+  assert.equal(Object.hasOwn(hydrated, 'dynamic_policy_revision'), false);
 
-  const partial = sandbox.normalizeDynamicSitePolicy({
-    dynamic_discovery_sources: ['HLS', 'dash', 'redirect', 'REDIRECT', 'unknown', null],
-  });
-  assert.deepEqual(plain(partial.dynamic_discovery_sources), ['redirect']);
-  assert.deepEqual(
-    plain(sandbox.buildDynamicPolicyPayload(partial, structuredDiscoveryResponse()).dynamic_discovery_sources),
-    ['redirect'],
-  );
+  const sourceCases = [
+    ['safe', ['redirect', 'playback_info'], ['redirect']],
+    ['compatible', ['redirect', 'playback_info', 'hls', 'dash'], ['redirect', 'hls', 'dash']],
+    ['extreme', ['redirect', 'playback_info', 'hls', 'dash'], ['redirect', 'hls', 'dash']],
+  ];
+  for (const [profile, enabledSources, disabledSources] of sourceCases) {
+    const enabled = sandbox.buildDynamicPolicyPayload({ dynamic_profile: profile, dynamic_playback_info_enabled: true }, capabilities);
+    const disabled = sandbox.buildDynamicPolicyPayload({ dynamic_profile: profile, dynamic_playback_info_enabled: false }, capabilities);
+    assert.deepEqual(plain(enabled.dynamic_discovery_sources), enabledSources, `${profile} ON`);
+    assert.deepEqual(plain(disabled.dynamic_discovery_sources), disabledSources, `${profile} OFF`);
+  }
+
+  assert.equal(sandbox.buildDynamicPolicyPayload({ dynamic_profile: 'safe', dynamic_allow_https_downgrade: true }, capabilities).dynamic_allow_https_downgrade, false);
+  assert.deepEqual(plain(sandbox.buildDynamicPolicyPayload({ dynamic_discovery_enabled: true }, {}, true)), { dynamic_discovery_enabled: false });
+  assert.deepEqual(plain(sandbox.buildDynamicPolicyPayload({ dynamic_discovery_enabled: true }, {}, false)), {});
 });
 
-test('Safe enablement requires a plausible exact or suffix DNS rule', () => {
+test('Safe empty-rule warning and last-restriction transition match public HTTPS semantics', () => {
   const sandbox = loadScripts('api.js', 'pages/sites.js');
+  const empty = sandbox.dynamicDomainRuleWarning('safe', []);
+  assert.equal(empty.tone, 'info');
+  assert.match(empty.message, /公网 DNS 主机名的 HTTPS:443/);
+  assert.match(empty.message, /IP 字面量始终拒绝/);
+  assert.equal(sandbox.dynamicDomainRuleWarning('safe', [{ type: 'exact', value: 'media.example.com' }]).message, '');
+  assert.equal(sandbox.dynamicDomainRuleWarning('safe', [{ type: 'exact', value: '127.0.0.1' }]).tone, 'warning');
+  const restriction = [{ type: 'exact', value: 'media.example.com' }];
+  assert.equal(sandbox.safeRulesBecomeUnrestricted(true, 'safe', restriction, []), true);
+  assert.equal(sandbox.safeRulesBecomeUnrestricted(false, 'safe', restriction, []), false);
+  const rows = sandbox.renderDynamicRuleRows([{ type: 'exact', value: 'origin.example.com' }, { type: 'suffix', value: 'cdn.example.com' }]);
+  assert.match(rows, /value="exact" selected/);
+  assert.match(rows, /value="suffix" selected/);
+  assert.match(rows, /<fieldset class="form-list-row dynamic-rule-row/);
+  assert.match(rows, /for="m-dynamic-rule-value-1"/);
+});
 
-  assert.equal(sandbox.hasRequiredSafeDynamicRules('safe', []), false);
-  assert.equal(sandbox.hasRequiredSafeDynamicRules('safe', [{ type: 'exact', value: 'Media.Example.COM' }]), true);
-  assert.equal(sandbox.hasRequiredSafeDynamicRules('safe', [{ type: 'suffix', value: 'cdn.example.net.' }]), true);
-  for (const value of [
-    '*.example.com',
-    '.example.com',
-    'https://example.com',
-    'example.com/path',
-    'user@example.com',
-    '127.0.0.1',
-    'localhost',
-    'example.123',
-    '-edge.example.com',
-  ]) {
-    assert.equal(
-      sandbox.hasRequiredSafeDynamicRules('safe', [{ type: 'exact', value }]),
-      false,
-      `${value} must not satisfy the Safe DNS-rule requirement`,
-    );
-  }
-  assert.equal(sandbox.hasRequiredSafeDynamicRules('compatible', []), true);
-  assert.equal(sandbox.hasRequiredSafeDynamicRules('extreme', []), true);
+test('create submission includes default Safe discovery sources and proxy optimization toggles', async () => {
+  const { sandbox, document, state } = loadModalHarness();
+  await sandbox.showSiteModal(null);
+  document.getElementById('m-name').value = 'Media';
+  document.getElementById('m-target').value = 'https://origin.example';
+  document.getElementById('m-port').value = '8096';
+  document.getElementById('m-playback-mode').value = 'direct';
+  document.getElementById('m-ping-cache-enabled').checked = true;
+  document.getElementById('m-progress-coalescing-enabled').checked = true;
+  await document.getElementById('m-submit').onclick();
+  assert.equal(state.created.length, 1);
+  const payload = state.created[0];
+  assert.equal(payload.ingress_mode, 'port');
+  assert.equal(payload.dynamic_discovery_enabled, true);
+  assert.deepEqual(payload.dynamic_discovery_sources, ['redirect', 'playback_info']);
+  assert.equal(Object.hasOwn(payload, 'dynamic_playback_info_enabled'), false);
+  assert.equal(payload.ping_cache_enabled, true);
+  assert.equal(payload.image_cache_enabled, false);
+  assert.equal(payload.progress_coalescing_enabled, true);
+  assert.deepEqual(state.errors, []);
+});
+
+test('create profile switch submits the exact PlaybackInfo-off Compatible sources', async () => {
+  const { sandbox, document, state } = loadModalHarness();
+  await sandbox.showSiteModal(null);
+  const playbackInfo = document.getElementById('m-dynamic-playback-info');
+  const profile = document.getElementById('m-dynamic-profile');
+  playbackInfo.checked = false;
+  playbackInfo.onchange();
+  profile.value = 'compatible';
+  profile.onchange();
+  assert.equal(playbackInfo.checked, false);
+  document.getElementById('m-name').value = 'Media';
+  document.getElementById('m-target').value = 'https://origin.example';
+  document.getElementById('m-port').value = '8096';
+  document.getElementById('m-playback-mode').value = 'direct';
+  state.confirmationResult = true;
+  await document.getElementById('m-submit').onclick();
+  assert.equal(state.created.length, 1);
+  assert.deepEqual(state.created[0].dynamic_discovery_sources, ['redirect', 'hls', 'dash']);
+  assert.equal(Object.hasOwn(state.created[0], 'dynamic_playback_info_enabled'), false);
+  assert.match(state.confirmations.at(-1), /Compatible/);
+  assert.deepEqual(state.errors, []);
+});
+
+test('edit submission toggles PlaybackInfo on and restores the selected profile full sources', async () => {
+  const { sandbox, document, state } = loadModalHarness();
+  await sandbox.showSiteModal(existingSite({
+    dynamic_profile: 'compatible',
+    dynamic_discovery_sources: ['redirect', 'hls', 'dash'],
+  }));
+  const playbackInfo = document.getElementById('m-dynamic-playback-info');
+  assert.equal(playbackInfo.checked, false);
+  playbackInfo.checked = true;
+  playbackInfo.onchange();
+  document.getElementById('m-playback-mode').value = 'direct';
+  await document.getElementById('m-submit').onclick();
+  assert.equal(state.updated.length, 1);
+  assert.equal(state.updated[0].siteId, 17);
+  assert.deepEqual(state.updated[0].data.dynamic_discovery_sources, ['redirect', 'playback_info', 'hls', 'dash']);
+  assert.equal(Object.hasOwn(state.updated[0].data, 'dynamic_playback_info_enabled'), false);
+  assert.deepEqual(state.errors, []);
+});
+
+test('request limit toggle reveals fields and unchecked submission sends zeroes', async () => {
+  const { sandbox, document, state } = loadModalHarness();
+  await sandbox.showSiteModal(null);
+  const toggle = document.getElementById('m-request-limits-enabled');
+  const fields = document.getElementById('m-request-limit-fields');
+  const quota = document.getElementById('m-quota');
+  const speed = document.getElementById('m-speed');
+  assert.equal(toggle.checked, false);
+  assert.equal(fields.hidden, true);
+  assert.equal(quota.disabled, true);
+  assert.equal(speed.disabled, true);
+
+  toggle.checked = true;
+  toggle.onchange();
+  assert.equal(fields.hidden, false);
+  assert.equal(quota.disabled, false);
+  assert.equal(speed.disabled, false);
+  quota.value = '2';
+  speed.value = '25';
+
+  toggle.checked = false;
+  toggle.onchange();
+  assert.equal(fields.hidden, true);
+  document.getElementById('m-name').value = 'Media';
+  document.getElementById('m-target').value = 'https://origin.example';
+  document.getElementById('m-port').value = '8096';
+  document.getElementById('m-playback-mode').value = 'direct';
+  await document.getElementById('m-submit').onclick();
+  assert.equal(state.created.length, 1);
+  assert.equal(state.created[0].traffic_quota, 0);
+  assert.equal(state.created[0].speed_limit, 0);
+  assert.equal(Object.hasOwn(state.created[0], 'request_limits_enabled'), false);
+  assert.deepEqual(state.errors, []);
+});
+
+test('enabled request limits require one positive value and submit existing fields only', async () => {
+  const { sandbox, document, state } = loadModalHarness();
+  await sandbox.showSiteModal(null);
+  document.getElementById('m-name').value = 'Media';
+  document.getElementById('m-target').value = 'https://origin.example';
+  document.getElementById('m-port').value = '8096';
+  document.getElementById('m-playback-mode').value = 'direct';
+  const toggle = document.getElementById('m-request-limits-enabled');
+  toggle.checked = true;
+  toggle.onchange();
+  document.getElementById('m-quota').value = '0';
+  document.getElementById('m-speed').value = '0';
+  await document.getElementById('m-submit').onclick();
+  assert.equal(state.created.length, 0);
+  assert.match(state.errors.at(-1), /至少一项必须大于 0/);
+
+  document.getElementById('m-quota').value = '2';
+  document.getElementById('m-speed').value = '25';
+  await document.getElementById('m-submit').onclick();
+  assert.equal(state.created.length, 1);
+  assert.equal(state.created[0].traffic_quota, 2 * 1073741824);
+  assert.equal(state.created[0].speed_limit, 25);
+  assert.equal(Object.hasOwn(state.created[0], 'request_limits_enabled'), false);
+});
+
+test('create keeps discovery disabled when the structured catalog is unavailable', async () => {
+  const { sandbox, document, state } = loadModalHarness({ dynamicResponse: {} });
+  await sandbox.showSiteModal(null);
+  document.getElementById('m-name').value = 'Fallback';
+  document.getElementById('m-target').value = 'https://origin.example';
+  document.getElementById('m-port').value = '8096';
+  document.getElementById('m-playback-mode').value = 'direct';
+  await document.getElementById('m-submit').onclick();
+  assert.equal(state.created.length, 1);
+  assert.equal(state.created[0].dynamic_discovery_enabled, false);
+  assert.equal(Object.hasOwn(state.created[0], 'dynamic_profile'), false);
+  assert.equal(Object.hasOwn(state.created[0], 'dynamic_discovery_sources'), false);
+  assert.deepEqual(state.errors, []);
 });
 
 test('observation normalization accepts only finite enums and privacy-safe aggregate fields', () => {
@@ -660,10 +819,9 @@ test('dynamic rendering escapes values and never renders sensitive observation d
     ],
   });
   const options = sandbox.renderDynamicProfileOptions(capabilities, 'safe');
-  const summaries = sandbox.renderDynamicProfileSummaries(capabilities);
   const ruleRows = sandbox.renderDynamicRuleRows([{ type: 'exact', value: ATTACK }]);
 
-  for (const html of [options, summaries, ruleRows]) {
+  for (const html of [options, ruleRows]) {
     assert.ok(!html.includes(ATTACK));
     assert.match(html, /&quot;&gt;&lt;img src=x onerror=alert\(1\)&gt;/);
   }

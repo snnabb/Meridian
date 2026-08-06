@@ -89,6 +89,8 @@ func TestDynamicFoundationMigrationDefaultsAndIdempotence(t *testing.T) {
 	if site.DynamicPolicyRevision != 1 {
 		t.Fatalf("client revision was persisted: %d", site.DynamicPolicyRevision)
 	}
+	site.DynamicProfile = dynamicProfileCompatible
+	site.DynamicDiscoverySources = allDynamicDiscoverySources()
 	site.DynamicAllowHTTPSDowngrade = true
 	site.DynamicPolicyRevision = 500
 	if err := db.UpdateSiteRecord(*site); err != nil {
@@ -98,7 +100,7 @@ func TestDynamicFoundationMigrationDefaultsAndIdempotence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !site.DynamicAllowHTTPSDowngrade || site.DynamicPolicyRevision != 2 {
+	if site.DynamicProfile != dynamicProfileCompatible || !site.DynamicAllowHTTPSDowngrade || !dynamicDiscoverySourcesEqual(site.DynamicDiscoverySources, allDynamicDiscoverySources()) || site.DynamicPolicyRevision != 2 {
 		t.Fatalf("dynamic policy revision = %#v", site)
 	}
 }
@@ -121,7 +123,7 @@ func TestStoredDynamicPolicyCorruptionFailsStartupAndReopen(t *testing.T) {
 		{name: "null rules", column: "dynamic_domain_rules", value: "null"},
 		{name: "non-array rules", column: "dynamic_domain_rules", value: `{}`},
 		{name: "noncanonical rules", column: "dynamic_domain_rules", value: `[{"type":"EXACT","value":"CDN.Example.COM."}]`},
-		{name: "enabled discovery", column: "dynamic_discovery_enabled", value: 1},
+		{name: "safe HTTPS downgrade", column: "dynamic_allow_https_downgrade", value: 1},
 		{name: "invalid discovery boolean", column: "dynamic_discovery_enabled", value: 2},
 		{name: "invalid downgrade boolean", column: "dynamic_allow_https_downgrade", value: -1},
 		{name: "revision below one", column: "dynamic_policy_revision", value: 0},
@@ -185,16 +187,23 @@ func dynamicSiteUpdatePayload(t *testing.T, site *Site, overrides map[string]int
 func TestDynamicSiteAPIStrictRoundTripAndRevision(t *testing.T) {
 	app := newTestApp(t)
 	for name, dynamicFields := range map[string]map[string]interface{}{
-		"server revision":      {"dynamic_policy_revision": 1},
-		"enabled discovery":    {"dynamic_discovery_enabled": true},
-		"safe public exact IP": {"dynamic_domain_rules": []map[string]string{{"type": "exact", "value": "8.8.8.8"}}},
+		"server revision":          {"dynamic_policy_revision": 1},
+		"enabled without key":      {"dynamic_discovery_enabled": true},
+		"safe public exact IP":     {"dynamic_domain_rules": []map[string]string{{"type": "exact", "value": "8.8.8.8"}}},
+		"null rules":               {"dynamic_domain_rules": nil},
+		"compatible redirect only": {"dynamic_profile": "compatible", "dynamic_discovery_sources": []string{"redirect"}},
+		"missing redirect":         {"dynamic_profile": "compatible", "dynamic_discovery_sources": []string{"playback_info", "hls", "dash"}},
+		"partial HLS DASH pair":    {"dynamic_profile": "compatible", "dynamic_discovery_sources": []string{"redirect", "playback_info", "hls"}},
+		"sources outside profile":  {"dynamic_profile": "safe", "dynamic_discovery_sources": []string{"redirect", "hls", "dash"}},
 	} {
 		t.Run("reject POST "+name, func(t *testing.T) {
 			payload := map[string]interface{}{
-				"name":        "rejected-" + name,
-				"listen_port": freePort(t),
-				"target_url":  "http://127.0.0.1:8096",
-				"ua_mode":     "infuse",
+				"name":         "rejected-" + name,
+				"listen_port":  freePort(t),
+				"public_host":  strings.ReplaceAll(name, " ", "-") + ".example.com",
+				"ingress_mode": ingressModeHost,
+				"target_url":   "http://127.0.0.1:8096",
+				"ua_mode":      "infuse",
 			}
 			for key, value := range dynamicFields {
 				payload[key] = value
@@ -213,6 +222,7 @@ func TestDynamicSiteAPIStrictRoundTripAndRevision(t *testing.T) {
 	if sites, err := app.db.ListSites(); err != nil || len(sites) != 0 {
 		t.Fatalf("rejected POST persisted sites=%#v err=%v", sites, err)
 	}
+
 	createPayload, err := json.Marshal(map[string]interface{}{
 		"name":                          "dynamic-policy",
 		"listen_port":                   freePort(t),
@@ -244,7 +254,7 @@ func TestDynamicSiteAPIStrictRoundTripAndRevision(t *testing.T) {
 	if len(site.DynamicDomainRules) != 2 || site.DynamicDomainRules[0] != (DynamicDomainRule{Type: "exact", Value: "cdn.example.com"}) || site.DynamicDomainRules[1] != (DynamicDomainRule{Type: "suffix", Value: "xn--bcher-kva.de"}) {
 		t.Fatalf("created normalized rules = %#v", site.DynamicDomainRules)
 	}
-	if got := strings.Join(site.DynamicDiscoverySources, ","); got != strings.Join(allDynamicDiscoverySources(), ",") {
+	if !dynamicDiscoverySourcesEqual(site.DynamicDiscoverySources, allDynamicDiscoverySources()) {
 		t.Fatalf("created discovery sources = %#v, want %#v", site.DynamicDiscoverySources, allDynamicDiscoverySources())
 	}
 
@@ -268,9 +278,9 @@ func TestDynamicSiteAPIStrictRoundTripAndRevision(t *testing.T) {
 	if site.DynamicPolicyRevision != 1 {
 		t.Fatalf("manual update revision=%d, want 1", site.DynamicPolicyRevision)
 	}
-	update(map[string]interface{}{"dynamic_profile": "SAFE", "dynamic_discovery_sources": []string{"redirect", "playback_info"}}, http.StatusOK)
-	if site.DynamicProfile != dynamicProfileSafe || site.DynamicPolicyRevision != 2 {
-		t.Fatalf("profile update = %q revision=%d", site.DynamicProfile, site.DynamicPolicyRevision)
+	update(map[string]interface{}{"dynamic_profile": "SAFE", "dynamic_discovery_sources": []string{"redirect"}}, http.StatusOK)
+	if site.DynamicProfile != dynamicProfileSafe || !dynamicDiscoverySourcesEqual(site.DynamicDiscoverySources, []string{dynamicDiscoverySourceRedirect}) || site.DynamicAllowHTTPSDowngrade || site.DynamicPolicyRevision != 2 {
+		t.Fatalf("safe profile PlaybackInfo-off adoption = %#v", site)
 	}
 	update(map[string]interface{}{
 		"dynamic_domain_rules": []map[string]string{{"type": "SUFFIX", "value": "bücher.de"}, {"type": "exact", "value": "cdn.example.com"}},
@@ -278,6 +288,7 @@ func TestDynamicSiteAPIStrictRoundTripAndRevision(t *testing.T) {
 	if site.DynamicPolicyRevision != 2 {
 		t.Fatalf("normalized no-op rule update revision=%d, want 2", site.DynamicPolicyRevision)
 	}
+	update(map[string]interface{}{"dynamic_allow_https_downgrade": true}, http.StatusBadRequest)
 
 	update(map[string]interface{}{"dynamic_discovery_enabled": true}, http.StatusBadRequest)
 	reloaded, err := app.db.GetSite(site.ID)
@@ -307,9 +318,22 @@ func TestDynamicSiteAPIStrictRoundTripAndRevision(t *testing.T) {
 	}
 
 	update(map[string]interface{}{"dynamic_discovery_sources": []string{"DASH", "hls"}}, http.StatusBadRequest)
-	update(map[string]interface{}{"dynamic_profile": "compatible", "dynamic_discovery_sources": []string{"DASH", "hls"}}, http.StatusOK)
-	if got := strings.Join(site.DynamicDiscoverySources, ","); got != "hls,dash" || site.DynamicPolicyRevision != 3 {
-		t.Fatalf("sources update = %#v revision=%d, want [hls dash] revision=3", site.DynamicDiscoverySources, site.DynamicPolicyRevision)
+	update(map[string]interface{}{"dynamic_profile": "compatible"}, http.StatusOK)
+	if !dynamicDiscoverySourcesEqual(site.DynamicDiscoverySources, allDynamicDiscoverySources()) || site.DynamicPolicyRevision != 3 {
+		t.Fatalf("compatible profile adoption = %#v", site)
+	}
+	update(map[string]interface{}{"dynamic_discovery_sources": []string{"DASH", "hls", "PLAYBACK_INFO", "redirect"}}, http.StatusOK)
+	if site.DynamicPolicyRevision != 3 {
+		t.Fatalf("canonical source no-op revision=%d, want 3", site.DynamicPolicyRevision)
+	}
+	update(map[string]interface{}{"dynamic_discovery_sources": []string{"DASH", "redirect", "HLS"}}, http.StatusOK)
+	wantCompatibleOff := []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourceHLS, dynamicDiscoverySourceDASH}
+	if !dynamicDiscoverySourcesEqual(site.DynamicDiscoverySources, wantCompatibleOff) || site.DynamicPolicyRevision != 4 {
+		t.Fatalf("compatible PlaybackInfo-off update = %#v", site)
+	}
+	update(map[string]interface{}{"dynamic_discovery_sources": wantCompatibleOff}, http.StatusOK)
+	if site.DynamicPolicyRevision != 4 {
+		t.Fatalf("PlaybackInfo-off no-op revision=%d, want 4", site.DynamicPolicyRevision)
 	}
 	update(map[string]interface{}{"dynamic_discovery_sources": []string{"redirect", "REDIRECT"}}, http.StatusBadRequest)
 	update(map[string]interface{}{"dynamic_discovery_sources": []string{"redirect", "unknown"}}, http.StatusBadRequest)
@@ -318,8 +342,367 @@ func TestDynamicSiteAPIStrictRoundTripAndRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(afterRejectedSources.DynamicDiscoverySources, ","); got != "hls,dash" || afterRejectedSources.DynamicPolicyRevision != 3 {
+	if !dynamicDiscoverySourcesEqual(afterRejectedSources.DynamicDiscoverySources, wantCompatibleOff) || afterRejectedSources.DynamicPolicyRevision != 4 {
 		t.Fatalf("rejected sources PUT changed stored policy: %#v", afterRejectedSources)
+	}
+}
+
+func TestDynamicSiteAPIPresenceAndDomainRuleSemantics(t *testing.T) {
+	basePayload := func(name string) map[string]interface{} {
+		return map[string]interface{}{
+			"name":         name,
+			"listen_port":  freePort(t),
+			"public_host":  name + ".example.com",
+			"ingress_mode": ingressModeHost,
+			"target_url":   "http://127.0.0.1:8096",
+			"ua_mode":      "infuse",
+		}
+	}
+	post := func(app *App, payload map[string]interface{}, wantStatus int) *Site {
+		t.Helper()
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rr := httptest.NewRecorder()
+		app.handleSites(rr, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(raw)))
+		if rr.Code != wantStatus {
+			t.Fatalf("POST status=%d body=%s, want %d", rr.Code, rr.Body.String(), wantStatus)
+		}
+		if wantStatus != http.StatusCreated {
+			return nil
+		}
+		var site Site
+		if err := json.Unmarshal(rr.Body.Bytes(), &site); err != nil {
+			t.Fatalf("decode created site: %v", err)
+		}
+		t.Cleanup(func() { _ = app.pm.StopSite(site.ID) })
+		return &site
+	}
+
+	withoutKey := newTestApp(t)
+	omittedWithoutKey := post(withoutKey, basePayload("omitted-without-key"), http.StatusCreated)
+	if omittedWithoutKey.DynamicDiscoveryEnabled {
+		t.Fatalf("omitted discovery without key enabled policy: %#v", omittedWithoutKey)
+	}
+	explicitFalsePayload := basePayload("false-without-key")
+	explicitFalsePayload["dynamic_discovery_enabled"] = false
+	if site := post(withoutKey, explicitFalsePayload, http.StatusCreated); site.DynamicDiscoveryEnabled {
+		t.Fatalf("explicit false without key enabled policy: %#v", site)
+	}
+	explicitTruePayload := basePayload("true-without-key")
+	explicitTruePayload["dynamic_discovery_enabled"] = true
+	post(withoutKey, explicitTruePayload, http.StatusBadRequest)
+
+	withKey := newTestApp(t)
+	withKey.dynamicRouteKey = bytes.Repeat([]byte{0x5a}, 32)
+	defaulted := post(withKey, basePayload("omitted-with-key"), http.StatusCreated)
+	if !defaulted.DynamicDiscoveryEnabled || defaulted.DynamicProfile != dynamicProfileSafe || len(defaulted.DynamicDomainRules) != 0 || !dynamicDiscoverySourcesEqual(defaulted.DynamicDiscoverySources, []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourcePlaybackInfo}) || defaulted.DynamicAllowHTTPSDowngrade {
+		t.Fatalf("key-backed POST defaults = %#v", defaulted)
+	}
+	explicitFalseWithKey := basePayload("false-with-key")
+	explicitFalseWithKey["dynamic_discovery_enabled"] = false
+	if site := post(withKey, explicitFalseWithKey, http.StatusCreated); site.DynamicDiscoveryEnabled {
+		t.Fatalf("explicit false with key enabled policy: %#v", site)
+	}
+	nullEnabled := basePayload("null-enabled")
+	nullEnabled["dynamic_discovery_enabled"] = nil
+	post(withKey, nullEnabled, http.StatusBadRequest)
+	nullRules := basePayload("null-rules")
+	nullRules["dynamic_domain_rules"] = nil
+	post(withKey, nullRules, http.StatusBadRequest)
+	emptyRules := basePayload("empty-rules")
+	emptyRules["dynamic_domain_rules"] = []DynamicDomainRule{}
+	emptySite := post(withKey, emptyRules, http.StatusCreated)
+	if len(emptySite.DynamicDomainRules) != 0 {
+		t.Fatalf("explicit empty POST rules = %#v", emptySite)
+	}
+	storedEmptySite, err := withKey.db.GetSite(emptySite.ID)
+	if err != nil || storedEmptySite.StoredDynamicDomainRules != "[]" {
+		t.Fatalf("stored explicit empty POST rules: site=%#v err=%v", storedEmptySite, err)
+	}
+
+	update := func(overrides map[string]interface{}, wantStatus int) {
+		t.Helper()
+		raw := dynamicSiteUpdatePayload(t, defaulted, overrides)
+		rr := httptest.NewRecorder()
+		withKey.handleSiteByID(rr, httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/sites/%d", defaulted.ID), bytes.NewReader(raw)))
+		if rr.Code != wantStatus {
+			t.Fatalf("PUT status=%d body=%s, want %d", rr.Code, rr.Body.String(), wantStatus)
+		}
+		if wantStatus == http.StatusOK {
+			if err := json.Unmarshal(rr.Body.Bytes(), defaulted); err != nil {
+				t.Fatalf("decode updated site: %v", err)
+			}
+		}
+	}
+	exactRule := DynamicDomainRule{Type: "exact", Value: "cdn.example.com"}
+	update(map[string]interface{}{"dynamic_domain_rules": []DynamicDomainRule{exactRule}}, http.StatusOK)
+	if len(defaulted.DynamicDomainRules) != 1 || defaulted.DynamicDomainRules[0] != exactRule || defaulted.DynamicPolicyRevision != 2 {
+		t.Fatalf("explicit PUT rules = %#v", defaulted)
+	}
+	update(map[string]interface{}{"name": "omitted-rules-preserved"}, http.StatusOK)
+	if !defaulted.DynamicDiscoveryEnabled || len(defaulted.DynamicDomainRules) != 1 || defaulted.DynamicDomainRules[0] != exactRule || defaulted.DynamicPolicyRevision != 2 {
+		t.Fatalf("omitted PUT rules/discovery changed policy = %#v", defaulted)
+	}
+	update(map[string]interface{}{"dynamic_discovery_enabled": nil}, http.StatusBadRequest)
+	if reloaded, err := withKey.db.GetSite(defaulted.ID); err != nil || !reloaded.DynamicDiscoveryEnabled || reloaded.DynamicPolicyRevision != 2 {
+		t.Fatalf("null PUT discovery switch changed policy: site=%#v err=%v", reloaded, err)
+	}
+	update(map[string]interface{}{"dynamic_domain_rules": nil}, http.StatusBadRequest)
+	if reloaded, err := withKey.db.GetSite(defaulted.ID); err != nil || len(reloaded.DynamicDomainRules) != 1 || reloaded.DynamicPolicyRevision != 2 {
+		t.Fatalf("null PUT rules changed policy: site=%#v err=%v", reloaded, err)
+	}
+	update(map[string]interface{}{"dynamic_domain_rules": []DynamicDomainRule{}}, http.StatusOK)
+	if len(defaulted.DynamicDomainRules) != 0 || defaulted.DynamicPolicyRevision != 3 {
+		t.Fatalf("explicit empty PUT rules = %#v", defaulted)
+	}
+	storedDefaulted, err := withKey.db.GetSite(defaulted.ID)
+	if err != nil || storedDefaulted.StoredDynamicDomainRules != "[]" {
+		t.Fatalf("stored explicit empty PUT rules: site=%#v err=%v", storedDefaulted, err)
+	}
+}
+
+func TestDynamicSiteAPIAcceptsOnlySelectablePlaybackInfoSets(t *testing.T) {
+	app := newTestApp(t)
+
+	post := func(name, profile string, sources []string, wantStatus int) *Site {
+		t.Helper()
+		payload, err := json.Marshal(map[string]interface{}{
+			"name":                      name,
+			"listen_port":               freePort(t),
+			"public_host":               name + ".example.com",
+			"ingress_mode":              ingressModeHost,
+			"target_url":                "http://127.0.0.1:8096",
+			"ua_mode":                   "infuse",
+			"dynamic_discovery_enabled": false,
+			"dynamic_profile":           profile,
+			"dynamic_discovery_sources": sources,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rr := httptest.NewRecorder()
+		app.handleSites(rr, httptest.NewRequest(http.MethodPost, "/api/sites", bytes.NewReader(payload)))
+		if rr.Code != wantStatus {
+			t.Fatalf("POST %s status=%d body=%s, want %d", name, rr.Code, rr.Body.String(), wantStatus)
+		}
+		if wantStatus != http.StatusCreated {
+			return nil
+		}
+		var site Site
+		if err := json.Unmarshal(rr.Body.Bytes(), &site); err != nil {
+			t.Fatalf("decode %s: %v", name, err)
+		}
+		t.Cleanup(func() { _ = app.pm.StopSite(site.ID) })
+		return &site
+	}
+
+	accepted := []struct {
+		name    string
+		profile string
+		input   []string
+		want    []string
+	}{
+		{name: "safe-on", profile: " SAFE ", input: []string{"PLAYBACK_INFO", "redirect"}, want: []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourcePlaybackInfo}},
+		{name: "safe-off", profile: dynamicProfileSafe, input: []string{"REDIRECT"}, want: []string{dynamicDiscoverySourceRedirect}},
+		{name: "compatible-on", profile: "COMPATIBLE", input: []string{"dash", "HLS", "playback_info", "REDIRECT"}, want: allDynamicDiscoverySources()},
+		{name: "compatible-off", profile: dynamicProfileCompatible, input: []string{"DASH", "redirect", "hls"}, want: []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourceHLS, dynamicDiscoverySourceDASH}},
+		{name: "extreme-on", profile: dynamicProfileExtreme, input: []string{"DASH", "HLS", "PLAYBACK_INFO", "REDIRECT"}, want: allDynamicDiscoverySources()},
+		{name: "extreme-off", profile: " EXTREME ", input: []string{"hls", "dash", "redirect"}, want: []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourceHLS, dynamicDiscoverySourceDASH}},
+	}
+	for _, tc := range accepted {
+		site := post(tc.name, tc.profile, tc.input, http.StatusCreated)
+		wantProfile, err := normalizeDynamicProfile(tc.profile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if site.DynamicProfile != wantProfile || !dynamicDiscoverySourcesEqual(site.DynamicDiscoverySources, tc.want) || site.DynamicPolicyRevision != 1 {
+			t.Fatalf("created %s policy = %#v, want profile=%s sources=%#v revision=1", tc.name, site, wantProfile, tc.want)
+		}
+		stored, err := app.db.GetSite(site.ID)
+		if err != nil {
+			t.Fatalf("reload %s: %v", tc.name, err)
+		}
+		wantStored, err := json.Marshal(tc.want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.StoredDynamicDiscoverySources != string(wantStored) {
+			t.Fatalf("stored %s sources=%s, want %s", tc.name, stored.StoredDynamicDiscoverySources, wantStored)
+		}
+	}
+
+	for _, tc := range []struct {
+		name    string
+		profile string
+		sources []string
+	}{
+		{name: "missing-redirect", profile: dynamicProfileCompatible, sources: []string{dynamicDiscoverySourcePlaybackInfo, dynamicDiscoverySourceHLS, dynamicDiscoverySourceDASH}},
+		{name: "partial-hls-dash", profile: dynamicProfileCompatible, sources: []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourcePlaybackInfo, dynamicDiscoverySourceHLS}},
+		{name: "profile-invalid", profile: dynamicProfileSafe, sources: []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourceHLS, dynamicDiscoverySourceDASH}},
+		{name: "playback-only", profile: dynamicProfileSafe, sources: []string{dynamicDiscoverySourcePlaybackInfo}},
+		{name: "empty", profile: dynamicProfileExtreme, sources: []string{}},
+	} {
+		post("rejected-"+tc.name, tc.profile, tc.sources, http.StatusBadRequest)
+	}
+	sites, err := app.db.ListSites()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sites) != len(accepted) {
+		t.Fatalf("rejected source sets persisted sites: got %d, want %d", len(sites), len(accepted))
+	}
+}
+
+func TestDynamicSiteAPISelectableSourcesAndLegacySubsetTransitions(t *testing.T) {
+	app := newTestApp(t)
+	app.dynamicRouteKey = bytes.Repeat([]byte{0x6b}, 32)
+	create := func(name, profile string, discoveryEnabled bool, sources []string) *Site {
+		t.Helper()
+		site, err := app.db.CreateSiteRecord(Site{
+			Name:                       name,
+			ListenPort:                 freePort(t),
+			PublicHost:                 name + ".example.com",
+			IngressMode:                ingressModeHost,
+			TargetURL:                  "http://127.0.0.1:8096",
+			PlaybackMode:               "direct",
+			StreamHosts:                "[]",
+			UAMode:                     "infuse",
+			DynamicDiscoveryEnabled:    discoveryEnabled,
+			DynamicProfile:             profile,
+			DynamicDiscoverySources:    sources,
+			DynamicDomainRules:         []DynamicDomainRule{},
+			DynamicAllowHTTPSDowngrade: false,
+		})
+		if err != nil {
+			t.Fatalf("create transition policy %s: %v", name, err)
+		}
+		t.Cleanup(func() { _ = app.pm.StopSite(site.ID) })
+		return site
+	}
+	update := func(site *Site, overrides map[string]interface{}, wantStatus int) {
+		t.Helper()
+		raw := dynamicSiteUpdatePayload(t, site, overrides)
+		rr := httptest.NewRecorder()
+		app.handleSiteByID(rr, httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/sites/%d", site.ID), bytes.NewReader(raw)))
+		if rr.Code != wantStatus {
+			t.Fatalf("PUT %s status=%d body=%s, want %d", site.Name, rr.Code, rr.Body.String(), wantStatus)
+		}
+		if wantStatus == http.StatusOK {
+			if err := json.Unmarshal(rr.Body.Bytes(), site); err != nil {
+				t.Fatalf("decode updated site: %v", err)
+			}
+		}
+	}
+
+	legacySources := []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourceHLS}
+	legacy := create("legacy-compatible-subset", dynamicProfileCompatible, true, legacySources)
+	update(legacy, map[string]interface{}{"name": "legacy-compatible-renamed"}, http.StatusOK)
+	if !dynamicDiscoverySourcesEqual(legacy.DynamicDiscoverySources, legacySources) || legacy.DynamicPolicyRevision != 1 {
+		t.Fatalf("unrelated update replaced legacy subset: %#v", legacy)
+	}
+	update(legacy, map[string]interface{}{"dynamic_discovery_sources": []string{"HLS", "REDIRECT"}}, http.StatusOK)
+	if !dynamicDiscoverySourcesEqual(legacy.DynamicDiscoverySources, legacySources) || legacy.DynamicPolicyRevision != 1 {
+		t.Fatalf("unchanged cached legacy subset changed policy: %#v", legacy)
+	}
+	update(legacy, map[string]interface{}{"dynamic_discovery_sources": []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourceDASH}}, http.StatusBadRequest)
+	reloadedLegacy, err := app.db.GetSite(legacy.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !dynamicDiscoverySourcesEqual(reloadedLegacy.DynamicDiscoverySources, legacySources) || reloadedLegacy.DynamicPolicyRevision != 1 {
+		t.Fatalf("rejected arbitrary subset changed legacy policy: %#v", reloadedLegacy)
+	}
+	update(legacy, map[string]interface{}{"dynamic_profile": dynamicProfileSafe}, http.StatusOK)
+	wantSafeFull := []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourcePlaybackInfo}
+	if legacy.DynamicProfile != dynamicProfileSafe || !dynamicDiscoverySourcesEqual(legacy.DynamicDiscoverySources, wantSafeFull) || legacy.DynamicPolicyRevision != 2 {
+		t.Fatalf("profile change without sources did not derive full set: %#v", legacy)
+	}
+
+	wantCompatibleOff := []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourceHLS, dynamicDiscoverySourceDASH}
+	sameProfile := create("same-profile-selectable", dynamicProfileCompatible, true, allDynamicDiscoverySources())
+	update(sameProfile, map[string]interface{}{"dynamic_discovery_sources": []string{"DASH", "redirect", "HLS"}}, http.StatusOK)
+	if !dynamicDiscoverySourcesEqual(sameProfile.DynamicDiscoverySources, wantCompatibleOff) || sameProfile.DynamicPolicyRevision != 2 {
+		t.Fatalf("explicit PlaybackInfo-off update = %#v", sameProfile)
+	}
+	update(sameProfile, map[string]interface{}{"dynamic_discovery_sources": wantCompatibleOff}, http.StatusOK)
+	if sameProfile.DynamicPolicyRevision != 2 {
+		t.Fatalf("repeated PlaybackInfo-off update revision=%d, want 2", sameProfile.DynamicPolicyRevision)
+	}
+
+	profileExplicit := create("profile-explicit-off", dynamicProfileSafe, true, wantSafeFull)
+	update(profileExplicit, map[string]interface{}{
+		"dynamic_profile":           dynamicProfileExtreme,
+		"dynamic_discovery_sources": []string{"dash", "hls", "redirect"},
+	}, http.StatusOK)
+	if profileExplicit.DynamicProfile != dynamicProfileExtreme || !dynamicDiscoverySourcesEqual(profileExplicit.DynamicDiscoverySources, wantCompatibleOff) || profileExplicit.DynamicPolicyRevision != 2 {
+		t.Fatalf("profile change did not honor explicit PlaybackInfo-off set: %#v", profileExplicit)
+	}
+
+	enableExplicit := create("enable-explicit-off", dynamicProfileCompatible, false, legacySources)
+	update(enableExplicit, map[string]interface{}{
+		"dynamic_discovery_enabled": true,
+		"dynamic_discovery_sources": []string{"hls", "redirect", "dash"},
+	}, http.StatusOK)
+	if !enableExplicit.DynamicDiscoveryEnabled || !dynamicDiscoverySourcesEqual(enableExplicit.DynamicDiscoverySources, wantCompatibleOff) || enableExplicit.DynamicPolicyRevision != 2 {
+		t.Fatalf("enable did not honor explicit PlaybackInfo-off set: %#v", enableExplicit)
+	}
+
+	enableDefault := create("enable-default-full", dynamicProfileExtreme, false, wantCompatibleOff)
+	update(enableDefault, map[string]interface{}{"dynamic_discovery_enabled": true}, http.StatusOK)
+	if !enableDefault.DynamicDiscoveryEnabled || !dynamicDiscoverySourcesEqual(enableDefault.DynamicDiscoverySources, allDynamicDiscoverySources()) || enableDefault.DynamicPolicyRevision != 2 {
+		t.Fatalf("enable without sources did not derive full set: %#v", enableDefault)
+	}
+}
+
+func TestDynamicRollbackReadinessCountsArePrivacySafe(t *testing.T) {
+	app := newTestApp(t)
+	create := func(name, profile string, discoveryEnabled bool, sources []string, rules []DynamicDomainRule) {
+		t.Helper()
+		if _, err := app.db.CreateSiteRecord(Site{
+			Name:                    name,
+			ListenPort:              freePort(t),
+			TargetURL:               "http://127.0.0.1:8096",
+			StreamHosts:             "[]",
+			UAMode:                  "infuse",
+			DynamicDiscoveryEnabled: discoveryEnabled,
+			DynamicProfile:          profile,
+			DynamicDiscoverySources: sources,
+			DynamicDomainRules:      rules,
+		}); err != nil {
+			t.Fatalf("create readiness fixture: %v", err)
+		}
+	}
+	create("safe-empty-canonical", dynamicProfileSafe, true, []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourcePlaybackInfo}, []DynamicDomainRule{})
+	create("safe-legacy-rules", dynamicProfileSafe, true, []string{dynamicDiscoverySourceRedirect}, []DynamicDomainRule{{Type: "exact", Value: "cdn.example.com"}})
+	create("compatible-legacy", dynamicProfileCompatible, true, []string{dynamicDiscoverySourceRedirect}, []DynamicDomainRule{})
+	create("disabled-safe-empty", dynamicProfileSafe, false, []string{dynamicDiscoverySourceRedirect}, []DynamicDomainRule{})
+
+	readiness, err := app.db.DynamicRollbackReadiness()
+	if err != nil {
+		t.Fatalf("read rollback readiness: %v", err)
+	}
+	if readiness.EnabledSafeEmptyRules != 1 || readiness.EnabledLegacySourceSubsets != 2 {
+		t.Fatalf("rollback readiness = %#v, want 1/2", readiness)
+	}
+
+	rr := httptest.NewRecorder()
+	app.handleDynamicProfiles(rr, httptest.NewRequest(http.MethodGet, "/api/dynamic-profiles", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("catalog status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var body DynamicProfilesResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode catalog: %v", err)
+	}
+	if body.RollbackReadiness != readiness {
+		t.Fatalf("catalog rollback readiness = %#v, want %#v", body.RollbackReadiness, readiness)
+	}
+	for _, sensitive := range []string{"safe-empty-canonical", "safe-legacy-rules", "compatible-legacy", "127.0.0.1:8096"} {
+		if strings.Contains(rr.Body.String(), sensitive) {
+			t.Fatalf("rollback readiness disclosed %q: %s", sensitive, rr.Body.String())
+		}
 	}
 }
 
@@ -368,6 +751,16 @@ func TestDynamicProfilesEndpointIsAuthenticatedAndDoesNotDiscloseKey(t *testing.
 	if body.GlobalLimits != dynamicGlobalLimits() {
 		t.Fatalf("global limits = %#v, want %#v", body.GlobalLimits, dynamicGlobalLimits())
 	}
+	if body.EmptyRulesSemantics != "public_dns_https_443" {
+		t.Fatalf("empty rule semantics = %q", body.EmptyRulesSemantics)
+	}
+	defaultPolicy := body.DefaultPolicy
+	if !defaultPolicy.DynamicDiscoveryEnabled || defaultPolicy.DynamicProfile != dynamicProfileSafe || !dynamicDiscoverySourcesEqual(defaultPolicy.DynamicDiscoverySources, []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourcePlaybackInfo}) || len(defaultPolicy.DynamicDomainRules) != 0 || defaultPolicy.DynamicAllowHTTPSDowngrade {
+		t.Fatalf("default dynamic policy = %#v", defaultPolicy)
+	}
+	if body.RollbackReadiness != (DynamicRollbackReadiness{}) {
+		t.Fatalf("empty database rollback readiness = %#v", body.RollbackReadiness)
+	}
 
 	expected := map[string]struct {
 		schemes    string
@@ -392,6 +785,10 @@ func TestDynamicProfilesEndpointIsAuthenticatedAndDoesNotDiscloseKey(t *testing.
 		want, ok := expected[profile.ID]
 		if !ok {
 			t.Fatalf("unexpected profile %#v", profile)
+		}
+		canonicalSources, ok := dynamicDiscoverySourcesForProfile(profile.ID)
+		if !ok || !dynamicDiscoverySourcesEqual(profile.DiscoverySources, canonicalSources) {
+			t.Fatalf("profile %s discovery sources = %#v, want %#v", profile.ID, profile.DiscoverySources, canonicalSources)
 		}
 		limits := profile.Limits
 		ports := make([]string, len(limits.AllowedPorts))
@@ -522,6 +919,15 @@ func TestNormalizeDynamicURLAndDomainRules(t *testing.T) {
 	if dynamicDomainRuleMatches("notbücher.de", rules) || dynamicDomainRuleMatches("cdn.example.com.evil.net", rules) {
 		t.Fatalf("dynamic rules crossed a DNS label boundary: %#v", rules)
 	}
+	if !dynamicSafeDomainAllowed("cdn.example.net", nil) || !dynamicSafeDomainAllowed("video.bücher.de", []DynamicDomainRule{}) {
+		t.Fatal("empty Safe rules did not allow recognized public DNS hostnames")
+	}
+	if dynamicSafeDomainAllowed("8.8.8.8", nil) || dynamicSafeDomainAllowed("localhost", nil) {
+		t.Fatal("empty Safe rules allowed an IP literal or unrecognized DNS name")
+	}
+	if !dynamicSafeDomainAllowed("cdn.example.com", rules) || !dynamicSafeDomainAllowed("video.bücher.de", rules) || dynamicSafeDomainAllowed("other.example.net", rules) {
+		t.Fatalf("present Safe exact/suffix rules did not narrow by union: %#v", rules)
+	}
 
 	invalidRules := [][]DynamicDomainRule{
 		{{Type: "wildcard", Value: "example.com"}},
@@ -542,24 +948,68 @@ func TestNormalizeDynamicURLAndDomainRules(t *testing.T) {
 func TestDynamicDiscoverySourcesFollowProfileContract(t *testing.T) {
 	for _, tc := range []struct {
 		profile string
-		want    string
+		full    []string
+		off     []string
 	}{
-		{profile: dynamicProfileSafe, want: "redirect,playback_info"},
-		{profile: dynamicProfileCompatible, want: "redirect,playback_info,hls,dash"},
-		{profile: dynamicProfileExtreme, want: "redirect,playback_info,hls,dash"},
+		{profile: dynamicProfileSafe, full: []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourcePlaybackInfo}, off: []string{dynamicDiscoverySourceRedirect}},
+		{profile: dynamicProfileCompatible, full: allDynamicDiscoverySources(), off: []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourceHLS, dynamicDiscoverySourceDASH}},
+		{profile: dynamicProfileExtreme, full: allDynamicDiscoverySources(), off: []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourceHLS, dynamicDiscoverySourceDASH}},
 	} {
 		site := Site{DynamicProfile: tc.profile}
 		if err := normalizeDynamicSitePolicy(&site); err != nil {
 			t.Fatalf("normalize %s defaults: %v", tc.profile, err)
 		}
-		if got := strings.Join(site.DynamicDiscoverySources, ","); got != tc.want {
-			t.Fatalf("%s default sources=%q, want %q", tc.profile, got, tc.want)
+		if !dynamicDiscoverySourcesEqual(site.DynamicDiscoverySources, tc.full) {
+			t.Fatalf("%s default sources=%#v, want %#v", tc.profile, site.DynamicDiscoverySources, tc.full)
+		}
+
+		selectable, ok := dynamicSelectableDiscoverySourceSetsForProfile(tc.profile)
+		if !ok || len(selectable) != 2 || !dynamicDiscoverySourcesEqual(selectable[0], tc.full) || !dynamicDiscoverySourcesEqual(selectable[1], tc.off) {
+			t.Fatalf("%s selectable source sets=%#v, want full=%#v off=%#v", tc.profile, selectable, tc.full, tc.off)
+		}
+		for _, allowed := range selectable {
+			if len(allowed) == 0 || allowed[0] != dynamicDiscoverySourceRedirect {
+				t.Fatalf("%s selectable set does not require redirect: %#v", tc.profile, allowed)
+			}
+		}
+
+		accepted := 0
+		all := allDynamicDiscoverySources()
+		for mask := range 1 << len(all) {
+			sources := make([]string, 0, len(all))
+			for index, source := range all {
+				if mask&(1<<index) != 0 {
+					sources = append(sources, source)
+				}
+			}
+			wantAccepted := dynamicDiscoverySourcesEqual(sources, tc.full) || dynamicDiscoverySourcesEqual(sources, tc.off)
+			err := validateSelectableDynamicDiscoverySources(tc.profile, sources)
+			if (err == nil) != wantAccepted {
+				t.Fatalf("%s sources %#v selectable=%t err=%v", tc.profile, sources, wantAccepted, err)
+			}
+			if err == nil {
+				accepted++
+			}
+		}
+		if accepted != 2 {
+			t.Fatalf("%s accepted %d source sets, want exactly 2", tc.profile, accepted)
 		}
 	}
 
+	if _, ok := dynamicSelectableDiscoverySourceSetsForProfile("unknown"); ok {
+		t.Fatal("unknown profile exposed selectable source sets")
+	}
 	safeWithManifest := Site{DynamicProfile: dynamicProfileSafe, DynamicDiscoverySources: []string{dynamicDiscoverySourceHLS}}
 	if err := normalizeDynamicSitePolicy(&safeWithManifest); err == nil {
 		t.Fatal("Safe profile accepted an HLS source")
+	}
+	legacyCompatible := Site{
+		DynamicDiscoveryEnabled: true,
+		DynamicProfile:          dynamicProfileCompatible,
+		DynamicDiscoverySources: []string{dynamicDiscoverySourceRedirect, dynamicDiscoverySourceHLS},
+	}
+	if err := normalizeDynamicSitePolicy(&legacyCompatible); err != nil {
+		t.Fatalf("stored/runtime legacy subset lost backward compatibility: %v", err)
 	}
 }
 

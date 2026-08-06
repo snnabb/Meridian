@@ -1049,7 +1049,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if !strings.Contains(string(sitesJS), "openModal({ closeOnBackdrop: false })") {
 		t.Error("site add/edit form must not close when its backdrop is clicked")
 	}
-	for _, snippet := range []string{`id="m-speed"`, "speed_limit: parseInt(document.getElementById('m-speed').value || 0)"} {
+	for _, snippet := range []string{`id="m-speed"`, "...buildRequestLimitPayload("} {
 		if !strings.Contains(string(sitesJS), snippet) {
 			t.Errorf("site form must expose and submit speed limit; missing %q", snippet)
 		}
@@ -1064,7 +1064,7 @@ func TestMobileModalKeepsBodyScrollableAndActionsVisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read embedded index HTML: %v", err)
 	}
-	for _, asset := range []string{"/css/style.css?v=1.8.0", "/js/pages/sites.js?v=1.8.0", "/js/app.js?v=1.8.0"} {
+	for _, asset := range []string{"/css/style.css?v=1.9.0", "/js/pages/sites.js?v=1.9.0", "/js/app.js?v=1.9.0"} {
 		if !strings.Contains(string(indexHTML), asset) {
 			t.Errorf("index must cache-bust updated asset %q", asset)
 		}
@@ -3032,7 +3032,7 @@ func TestHandleSiteUpdateRollsBackOnStartFailure(t *testing.T) {
 	if reloaded.ListenPort != initialPort {
 		t.Fatalf("listen_port = %d, want %d", reloaded.ListenPort, initialPort)
 	}
-	if reloaded.DynamicDiscoveryEnabled != site.DynamicDiscoveryEnabled || reloaded.DynamicProfile != site.DynamicProfile || reloaded.StoredDynamicDomainRules != site.StoredDynamicDomainRules || reloaded.DynamicAllowHTTPSDowngrade != site.DynamicAllowHTTPSDowngrade || reloaded.DynamicPolicyRevision != site.DynamicPolicyRevision {
+	if reloaded.DynamicDiscoveryEnabled != site.DynamicDiscoveryEnabled || reloaded.DynamicProfile != site.DynamicProfile || reloaded.StoredDynamicDiscoverySources != site.StoredDynamicDiscoverySources || reloaded.StoredDynamicDomainRules != site.StoredDynamicDomainRules || reloaded.DynamicAllowHTTPSDowngrade != site.DynamicAllowHTTPSDowngrade || reloaded.DynamicPolicyRevision != site.DynamicPolicyRevision {
 		t.Fatalf("rolled-back dynamic policy = %#v, want original %#v", reloaded, site)
 	}
 	if !app.pm.IsRunning(site.ID) {
@@ -4252,6 +4252,7 @@ func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 		"ua_mode": true, "custom_user_agent": true, "custom_client": true,
 		"custom_version": true, "upstream_headers": true, "enabled": true, "traffic_quota": true,
 		"traffic_used": true, "speed_limit": true, "created_at": true,
+		"ping_cache_enabled": true, "image_cache_enabled": true, "progress_coalescing_enabled": true,
 		"updated_at": true, "running": true,
 		"dynamic_discovery_enabled": true, "dynamic_profile": true,
 		"dynamic_discovery_sources": true,
