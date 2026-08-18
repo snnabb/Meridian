@@ -557,6 +557,20 @@ test('dashboard trend tooltip avoids the pointer and flips at chart edges', () =
   const css = readScript('../css/style.css');
   assert.match(css, /\.dashboard-chart-tooltip[^\n]*transform:\s*none/);
   assert.match(css, /\.dashboard-chart-tooltip[^\n]*pointer-events:\s*none/);
+  assert.match(css, /\.dashboard-trend-card\s*\{[^}]*overflow:\s*visible/);
+  assert.match(css, /\.dashboard-trend-grid\s*\{[^}]*position:\s*relative[^}]*z-index:\s*3/);
+  assert.match(css, /\.dashboard-insights-grid,\s*\.dashboard-site-status\s*\{[^}]*position:\s*relative[^}]*z-index:\s*1/);
+});
+
+test('dashboard trend tooltip keeps long content outside the pointer without clipping', () => {
+  const { sandbox } = makeTrafficHarness();
+  const middle = vm.runInContext('dashboardTooltipPosition(150, 100, 300, 200, 360, 300)', sandbox);
+  assert.equal(middle.top, 114, 'a long tooltip should move below a middle pointer');
+  assert.equal(middle.maxHeight, undefined, 'the tooltip should not receive a height limit');
+  assert.ok(middle.top >= 100 + 14, 'the tooltip should keep a gap below the pointer');
+  const top = vm.runInContext('dashboardTooltipPosition(150, 20, 300, 200, 360, 300)', sandbox);
+  assert.equal(top.top, 34, 'a top-edge pointer should use the space below it');
+  assert.equal(top.maxHeight, undefined, 'the tooltip should remain fully visible instead of scrolling');
 });
 
 test('dashboard zero-value trend scales never render negative or invalid labels', () => {

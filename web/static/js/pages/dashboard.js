@@ -187,13 +187,30 @@ function dashboardTooltipPosition(pointerX, pointerY, wrapWidth, wrapHeight, too
   const cardHeight = Math.max(1, Number(tooltipHeight) || 56);
   const gap = 14;
   const padding = 6;
-  let left = pointerX + gap;
-  if (left + cardWidth > width - padding) left = pointerX - cardWidth - gap;
-  left = Math.max(padding, Math.min(Math.max(padding, width - cardWidth - padding), left));
-  let top = pointerY - cardHeight - gap;
-  if (top < padding) top = pointerY + gap;
-  top = Math.max(padding, Math.min(Math.max(padding, height - cardHeight - padding), top));
-  return { left, top };
+  const rightSpace = width - pointerX - gap - padding;
+  const leftSpace = pointerX - gap - padding;
+  const clampLeft = left => Math.max(padding, Math.min(Math.max(padding, width - cardWidth - padding), left));
+
+  // Keep the tooltip beside the pointer whenever possible. This avoids
+  // covering the pointer even when the contents contain many site rows.
+  if (rightSpace >= cardWidth) {
+    let top = pointerY - cardHeight - gap;
+    if (top < padding) top = pointerY + gap;
+    return { left: clampLeft(pointerX + gap), top };
+  }
+  if (leftSpace >= cardWidth) {
+    let top = pointerY - cardHeight - gap;
+    if (top < padding) top = pointerY + gap;
+    return { left: clampLeft(pointerX - cardWidth - gap), top };
+  }
+
+  // If neither side has enough room, place the full card above or below the
+  // pointer. It is intentionally allowed to overflow the chart wrapper so
+  // long all-site tooltips keep all rows visible without covering the pointer.
+  const aboveSpace = Math.max(0, pointerY - gap - padding);
+  const belowSpace = Math.max(0, height - pointerY - gap - padding);
+  const below = belowSpace >= aboveSpace;
+  return { left: clampLeft(pointerX - cardWidth / 2), top: below ? pointerY + gap : pointerY - cardHeight - gap };
 }
 
 function dashboardTrendTimeLabel(timestamp, range) {
