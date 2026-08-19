@@ -180,6 +180,18 @@ function dashboardTrendPointerState(rect, geometry, event, pointCount) {
   return { x, y, index };
 }
 
+function dashboardTrendPointerInside(rect, event) {
+  if (!rect || !event) return false;
+  const x = Number(event.clientX);
+  const y = Number(event.clientY);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+  const left = Number(rect.left) || 0;
+  const top = Number(rect.top) || 0;
+  const right = Number.isFinite(Number(rect.right)) ? Number(rect.right) : left + (Number(rect.width) || 0);
+  const bottom = Number.isFinite(Number(rect.bottom)) ? Number(rect.bottom) : top + (Number(rect.height) || 0);
+  return x >= left && x <= right && y >= top && y <= bottom;
+}
+
 function dashboardTooltipPosition(pointerX, pointerY, wrapWidth, wrapHeight, tooltipWidth, tooltipHeight) {
   const width = Math.max(1, Number(wrapWidth) || 1);
   const height = Math.max(1, Number(wrapHeight) || 1);
@@ -567,6 +579,13 @@ function setupDashboardTrendControls() {
       const points = dashboardTrendPoints();
       if (!points.length) return;
       const rect = canvas.getBoundingClientRect();
+      // Touch pointer capture continues delivering pointermove events after
+      // the finger leaves the canvas. Do not clamp those events to the edge:
+      // hide the tooltip until the finger comes back into the chart.
+      if (event.pointerType !== 'mouse' && !dashboardTrendPointerInside(rect, event)) {
+        clearHover();
+        return;
+      }
       const geometry = chart.geometry || { width: rect.width, height: rect.height, left: 0, top: 0, plotW: rect.width, plotH: rect.height };
       const pointer = dashboardTrendPointerState(rect, geometry, event, points.length);
       chart.hoverIndex = pointer.index;
@@ -607,9 +626,7 @@ function setupDashboardTrendControls() {
     canvas.addEventListener('pointercancel', clearHover);
     canvas.addEventListener('pointerleave', event => {
       if (event.pointerType !== 'mouse') return;
-      chart.hoverIndex = -1; chart.hoverX = null; chart.hoverY = null;
-      if (tooltip) tooltip.hidden = true;
-      drawDashboardTrendChart(metric);
+      clearHover();
     });
   });
 }

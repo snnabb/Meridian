@@ -546,6 +546,18 @@ test('dashboard trend pointer coordinates use the plot bounds and keep the cross
   assert.equal(right.index, 6, 'the last sample should be selected at the plot end');
 });
 
+test('dashboard trend touch pointers outside the canvas are treated as inactive', () => {
+  const { sandbox } = makeTrafficHarness();
+  assert.equal(vm.runInContext('dashboardTrendPointerInside({ left: 100, top: 50, right: 400, bottom: 250 }, { clientX: 250, clientY: 150 })', sandbox), true);
+  assert.equal(vm.runInContext('dashboardTrendPointerInside({ left: 100, top: 50, right: 400, bottom: 250 }, { clientX: 401, clientY: 150 })', sandbox), false);
+  assert.equal(vm.runInContext('dashboardTrendPointerInside({ left: 100, top: 50, right: 400, bottom: 250 }, { clientX: 250, clientY: 251 })', sandbox), false);
+  assert.equal(vm.runInContext('dashboardTrendPointerInside({ left: 100, top: 50, width: 300, height: 200 }, { clientX: 399, clientY: 249 })', sandbox), true);
+  const source = readScript('pages/dashboard.js');
+  assert.match(source, /event\.pointerType !== 'mouse' && !dashboardTrendPointerInside\(rect, event\)/);
+  assert.match(source, /pointerType !== 'mouse' && !dashboardTrendPointerInside\(canvas\.getBoundingClientRect\(\), event\)/);
+  assert.match(source, /Touch pointer capture continues delivering pointermove events/);
+});
+
 test('dashboard trend tooltip avoids the pointer and flips at chart edges', () => {
   const { sandbox } = makeTrafficHarness();
   const rightEdge = vm.runInContext('dashboardTooltipPosition(270, 100, 300, 200, 100, 50)', sandbox);
