@@ -1650,7 +1650,15 @@ configure_panel_domain() {
 disable_panel_domain() {
     local work_dir proxies
     validate_nginx_config_path
-    is_systemd || { warn "自动取消面板域名要求 Meridian 由 systemd 管理"; return 1; }
+    # A non-systemd environment (for example a container or a CI install
+    # test) cannot safely restart Meridian after changing the panel binding.
+    # Treat the no-domain choice as a no-op there instead of failing an
+    # otherwise successful installation; operators can apply the choice when
+    # the service is managed by systemd.
+    is_systemd || {
+        warn "未检测到 systemd，跳过自动取消面板域名；请在服务启动方式就绪后重新执行 --no-domain"
+        return 0
+    }
     work_dir=$(mktemp -d)
     chmod 0700 "$work_dir"
     snapshot_panel_state "$work_dir" || { rm -rf -- "$work_dir"; return 1; }
