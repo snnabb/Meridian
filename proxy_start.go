@@ -112,6 +112,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	instanceCtx, instanceCancel := context.WithCancel(context.Background())
 	inst := &ProxyInstance{
 		Site:           site,
+		quota:          &trafficQuotaState{pm: pm},
 		startedAt:      time.Now(),
 		ctx:            instanceCtx,
 		cancel:         instanceCancel,
@@ -123,6 +124,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		pingCache:      pingCacheState,
 		imageCache:     imageCacheState,
 	}
+	inst.quota.inst = inst
 	installed := false
 	defer func() {
 		if !installed {
@@ -347,8 +349,9 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			requestCancel()
 		}()
 		r = r.WithContext(requestCtx)
-		inst.reqCount.Add(1)
-		inst.pendingRequests.Add(1)
+		trafficMeter := newRequestTrafficMeter(inst)
+		defer trafficMeter.finish(time.Now())
+		r = r.WithContext(context.WithValue(r.Context(), requestTrafficMeterContextKey{}, trafficMeter))
 
 		if site.TrafficQuota > 0 {
 			currentUsed, usageErr := pm.currentTrafficCycleUsage(inst, time.Now())
@@ -371,9 +374,11 @@ func (pm *ProxyManager) StartSite(site Site) error {
 					cumulative:     &inst.cumulativeBytesOut,
 					start:          time.Now(),
 					ctx:            r.Context(),
+					meter:          trafficMeter,
+					quota:          inst.quota,
 				}
 			} else {
-				rw = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut}
+				rw = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut, meter: trafficMeter, quota: inst.quota}
 			}
 			if dynamicIssuer == nil {
 				writeDynamicCapabilityUnavailable(rw)
@@ -406,7 +411,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			if isRedirectMode {
 				wsTarget = target
 			}
-			handleWebSocket(w, r, wsTarget, target, policy, inst, speedLimitBytes, configuredHeaders)
+			handleWebSocket(w, r, wsTarget, target, policy, inst, speedLimitBytes, trafficMeter, configuredHeaders)
 			return
 		}
 
@@ -425,9 +430,9 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			if hit, err := pm.assetCache.read(cacheReq, time.Now()); err == nil && hit != nil {
 				var cacheWriter http.ResponseWriter
 				if speedLimitBytes > 0 {
-					cacheWriter = &rateLimitedWriter{ResponseWriter: w, bytesPerSec: speedLimitBytes, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut, start: time.Now(), ctx: r.Context()}
+					cacheWriter = &rateLimitedWriter{ResponseWriter: w, bytesPerSec: speedLimitBytes, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut, start: time.Now(), ctx: r.Context(), meter: trafficMeter, quota: inst.quota}
 				} else {
-					cacheWriter = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut}
+					cacheWriter = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut, meter: trafficMeter, quota: inst.quota}
 				}
 				serveAssetCacheHit(cacheWriter, r, hit)
 				return
@@ -436,7 +441,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		}
 
 		if r.Body != nil {
-			r.Body = &meteredReader{ReadCloser: r.Body, read: &inst.bytesIn, cumulative: &inst.cumulativeBytesIn}
+			r.Body = &meteredReader{ReadCloser: r.Body, read: &inst.bytesIn, cumulative: &inst.cumulativeBytesIn, meter: trafficMeter, quota: inst.quota}
 		}
 		if len(failoverTargets) > 1 {
 			if err := prepareFailoverPlaybackInfoBody(r, redirectPolicy.limits.MaxBodyBytes); err != nil {
@@ -468,9 +473,11 @@ func (pm *ProxyManager) StartSite(site Site) error {
 				cumulative:     &inst.cumulativeBytesOut,
 				start:          time.Now(),
 				ctx:            r.Context(),
+				meter:          trafficMeter,
+				quota:          inst.quota,
 			}
 		} else {
-			rw = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut}
+			rw = &meteredWriter{ResponseWriter: w, written: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut, meter: trafficMeter, quota: inst.quota}
 		}
 		finalProxy := http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
 			proxy.ServeHTTP(responseWriter, request)

@@ -116,7 +116,7 @@ func newWSProxyServer(t *testing.T, upstreamAddr string, inst *ProxyInstance, sp
 		t.Fatalf("normalizeTargetURL: %v", err)
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		handleWebSocket(w, r, target, target, policy, inst, speedLimitBytes)
+		handleWebSocket(w, r, target, target, policy, inst, speedLimitBytes, nil)
 	}))
 	t.Cleanup(srv.Close)
 	return srv

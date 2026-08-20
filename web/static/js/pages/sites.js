@@ -1,5 +1,6 @@
 // Sites management page
 let siteSortingCleanup = null;
+let sitesLoadGeneration = 0;
 function renderSites() {
   const page = document.getElementById('page-sites');
   page.innerHTML = `
@@ -25,8 +26,10 @@ function renderSites() {
 }
 
 async function loadSites() {
+  const generation = ++sitesLoadGeneration;
   try {
 	const [sites, capabilities] = await Promise.all([API.listSites(), API.ingressCapabilities()]);
+	if (generation !== sitesLoadGeneration || Router.current !== 'sites') return;
 	siteIngressCapabilities = normalizeSiteCapabilities(capabilities);
     document.getElementById('sites-count').innerHTML = `共 <strong>${sites.length}</strong> 个站点`;
 

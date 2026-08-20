@@ -185,7 +185,7 @@ func (d *DB) migrateOnce() error {
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	INSERT OR IGNORE INTO telegram_report_settings (id) VALUES (1);
-	CREATE TABLE IF NOT EXISTS system_settings (
+		CREATE TABLE IF NOT EXISTS system_settings (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
 		ui_mode TEXT NOT NULL DEFAULT 'novice', ui_radius INTEGER NOT NULL DEFAULT 10,
 		traffic_billing_mode TEXT NOT NULL DEFAULT 'bidirectional', traffic_reset_day INTEGER NOT NULL DEFAULT 1,
@@ -206,7 +206,9 @@ func (d *DB) migrateOnce() error {
 		log_display_colo INTEGER NOT NULL DEFAULT 0, log_display_ua INTEGER NOT NULL DEFAULT 1, log_display_upstream_ua INTEGER NOT NULL DEFAULT 1, log_display_backend_address INTEGER NOT NULL DEFAULT 1,
 		log_display_node INTEGER NOT NULL DEFAULT 1, log_display_category INTEGER NOT NULL DEFAULT 1,
 		log_display_status INTEGER NOT NULL DEFAULT 1, log_display_timeline INTEGER NOT NULL DEFAULT 1,
-		log_search_mode TEXT NOT NULL DEFAULT 'like', updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+			log_search_mode TEXT NOT NULL DEFAULT 'like',
+			session_epoch INTEGER NOT NULL DEFAULT 1,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	INSERT OR IGNORE INTO system_settings (id) VALUES (1);
 	`); err != nil {
@@ -295,6 +297,7 @@ func (d *DB) migrateOnce() error {
 		{"log_display_timeline", "ALTER TABLE system_settings ADD COLUMN log_display_timeline INTEGER NOT NULL DEFAULT 1"},
 		{"log_display_upstream_ua", "ALTER TABLE system_settings ADD COLUMN log_display_upstream_ua INTEGER NOT NULL DEFAULT 1"},
 		{"log_display_backend_address", "ALTER TABLE system_settings ADD COLUMN log_display_backend_address INTEGER NOT NULL DEFAULT 1"},
+		{"session_epoch", "ALTER TABLE system_settings ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 1"},
 	} {
 		var exists int
 		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('system_settings') WHERE name=?", migration.column).Scan(&exists); err != nil {

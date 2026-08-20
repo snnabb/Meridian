@@ -35,7 +35,7 @@ const (
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.9.3"
+var appVersion = "v1.12.0"
 
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
@@ -87,6 +87,9 @@ func main() {
 	if err := validateDynamicRouteKeySeparation(dynamicRouteKey, jwtSecret, upstreamHeaderKey); err != nil {
 		log.Fatalf("invalid dynamic route key: %v", err)
 	}
+	if err := validateCredentialKeySeparation(meridianSecretKey, meridianSecretKeyConfigured, jwtSecret, dynamicRouteKey, upstreamHeaderKey, os.Getenv("DYNAMIC_ROUTE_KEY"), os.Getenv("UPSTREAM_HEADER_KEY")); err != nil {
+		log.Fatalf("invalid credential key: %v", err)
+	}
 
 	restoreState, err := applyPendingRestore(dbPath)
 	if err != nil {
@@ -105,6 +108,11 @@ func main() {
 	}
 	if err := migrateStoredCredentialCiphertexts(db); err != nil {
 		log.Fatalf("migrate stored credentials: %v", err)
+	}
+	if restoreState != nil {
+		if err := db.InvalidateAllSessions(); err != nil {
+			log.Fatalf("invalidate sessions after database restore: %v", err)
+		}
 	}
 	defer db.Close()
 	panelSettings, err := db.BootstrapPanelSettings(os.Getenv("PANEL_DOMAIN"), os.Getenv("PANEL_ROUTE_DOMAIN"), envBool("PANEL_TLS_ENABLED"), port)
@@ -140,6 +148,12 @@ func main() {
 	panelTLSConfig, panelTLSEnabled, err := panelCertificates.tlsConfig(panelSettings.TLSEnabled)
 	if err != nil {
 		log.Fatalf("invalid panel TLS configuration: %v", err)
+	}
+	if !panelTLSEnabled && panelBindIP != nil && !panelBindIP.IsLoopback() {
+		if !envBool("ALLOW_INSECURE_HTTP") {
+			log.Fatalf("refusing to expose the management panel over plain HTTP on %s; set ALLOW_INSECURE_HTTP=true only for a deliberate temporary compatibility deployment, or bind PANEL_BIND_ADDR=127.0.0.1 behind an HTTPS reverse proxy", panelBindIP.String())
+		}
+		log.Printf("SECURITY WARNING: ALLOW_INSECURE_HTTP is enabled; panel sessions are exposed over plain HTTP on %s", panelBindIP.String())
 	}
 	userCount, err := db.UserCount()
 	if err != nil {

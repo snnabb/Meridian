@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -111,6 +112,38 @@ func validateToken(token string) (int64, string, error) {
 
 func invalidateAllSessions() {
 	sessionGeneration.Add(1)
+}
+
+func setSessionGeneration(value uint64) {
+	if value == 0 {
+		value = 1
+	}
+	sessionGeneration.Store(value)
+}
+
+func validateCredentialKeySeparation(credential []byte, configured bool, effectiveJWT, dynamicKey, upstreamKey []byte, dynamicRaw, upstreamRaw string) error {
+	if !configured || len(credential) == 0 {
+		return nil
+	}
+	if len(effectiveJWT) > 0 && subtle.ConstantTimeCompare(credential, effectiveJWT) == 1 {
+		return fmt.Errorf("MERIDIAN_SECRET_KEY must differ from JWT_SECRET")
+	}
+	// Compare both the raw configured values and their derived runtime keys.
+	// This avoids hashing a password-shaped secret here; SHA-256 is used by the
+	// individual key resolvers only to derive their runtime keys.
+	if dynamicRaw != "" && subtle.ConstantTimeCompare(credential, []byte(dynamicRaw)) == 1 {
+		return fmt.Errorf("MERIDIAN_SECRET_KEY must differ from DYNAMIC_ROUTE_KEY")
+	}
+	if len(dynamicKey) > 0 && subtle.ConstantTimeCompare(credential, dynamicKey) == 1 {
+		return fmt.Errorf("MERIDIAN_SECRET_KEY must differ from DYNAMIC_ROUTE_KEY")
+	}
+	if upstreamRaw != "" && subtle.ConstantTimeCompare(credential, []byte(upstreamRaw)) == 1 {
+		return fmt.Errorf("MERIDIAN_SECRET_KEY must differ from UPSTREAM_HEADER_KEY")
+	}
+	if len(upstreamKey) > 0 && subtle.ConstantTimeCompare(credential, upstreamKey) == 1 {
+		return fmt.Errorf("MERIDIAN_SECRET_KEY must differ from UPSTREAM_HEADER_KEY")
+	}
+	return nil
 }
 
 var jwtHeaderEncoded = base64url([]byte(`{"alg":"HS256","typ":"JWT"}`))

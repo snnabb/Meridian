@@ -27,7 +27,7 @@ type DB struct {
 
 func openDB(path string) (*DB, error) {
 	setSecureFileCreationMask()
-	sqlDB, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	sqlDB, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)")
 	if err != nil {
 		return nil, err
 	}
@@ -36,6 +36,12 @@ func openDB(path string) (*DB, error) {
 	if err := d.migrate(); err != nil {
 		sqlDB.Close()
 		return nil, err
+	}
+	if epoch, err := d.SessionEpoch(); err == nil {
+		setSessionGeneration(epoch)
+	} else {
+		sqlDB.Close()
+		return nil, fmt.Errorf("load session epoch: %w", err)
 	}
 	settings, err := d.loadSystemSettings()
 	if err != nil {
@@ -56,6 +62,52 @@ func openDB(path string) (*DB, error) {
 	d.dynamicObservationDone = make(chan struct{})
 	go d.runDynamicObservationWriter()
 	return d, nil
+}
+
+func (d *DB) SessionEpoch() (uint64, error) {
+	var epoch int64
+	if err := d.db.QueryRow("SELECT session_epoch FROM system_settings WHERE id=1").Scan(&epoch); err != nil {
+		return 0, err
+	}
+	if epoch < 1 {
+		epoch = 1
+	}
+	return uint64(epoch), nil
+}
+
+func (d *DB) BumpSessionEpochTx(tx *sql.Tx) (uint64, error) {
+	if _, err := tx.Exec("UPDATE system_settings SET session_epoch=session_epoch+1, updated_at=CURRENT_TIMESTAMP WHERE id=1"); err != nil {
+		return 0, err
+	}
+	var epoch int64
+	if err := tx.QueryRow("SELECT session_epoch FROM system_settings WHERE id=1").Scan(&epoch); err != nil {
+		return 0, err
+	}
+	if epoch < 1 {
+		epoch = 1
+	}
+	return uint64(epoch), nil
+}
+
+// InvalidateAllSessions persists a new epoch before publishing it to the
+// in-process token validator. It is used after a database restore so tokens
+// issued from the pre-restore administrator identity cannot become valid again
+// merely because the restored database happens to carry the same epoch.
+func (d *DB) InvalidateAllSessions() error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	epoch, err := d.BumpSessionEpochTx(tx)
+	if err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	setSessionGeneration(epoch)
+	return nil
 }
 
 // warnUnenforcedFileModes keeps the platform warning to one line per process

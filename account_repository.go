@@ -123,8 +123,13 @@ func (d *DB) UpdateAdminAccount(userID int64, currentPassword, username, newPass
 		}
 		nextHash = string(hash)
 	}
-	result, err := d.db.Exec(`
-		UPDATE users
+	tx, err := d.db.Begin()
+	if err != nil {
+		return AdminAccount{}, err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`
+			UPDATE users
 		SET username=?, password_hash=?
 		WHERE id=? AND username=? AND password_hash=?`, username, nextHash, userID, currentUsername, currentHash)
 	if err != nil {
@@ -140,7 +145,14 @@ func (d *DB) UpdateAdminAccount(userID int64, currentPassword, username, newPass
 	if rows != 1 {
 		return AdminAccount{}, errors.New("administrator account changed concurrently")
 	}
-	invalidateAllSessions()
+	epoch, err := d.BumpSessionEpochTx(tx)
+	if err != nil {
+		return AdminAccount{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AdminAccount{}, err
+	}
+	setSessionGeneration(epoch)
 	return AdminAccount{Username: username, Role: "管理员", CreatedAt: createdAt}, nil
 }
 
@@ -229,9 +241,13 @@ func (d *DB) ResetAdminPassword(password string) error {
 	if rows != 1 {
 		return fmt.Errorf("updated %d administrator rows, want 1", rows)
 	}
+	epoch, err := d.BumpSessionEpochTx(tx)
+	if err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	invalidateAllSessions()
+	setSessionGeneration(epoch)
 	return nil
 }

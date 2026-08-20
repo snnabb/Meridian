@@ -201,6 +201,9 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
 		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+		if requestIsHTTPS(r, nil) {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -304,6 +307,21 @@ func sessionIdentity(r *http.Request) (int64, string, error) {
 	return 0, "", errors.New("missing or invalid session")
 }
 
+func (a *App) authenticatedSession(r *http.Request) (int64, string, error) {
+	userID, username, err := sessionIdentity(r)
+	if err != nil {
+		return 0, "", err
+	}
+	if a == nil || a.db == nil {
+		return 0, "", errors.New("session database unavailable")
+	}
+	account, err := a.db.AdminAccountByID(userID)
+	if err != nil || account.Username != username {
+		return 0, "", errors.New("session identity no longer valid")
+	}
+	return userID, username, nil
+}
+
 func (a *App) csrfMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if stateChangingMethod(r.Method) && !requestHasSameOrigin(r) {
@@ -316,7 +334,7 @@ func (a *App) csrfMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 func (a *App) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if _, _, err := sessionIdentity(r); err != nil {
+		if _, _, err := a.authenticatedSession(r); err != nil {
 			a.jsonErr(w, http.StatusUnauthorized, "session expired or invalid")
 			return
 		}
@@ -467,7 +485,7 @@ func (a *App) handleAuthCheck(w http.ResponseWriter, r *http.Request) {
 	authenticated := false
 	username := ""
 	if !needsSetup {
-		if _, sessionUsername, err := sessionIdentity(r); err == nil {
+		if _, sessionUsername, err := a.authenticatedSession(r); err == nil {
 			authenticated = true
 			username = sessionUsername
 		}
@@ -484,7 +502,7 @@ func (a *App) handleAuthCheck(w http.ResponseWriter, r *http.Request) {
 
 // GET/PUT /api/account
 func (a *App) handleAccount(w http.ResponseWriter, r *http.Request) {
-	userID, _, err := sessionIdentity(r)
+	userID, _, err := a.authenticatedSession(r)
 	if err != nil {
 		a.jsonErr(w, http.StatusUnauthorized, "session expired or invalid")
 		return

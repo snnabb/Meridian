@@ -309,7 +309,7 @@ func (d *DB) telegramReportSettingsView() (telegramReportSettingsView, telegramR
 	return telegramReportSettingsView{
 		Enabled: stored.Enabled, Configured: stored.Configured, ScheduleTime: stored.ScheduleTime,
 		Frequency: stored.Frequency, Weekday: stored.Weekday, LastSentKey: stored.LastSentKey,
-		Timezone: d.currentSystemSettings().ScheduleTimezone,
+		Timezone:     d.currentSystemSettings().ScheduleTimezone,
 		TimezoneName: d.currentSystemSettings().ScheduleTimezoneName,
 	}, stored, nil
 }
@@ -325,7 +325,7 @@ func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error
 	if err := d.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(enabled),0) FROM sites`).Scan(&stats.SiteCount, &stats.RunningSiteCount); err != nil {
 		return stats, err
 	}
-	if err := d.db.QueryRow(`SELECT COUNT(DISTINCT client_ip), COALESCE(SUM(CASE WHEN resource_category='video' THEN 1 ELSE 0 END),0) FROM request_logs WHERE recorded_at_ms>=? AND recorded_at_ms<?`, todayStart.UnixMilli(), tomorrow.UnixMilli()).Scan(&stats.UniqueClients, &stats.VideoRequests); err != nil {
+	if err := d.db.QueryRow(`SELECT COUNT(DISTINCT client_ip), COALESCE(SUM(CASE WHEN resource_category IN ('video','stream','manifest','segment') THEN 1 ELSE 0 END),0) FROM request_logs WHERE recorded_at_ms>=? AND recorded_at_ms<?`, todayStart.UnixMilli(), tomorrow.UnixMilli()).Scan(&stats.UniqueClients, &stats.VideoRequests); err != nil {
 		return stats, err
 	}
 	if err := d.db.QueryRow(`SELECT COUNT(*) FROM request_logs WHERE recorded_at_ms>=? AND recorded_at_ms<?`, todayStart.UnixMilli(), tomorrow.UnixMilli()).Scan(&stats.Requests); err != nil {

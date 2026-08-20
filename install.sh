@@ -108,11 +108,15 @@ validate_safe_directory() {
         ""|/|/bin|/boot|/dev|/etc|/home|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/usr/local|/var)
             fail "拒绝使用不安全的${label}: ${value:-<empty>}"
             ;;
-        *//*|*/../*|*/..|*/./*|*/.|*$'\n'*)
+        *//*|*/../*|*/..|*/./*|*/.|*$'\n'*|*$'\r'*|*$'\t'*)
             fail "${label}包含不安全的路径片段: $value"
             ;;
     esac
     [[ "$value" = /* ]] || fail "${label}必须是绝对路径: $value"
+}
+
+validate_install_dir() {
+    validate_safe_directory "$INSTALL_DIR" "安装目录"
 }
 
 validate_data_dir() {
@@ -346,6 +350,23 @@ download() {
         --retry 3 --retry-delay 2 --connect-timeout 15 -fsSL "$1" -o "$2"
 }
 
+verify_release_signature() {
+    local version="$1" checksum_file="$2" bundle_file="$3" identity
+    if ! download "https://github.com/${REPO}/releases/download/${version}/SHA256SUMS.bundle" "$bundle_file" 2>/dev/null; then
+        warn "该 Release 没有 Sigstore 签名清单，继续执行兼容的 SHA-256 校验"
+        return 0
+    fi
+    command -v cosign >/dev/null 2>&1 \
+        || fail "该 Release 已签名，但本机缺少 cosign；请先安装 Sigstore cosign 后重试"
+    identity="https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${version}"
+    cosign verify-blob --bundle "$bundle_file" \
+        --certificate-identity-regexp "$identity" \
+        --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+        "$checksum_file" >/dev/null \
+        || fail "SHA256SUMS 的 Sigstore 签名验证失败"
+    ok "已验证 Release 的 Sigstore 签名"
+}
+
 sha256_file() {
     if command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$1" | awk '{print $1}'
@@ -436,16 +457,18 @@ get_current_version() {
 }
 
 download_release_binary() {
-    local version="$1" tmp_dir="$2" suffix asset binary_file checksum_file expected actual
+    local version="$1" tmp_dir="$2" suffix asset binary_file checksum_file bundle_file expected actual
     suffix=$(detect_platform)
     asset="${BIN_NAME}-${suffix}"
     binary_file="${tmp_dir}/${asset}"
     checksum_file="${tmp_dir}/SHA256SUMS"
+    bundle_file="${tmp_dir}/SHA256SUMS.bundle"
     info "下载 Meridian ${version} (${suffix})..."
     download "https://github.com/${REPO}/releases/download/${version}/${asset}" "$binary_file" \
         || fail "二进制下载失败，请检查网络和 Release"
     download "https://github.com/${REPO}/releases/download/${version}/SHA256SUMS" "$checksum_file" \
         || fail "SHA256SUMS 下载失败；已停止安装"
+    verify_release_signature "$version" "$checksum_file" "$bundle_file"
     expected=$(awk -v file="$asset" '$2 == file || $2 == "*" file { print $1; exit }' "$checksum_file")
     printf '%s' "$expected" | grep -Eq '^[[:xdigit:]]{64}$' \
         || fail "SHA256SUMS 中缺少 ${asset} 的有效校验值"
@@ -568,6 +591,11 @@ validate_existing_secret_configuration() {
         || [ "$dynamic_route_key" = "$upstream_header_key" ]; }; then
         fail "DYNAMIC_ROUTE_KEY 必须与 JWT_SECRET 和 UPSTREAM_HEADER_KEY 使用不同的值；现有配置未修改"
     fi
+    if [ -n "$credential_key" ] && { [ "$credential_key" = "$jwt_secret" ] \
+        || [ "$credential_key" = "$upstream_header_key" ] \
+        || [ "$credential_key" = "$dynamic_route_key" ]; }; then
+        fail "MERIDIAN_SECRET_KEY 必须与其他长期密钥使用不同的值；现有配置未修改"
+    fi
 }
 
 env_has_key() {
@@ -603,6 +631,31 @@ append_env_default() {
     printf '%s=%s\n' "$key" "$value" >> "$tmp_file" || return 1
     chmod 0600 "$tmp_file" || return 1
     install_env_file "$tmp_file" || return 1
+}
+
+normalize_insecure_bind() {
+    local tmp_dir="$1" env_file bind tls allow tmp_file
+    env_file=$(env_file_path) || return 1
+    bind=$(read_env_value PANEL_BIND_ADDR)
+    tls=$(printf '%s' "$(read_env_value PANEL_TLS_ENABLED)" | tr '[:upper:]' '[:lower:]')
+    allow=$(printf '%s' "$(read_env_value ALLOW_INSECURE_HTTP)" | tr '[:upper:]' '[:lower:]')
+    case "$bind" in
+        0.0.0.0|::)
+            if [ "$tls" = "1" ] || [ "$tls" = "true" ] || [ "$tls" = "yes" ] || [ "$tls" = "on" ]; then
+                return 0
+            fi
+            if [ "$allow" = "1" ] || [ "$allow" = "true" ] || [ "$allow" = "yes" ] || [ "$allow" = "on" ]; then
+                return 0
+            fi
+            tmp_file="${tmp_dir}/env-loopback-bind"
+            # shellcheck disable=SC2016
+            as_root awk -F= '$1 != "PANEL_BIND_ADDR" { print }' "$env_file" > "$tmp_file" || return 1
+            printf 'PANEL_BIND_ADDR=127.0.0.1\n' >> "$tmp_file" || return 1
+            chmod 0600 "$tmp_file" || return 1
+            install_env_file "$tmp_file" || return 1
+            warn "检测到旧版公网面板绑定，已迁移为 127.0.0.1；如确需明文公网访问，请显式设置 ALLOW_INSECURE_HTTP=true"
+            ;;
+    esac
 }
 
 ensure_setup_token() {
@@ -685,14 +738,14 @@ ensure_dynamic_route_key() {
 
 
 set_panel_env() {
-    local bind_addr="$1" domain="$2" proxies="$3" tmp_dir="$4" env_file tmp_file
+    local bind_addr="$1" domain="$2" proxies="$3" allow_insecure="$4" tmp_dir="$5" env_file tmp_file
     env_file=$(env_file_path) || return 1
     tmp_file="${tmp_dir}/panel.env"
     # $1 is an awk field reference, not a shell variable.
     # shellcheck disable=SC2016
-    as_root awk -F= '$1 != "PANEL_BIND_ADDR" && $1 != "PANEL_DOMAIN" && $1 != "TRUSTED_PROXY_CIDRS" { print }' "$env_file" > "$tmp_file" || return 1
-    printf 'PANEL_BIND_ADDR=%s\nPANEL_DOMAIN=%s\nTRUSTED_PROXY_CIDRS=%s\n' \
-        "$bind_addr" "$domain" "$proxies" >> "$tmp_file" || return 1
+    as_root awk -F= '$1 != "PANEL_BIND_ADDR" && $1 != "PANEL_DOMAIN" && $1 != "TRUSTED_PROXY_CIDRS" && $1 != "ALLOW_INSECURE_HTTP" { print }' "$env_file" > "$tmp_file" || return 1
+    printf 'PANEL_BIND_ADDR=%s\nPANEL_DOMAIN=%s\nTRUSTED_PROXY_CIDRS=%s\nALLOW_INSECURE_HTTP=%s\n' \
+        "$bind_addr" "$domain" "$proxies" "$allow_insecure" >> "$tmp_file" || return 1
     chmod 0600 "$tmp_file" || return 1
     install_env_file "$tmp_file" || return 1
 }
@@ -793,7 +846,7 @@ prepare_data_and_config() {
         credential_key=$(generate_distinct_secret "$secret" "$upstream_header_key" "$dynamic_route_key") || return 1
         INITIAL_SETUP_TOKEN=$(generate_distinct_secret "$secret" "$upstream_header_key" "$dynamic_route_key" "$credential_key") || return 1
         env_tmp="${tmp_dir}/meridian.env"
-        printf 'JWT_SECRET=%s\nUPSTREAM_HEADER_KEY=%s\nDYNAMIC_ROUTE_KEY=%s\nMERIDIAN_SECRET_KEY=%s\nSETUP_TOKEN=%s\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=0.0.0.0\nPANEL_DOMAIN=\nPANEL_ROUTE_DOMAIN=\nPANEL_TLS_ENABLED=false\nPANEL_TLS_CERT_FILE=\nPANEL_TLS_KEY_FILE=\nTRUSTED_PROXY_CIDRS=\n' \
+        printf 'JWT_SECRET=%s\nUPSTREAM_HEADER_KEY=%s\nDYNAMIC_ROUTE_KEY=%s\nMERIDIAN_SECRET_KEY=%s\nSETUP_TOKEN=%s\nPORT=9090\nDB_PATH=%s/meridian.db\nPANEL_BIND_ADDR=127.0.0.1\nPANEL_DOMAIN=\nPANEL_ROUTE_DOMAIN=\nPANEL_TLS_ENABLED=false\nPANEL_TLS_CERT_FILE=\nPANEL_TLS_KEY_FILE=\nTRUSTED_PROXY_CIDRS=\nALLOW_INSECURE_HTTP=false\n' \
             "$secret" "$upstream_header_key" "$dynamic_route_key" "$credential_key" "$INITIAL_SETUP_TOKEN" "$DATA_DIR" > "$env_tmp" || return 1
         chmod 0600 "$env_tmp" || return 1
         install_env_file "$env_tmp" || return 1
@@ -801,14 +854,17 @@ prepare_data_and_config() {
         ok "已创建安全配置: $env_file"
     else
         ensure_dynamic_route_key "$tmp_dir" || return 1
-        append_env_default PANEL_BIND_ADDR 0.0.0.0 "$tmp_dir" || return 1
+        append_env_default PANEL_BIND_ADDR 127.0.0.1 "$tmp_dir" || return 1
         append_env_default PANEL_DOMAIN "" "$tmp_dir" || return 1
         append_env_default PANEL_ROUTE_DOMAIN "" "$tmp_dir" || return 1
         append_env_default PANEL_TLS_ENABLED false "$tmp_dir" || return 1
         append_env_default PANEL_TLS_CERT_FILE "" "$tmp_dir" || return 1
         append_env_default PANEL_TLS_KEY_FILE "" "$tmp_dir" || return 1
         append_env_default TRUSTED_PROXY_CIDRS "" "$tmp_dir" || return 1
-        append_env_default MERIDIAN_SECRET_KEY "$(generate_secret)" "$tmp_dir" || return 1
+        append_env_default ALLOW_INSECURE_HTTP false "$tmp_dir" || return 1
+        normalize_insecure_bind "$tmp_dir" || return 1
+        credential_key=$(generate_distinct_secret "$(read_legacy_env_secret JWT_SECRET)" "$(read_legacy_env_secret UPSTREAM_HEADER_KEY)" "$(read_strict_dynamic_route_key)") || return 1
+        append_env_default MERIDIAN_SECRET_KEY "$credential_key" "$tmp_dir" || return 1
         ensure_upstream_header_key "$tmp_dir" || return 1
         ensure_setup_token "$tmp_dir" || return 1
         if is_systemd; then
@@ -942,7 +998,7 @@ restore_previous_binary() {
 cleanup_update_transaction() {
     local exit_code=$?
     if [ "$exit_code" -ne 0 ] && [ "$UPDATE_TRANSACTION" = "1" ]; then
-        warn "更新中断，正在恢复更新前的二进制和数据状态..."
+        warn "更新中断，正在自动回滚并恢复更新前的二进制和数据状态..."
         if [ "$UPDATE_BINARY_CHANGED" = "1" ]; then
             restore_previous_binary || true
         fi
@@ -1578,7 +1634,7 @@ configure_panel_domain() {
     fi
 
     proxies="127.0.0.1/32,::1/128"
-    if ! set_panel_env "127.0.0.1" "$domain" "$proxies" "$work_dir" \
+    if ! set_panel_env "127.0.0.1" "$domain" "$proxies" "false" "$work_dir" \
         || ! restart_meridian_and_health; then
         warn "面板切换到回环地址后健康检查失败，正在恢复原配置"
         rollback_panel_transaction
@@ -1594,7 +1650,15 @@ configure_panel_domain() {
 disable_panel_domain() {
     local work_dir proxies
     validate_nginx_config_path
-    is_systemd || { warn "自动取消面板域名要求 Meridian 由 systemd 管理"; return 1; }
+    # A non-systemd environment (for example a container or a CI install
+    # test) cannot safely restart Meridian after changing the panel binding.
+    # Treat the no-domain choice as a no-op there instead of failing an
+    # otherwise successful installation; operators can apply the choice when
+    # the service is managed by systemd.
+    is_systemd || {
+        warn "未检测到 systemd，跳过自动取消面板域名；请在服务启动方式就绪后重新执行 --no-domain"
+        return 0
+    }
     work_dir=$(mktemp -d)
     chmod 0700 "$work_dir"
     snapshot_panel_state "$work_dir" || { rm -rf -- "$work_dir"; return 1; }
@@ -1613,13 +1677,13 @@ disable_panel_domain() {
         fi
     fi
     proxies=$(remove_loopback_proxies "$(read_env_value TRUSTED_PROXY_CIDRS)")
-    if ! set_panel_env "0.0.0.0" "" "$proxies" "$work_dir" || ! restart_meridian_and_health; then
+    if ! set_panel_env "0.0.0.0" "" "$proxies" "true" "$work_dir" || ! restart_meridian_and_health; then
         warn "恢复 IP 访问时健康检查失败，正在恢复原配置"
         rollback_panel_transaction
         return 1
     fi
     commit_panel_transaction
-    ok "已取消安装器管理的面板域名；可通过服务器IP:$(read_config_port)访问"
+    ok "已取消安装器管理的面板域名；已显式启用明文兼容模式，可通过服务器IP:$(read_config_port)访问（建议尽快重新配置 HTTPS）"
 }
 
 prompt_domain_choice() {
@@ -1702,6 +1766,7 @@ do_install() {
     need_cmd sed
     need_cmd tr
     init_privilege
+    validate_install_dir
     validate_data_dir
     validate_backup_dir
 
@@ -1749,7 +1814,7 @@ do_install() {
     if [ -n "$(read_env_value PANEL_DOMAIN)" ]; then
         printf '  面板地址: https://%s\n' "$(read_env_value PANEL_DOMAIN)"
     else
-        printf '  面板地址: http://服务器IP:%s\n' "$(read_config_port)"
+        printf '  面板地址: http://127.0.0.1:%s（默认仅本机；公网请配置 HTTPS 域名）\n' "$(read_config_port)"
     fi
     printf '  数据目录: %s\n' "$DATA_DIR"
     print_setup_token_notice || return 1
@@ -1759,6 +1824,8 @@ do_update() {
     local current_binary="${INSTALL_DIR}/${BIN_NAME}" current_version latest_version should_stop_after=0 tmp_dir
     INITIAL_SETUP_TOKEN=""
     SETUP_TOKEN_ORIGIN=""
+    validate_install_dir
+    validate_data_dir
     UPDATE_SERVICE_SNAPSHOT=""
     UPDATE_SERVICE_CHANGED=0
     [ -x "$current_binary" ] || fail "Meridian 尚未安装，请先运行 install"
@@ -1961,6 +2028,7 @@ abort_password_transaction() {
 do_password() {
     local password password_again length db_path tmp_dir snapshot_dir rotated_env new_secret mutated=0
     local current_binary="${INSTALL_DIR}/${BIN_NAME}"
+    validate_install_dir
     [ -x "$current_binary" ] || fail "Meridian 尚未安装"
     is_systemd || fail "自动修改密码要求 Meridian 由 systemd 管理"
     init_privilege
@@ -2058,6 +2126,7 @@ remove_managed_nginx_config() {
 do_uninstall() {
     local remove_data="$PURGE_DATA"
     init_privilege
+    validate_install_dir
     warn "即将卸载 Meridian；Nginx、Certbot、证书和备份不会删除"
     if [ "$ASSUME_YES" != "1" ]; then
         if [ "$PURGE_DATA" = "1" ]; then

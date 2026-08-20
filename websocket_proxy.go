@@ -18,7 +18,7 @@ func writeWebSocketGatewayError(conn net.Conn) {
 	_, _ = fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
 }
 
-func handleWebSocket(w http.ResponseWriter, r *http.Request, target, primaryTarget *url.URL, policy UAHeaderPolicy, inst *ProxyInstance, speedLimitBytes int64, upstreamPolicies ...upstreamHeaderPolicy) {
+func handleWebSocket(w http.ResponseWriter, r *http.Request, target, primaryTarget *url.URL, policy UAHeaderPolicy, inst *ProxyInstance, speedLimitBytes int64, meter *requestTrafficMeter, upstreamPolicies ...upstreamHeaderPolicy) {
 	// Nothing on this path reads r.Body, so a body would be left sitting in the
 	// hijacked buffer and relayed verbatim to the upstream.
 	if r.ContentLength != 0 || len(r.TransferEncoding) > 0 {
@@ -158,13 +158,16 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target, primaryTarg
 
 	// Bidirectional copy. Both directions are metered per chunk; only the
 	// download direction is paced, matching rateLimitedWriter on the HTTP path.
+	if meter == nil {
+		meter = requestTrafficMeterFromContext(r.Context())
+	}
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(&tunnelWriter{dst: upstreamConn, counter: &inst.bytesIn, cumulative: &inst.cumulativeBytesIn, start: time.Now()}, clientBuf)
+		_, _ = io.Copy(&tunnelWriter{dst: upstreamConn, counter: &inst.bytesIn, cumulative: &inst.cumulativeBytesIn, meter: meter, inbound: true, quota: inst.quota, start: time.Now()}, clientBuf)
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(&tunnelWriter{dst: clientConn, counter: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut, bytesPerSec: speedLimitBytes, start: time.Now()}, upstreamReader)
+		_, _ = io.Copy(&tunnelWriter{dst: clientConn, counter: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut, meter: meter, bytesPerSec: speedLimitBytes, quota: inst.quota, start: time.Now()}, upstreamReader)
 		done <- struct{}{}
 	}()
 	// The first closed direction must tear down its counterpart, then both copy

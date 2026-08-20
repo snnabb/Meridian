@@ -38,6 +38,8 @@ type meteredWriter struct {
 	http.ResponseWriter
 	written    *atomic.Int64
 	cumulative *atomic.Int64
+	meter      *requestTrafficMeter
+	quota      *trafficQuotaState
 }
 
 func addMeteredBytes(primary, cumulative *atomic.Int64, n int) {
@@ -52,9 +54,39 @@ func addMeteredBytes(primary, cumulative *atomic.Int64, n int) {
 	}
 }
 
+func addMeteredBytesWithMeter(primary, cumulative *atomic.Int64, meter *requestTrafficMeter, inbound bool, n int) {
+	if n <= 0 {
+		return
+	}
+	if meter != nil {
+		if inbound {
+			meter.addIn(int64(n))
+		} else {
+			meter.addOut(int64(n))
+		}
+		if cumulative != nil {
+			cumulative.Add(int64(n))
+		}
+		return
+	}
+	addMeteredBytes(primary, cumulative, n)
+}
+
 func (m *meteredWriter) Write(b []byte) (int, error) {
+	if m.quota != nil {
+		allowed, quotaErr := m.quota.allow(true, int64(len(b)), time.Now())
+		if allowed == 0 {
+			return 0, quotaErr
+		}
+		if allowed < int64(len(b)) {
+			b = b[:allowed]
+		}
+	}
 	n, err := m.ResponseWriter.Write(b)
-	addMeteredBytes(m.written, m.cumulative, n)
+	addMeteredBytesWithMeter(m.written, m.cumulative, m.meter, false, n)
+	if m.quota != nil && int64(n) < int64(len(b)) {
+		return n, errTrafficQuotaExceeded
+	}
 	return n, err
 }
 
@@ -78,11 +110,25 @@ type meteredReader struct {
 	io.ReadCloser
 	read       *atomic.Int64
 	cumulative *atomic.Int64
+	meter      *requestTrafficMeter
+	quota      *trafficQuotaState
 }
 
 func (m *meteredReader) Read(p []byte) (int, error) {
+	if m.quota != nil {
+		allowed, quotaErr := m.quota.allow(false, int64(len(p)), time.Now())
+		if allowed == 0 {
+			return 0, quotaErr
+		}
+		if allowed < int64(len(p)) {
+			p = p[:allowed]
+		}
+	}
 	n, err := m.ReadCloser.Read(p)
-	addMeteredBytes(m.read, m.cumulative, n)
+	addMeteredBytesWithMeter(m.read, m.cumulative, m.meter, true, n)
+	if m.quota != nil && int64(n) < int64(len(p)) && err == nil {
+		return n, errTrafficQuotaExceeded
+	}
 	return n, err
 }
 
@@ -91,6 +137,8 @@ type rateLimitedWriter struct {
 	bytesPerSec    int64
 	written        *atomic.Int64
 	cumulative     *atomic.Int64
+	meter          *requestTrafficMeter
+	quota          *trafficQuotaState
 	requestWritten int64
 	start          time.Time
 	ctx            context.Context
@@ -98,8 +146,20 @@ type rateLimitedWriter struct {
 
 func (w *rateLimitedWriter) Write(b []byte) (int, error) {
 	if w.bytesPerSec <= 0 {
+		if w.quota != nil {
+			allowed, quotaErr := w.quota.allow(true, int64(len(b)), time.Now())
+			if allowed == 0 {
+				return 0, quotaErr
+			}
+			if allowed < int64(len(b)) {
+				b = b[:allowed]
+			}
+		}
 		n, err := w.ResponseWriter.Write(b)
-		addMeteredBytes(w.written, w.cumulative, n)
+		addMeteredBytesWithMeter(w.written, w.cumulative, w.meter, false, n)
+		if w.quota != nil && int64(n) < int64(len(b)) {
+			return n, errTrafficQuotaExceeded
+		}
 		return n, err
 	}
 	totalWritten := 0
@@ -125,11 +185,23 @@ func (w *rateLimitedWriter) Write(b []byte) (int, error) {
 		if int64(len(chunk)) > allowed {
 			chunk = b[:allowed]
 		}
+		if w.quota != nil {
+			quotaAllowed, quotaErr := w.quota.allow(true, int64(len(chunk)), time.Now())
+			if quotaAllowed == 0 {
+				return totalWritten, quotaErr
+			}
+			if quotaAllowed < int64(len(chunk)) {
+				chunk = chunk[:quotaAllowed]
+			}
+		}
 		n, err := w.ResponseWriter.Write(chunk)
-		addMeteredBytes(w.written, w.cumulative, n)
+		addMeteredBytesWithMeter(w.written, w.cumulative, w.meter, false, n)
 		w.requestWritten += int64(n)
 		totalWritten += n
 		b = b[n:]
+		if w.quota != nil && int64(n) < int64(len(chunk)) {
+			return totalWritten, errTrafficQuotaExceeded
+		}
 		if err != nil {
 			return totalWritten, err
 		}
@@ -161,6 +233,9 @@ type tunnelWriter struct {
 	dst         io.Writer
 	counter     *atomic.Int64
 	cumulative  *atomic.Int64
+	meter       *requestTrafficMeter
+	inbound     bool
+	quota       *trafficQuotaState
 	bytesPerSec int64
 	written     int64
 	start       time.Time
@@ -168,8 +243,20 @@ type tunnelWriter struct {
 
 func (t *tunnelWriter) Write(b []byte) (int, error) {
 	if t.bytesPerSec <= 0 {
+		if t.quota != nil {
+			allowed, quotaErr := t.quota.allow(!t.inbound, int64(len(b)), time.Now())
+			if allowed == 0 {
+				return 0, quotaErr
+			}
+			if allowed < int64(len(b)) {
+				b = b[:allowed]
+			}
+		}
 		n, err := t.dst.Write(b)
-		addMeteredBytes(t.counter, t.cumulative, n)
+		addMeteredBytesWithMeter(t.counter, t.cumulative, t.meter, t.inbound, n)
+		if t.quota != nil && int64(n) < int64(len(b)) {
+			return n, errTrafficQuotaExceeded
+		}
 		return n, err
 	}
 	total := 0
@@ -187,11 +274,23 @@ func (t *tunnelWriter) Write(b []byte) (int, error) {
 		if int64(len(chunk)) > allowed {
 			chunk = b[:allowed]
 		}
+		if t.quota != nil {
+			quotaAllowed, quotaErr := t.quota.allow(!t.inbound, int64(len(chunk)), time.Now())
+			if quotaAllowed == 0 {
+				return total, quotaErr
+			}
+			if quotaAllowed < int64(len(chunk)) {
+				chunk = chunk[:quotaAllowed]
+			}
+		}
 		n, err := t.dst.Write(chunk)
-		addMeteredBytes(t.counter, t.cumulative, n)
+		addMeteredBytesWithMeter(t.counter, t.cumulative, t.meter, t.inbound, n)
 		t.written += int64(n)
 		total += n
 		b = b[n:]
+		if t.quota != nil && int64(n) < int64(len(chunk)) {
+			return total, errTrafficQuotaExceeded
+		}
 		if err != nil {
 			return total, err
 		}

@@ -500,6 +500,9 @@ detect_platform() { printf 'linux-amd64\n'; }
 download() {
     local url="$1" output="$2" version
     version=$(printf '%s' "$url" | awk -F/ '{print $(NF-1)}')
+    if [[ "$url" == */SHA256SUMS.bundle* ]]; then
+        return 1
+    fi
     if [[ "$url" == */SHA256SUMS ]]; then
         printf '%s  meridian-linux-amd64\n' "$(sha256_file "${TEST_ROOT}/release-binary")" > "$output"
         return
@@ -563,7 +566,7 @@ if ! (do_install) >"${TEST_ROOT}/install-first.log" 2>&1; then
 fi
 assert_eq 'v9.9.9' "$(get_current_version)" 'first installed version'
 assert_file "${DATA_DIR}/.env"
-assert_eq '0.0.0.0' "$(read_env_value PANEL_BIND_ADDR)" 'fresh IP bind'
+assert_eq '127.0.0.1' "$(read_env_value PANEL_BIND_ADDR)" 'fresh IP bind'
 upstream_header_key=$(read_env_value UPSTREAM_HEADER_KEY)
 if [ "${#upstream_header_key}" -lt 32 ]; then
     echo 'FAIL: fresh install must generate UPSTREAM_HEADER_KEY' >&2
@@ -749,6 +752,9 @@ if (
     MOCK_LATEST='v9.9.12'
     download() {
         local url="$1" output="$2"
+        if [[ "$url" == */SHA256SUMS.bundle* ]]; then
+            return 1
+        fi
         if [[ "$url" == */SHA256SUMS ]]; then
             printf '%s  meridian-linux-amd64\n' "$(sha256_file "$failing_binary")" > "$output"
             return
@@ -1078,6 +1084,9 @@ if (
     MOCK_LATEST='v9.9.13'
     download() {
         local url="$1" output="$2"
+        if [[ "$url" == */SHA256SUMS.bundle* ]]; then
+            return 1
+        fi
         if [[ "$url" == */SHA256SUMS ]]; then
             printf '%s  meridian-linux-amd64\n' "$(sha256_file "$retry_failing_binary")" > "$output"
             return

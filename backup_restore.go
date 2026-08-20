@@ -583,13 +583,20 @@ func backupHasTelegramToken(database []byte) (bool, error) {
 		return false, err
 	}
 	defer db.Close()
-	var telegramCiphertext string
-	if err := db.QueryRow("SELECT bot_token_ciphertext FROM telegram_report_settings WHERE id=1").Scan(&telegramCiphertext); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	var telegramCiphertext, acmeCiphertext string
+	if exists, err := backupSQLiteColumnExists(db, "telegram_report_settings", "bot_token_ciphertext"); err != nil {
 		return false, err
+	} else if exists {
+		if err := db.QueryRow("SELECT bot_token_ciphertext FROM telegram_report_settings WHERE id=1").Scan(&telegramCiphertext); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return false, err
+		}
 	}
-	var acmeCiphertext string
-	if err := db.QueryRow("SELECT acme_token_ciphertext FROM panel_settings WHERE id=1").Scan(&acmeCiphertext); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if exists, err := backupSQLiteColumnExists(db, "panel_settings", "acme_token_ciphertext"); err != nil {
 		return false, err
+	} else if exists {
+		if err := db.QueryRow("SELECT acme_token_ciphertext FROM panel_settings WHERE id=1").Scan(&acmeCiphertext); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return false, err
+		}
 	}
 	return telegramCiphertext != "" || acmeCiphertext != "", nil
 }

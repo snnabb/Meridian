@@ -258,6 +258,23 @@ func (c *assetCache) clear() error {
 	return nil
 }
 
+func (c *assetCache) clearSite(siteID int64) error {
+	if c == nil || siteID <= 0 {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	root, err := c.openRoot(false)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer root.Close()
+	return root.RemoveAll(strconv.FormatInt(siteID, 10))
+}
+
 func (c *assetCache) read(req *assetCacheRequest, now time.Time) (*assetCacheHit, error) {
 	if c == nil || req == nil {
 		return nil, nil
@@ -373,6 +390,7 @@ func (c *assetCache) write(site Site, req *assetCacheRequest, resp *http.Respons
 	}
 	if err := root.Rename(metaTmp, req.metaName); err != nil {
 		_ = root.Remove(metaTmp)
+		_ = root.Remove(req.bodyName)
 		return err
 	}
 	return c.enforceBudgetLocked(root, site)

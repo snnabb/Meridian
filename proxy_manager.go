@@ -30,6 +30,7 @@ type ProxyInstance struct {
 	lifecycleMu     sync.Mutex
 	closing         bool
 	activeRequests  sync.WaitGroup
+	drainDone       chan struct{}
 	activeHTTP      map[*http.ResponseController]struct{}
 	hijackedConns   map[net.Conn]struct{}
 	portServing     atomic.Bool
@@ -39,6 +40,7 @@ type ProxyInstance struct {
 	// Lock order is pm.mu -> trafficMu; helpers that take trafficMu (e.g.
 	// flushProxyTraffic) must never be called from code that already holds it.
 	trafficMu            sync.Mutex
+	quota                *trafficQuotaState
 	bytesIn              atomic.Int64
 	bytesOut             atomic.Int64
 	cumulativeBytesIn    atomic.Int64
@@ -222,6 +224,15 @@ func (inst *ProxyInstance) shutdown(ctx context.Context) error {
 		_ = controller.SetReadDeadline(now)
 		_ = controller.SetWriteDeadline(now)
 	}
+	if inst.drainDone == nil {
+		inst.drainDone = make(chan struct{})
+		drainDone := inst.drainDone
+		go func() {
+			inst.activeRequests.Wait()
+			close(drainDone)
+		}()
+	}
+	drained := inst.drainDone
 	inst.lifecycleMu.Unlock()
 
 	if inst.listener != nil {
@@ -237,11 +248,6 @@ func (inst *ProxyInstance) shutdown(ctx context.Context) error {
 		_ = conn.Close()
 	}
 
-	drained := make(chan struct{})
-	go func() {
-		inst.activeRequests.Wait()
-		close(drained)
-	}()
 	select {
 	case <-drained:
 		if inst.dynamicState != nil {
@@ -322,6 +328,16 @@ func (pm *ProxyManager) ClearAssetCache() error {
 		return nil
 	}
 	return cache.clear()
+}
+
+func (pm *ProxyManager) ClearSiteAssetCache(siteID int64) error {
+	pm.mu.RLock()
+	cache := pm.assetCache
+	pm.mu.RUnlock()
+	if cache == nil {
+		return nil
+	}
+	return cache.clearSite(siteID)
 }
 
 func (pm *ProxyManager) DynamicDiscoveryAvailable() bool {

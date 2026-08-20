@@ -1046,6 +1046,9 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.pm.UnregisterSiteHost(id)
+		if err := a.pm.ClearSiteAssetCache(id); err != nil {
+			log.Printf("[%d] site asset cache cleanup failed: %v", id, err)
+		}
 		a.jsonOK(w, map[string]string{"status": "deleted"})
 
 	default:

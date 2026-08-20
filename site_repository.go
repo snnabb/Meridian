@@ -510,6 +510,9 @@ func (d *DB) DeleteSite(id int64) error {
 	if _, err := tx.Exec("DELETE FROM request_logs WHERE site_id=?", id); err != nil {
 		return err
 	}
+	if _, err := tx.Exec("DELETE FROM traffic_minute_logs WHERE site_id=?", id); err != nil {
+		return err
+	}
 	if _, err := tx.Exec("DELETE FROM sites WHERE id=?", id); err != nil {
 		return err
 	}

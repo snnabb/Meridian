@@ -195,7 +195,7 @@ func readPasswordLine(input io.Reader) (string, error) {
 func panelListenAddress(bindAddress string, port int) (string, error) {
 	bindAddress = strings.TrimSpace(bindAddress)
 	if bindAddress == "" {
-		bindAddress = "0.0.0.0"
+		bindAddress = "127.0.0.1"
 	}
 	if net.ParseIP(bindAddress) == nil {
 		return "", fmt.Errorf("PANEL_BIND_ADDR must be an IP address, got %q", bindAddress)

@@ -1569,6 +1569,12 @@ func TestSecurityHeaders(t *testing.T) {
 	if got := rr.Header().Get("X-Frame-Options"); got != "DENY" {
 		t.Fatalf("X-Frame-Options = %q, want DENY", got)
 	}
+	secureReq := httptest.NewRequest(http.MethodGet, "https://panel.example.com/", nil)
+	secureRR := httptest.NewRecorder()
+	handler.ServeHTTP(secureRR, secureReq)
+	if got := secureRR.Header().Get("Strict-Transport-Security"); got != "max-age=31536000; includeSubDomains" {
+		t.Fatalf("Strict-Transport-Security = %q, want HSTS on HTTPS", got)
+	}
 }
 
 func TestHandleAuthCheckExposesSingleAdminModeBeforeSetup(t *testing.T) {
@@ -2113,6 +2119,31 @@ func TestJWTSecretRotationInvalidatesExistingToken(t *testing.T) {
 	}
 }
 
+func TestInvalidateAllSessionsPersistsEpochAndRejectsExistingToken(t *testing.T) {
+	app := newTestApp(t)
+	setSessionGeneration(1)
+	originalSecret := jwtSecret
+	jwtSecret = []byte("session-epoch-test-secret-000000000000")
+	t.Cleanup(func() { jwtSecret = originalSecret })
+	token, err := generateToken(1, "admin")
+	if err != nil {
+		t.Fatalf("generateToken: %v", err)
+	}
+	if err := app.db.InvalidateAllSessions(); err != nil {
+		t.Fatalf("InvalidateAllSessions: %v", err)
+	}
+	if _, _, err := validateToken(token); err == nil {
+		t.Fatal("token remained valid after session epoch invalidation")
+	}
+	epoch, err := app.db.SessionEpoch()
+	if err != nil {
+		t.Fatalf("SessionEpoch: %v", err)
+	}
+	if epoch < 2 {
+		t.Fatalf("persisted session epoch = %d, want at least 2", epoch)
+	}
+}
+
 func TestSessionIdentityIgnoresInvalidSameNameCookieShadow(t *testing.T) {
 	token, err := generateToken(7, "admin")
 	if err != nil {
@@ -2133,7 +2164,7 @@ func TestPanelListenAddressSeparatesPanelFromSiteListeners(t *testing.T) {
 		port int
 		want string
 	}{
-		{name: "default", port: 9090, want: "0.0.0.0:9090"},
+		{name: "default", port: 9090, want: "127.0.0.1:9090"},
 		{name: "loopback", bind: "127.0.0.1", port: 9090, want: "127.0.0.1:9090"},
 		{name: "ipv6", bind: "::1", port: 9090, want: "[::1]:9090"},
 	} {
@@ -2159,7 +2190,7 @@ func TestPanelListenAddressSeparatesPanelFromSiteListeners(t *testing.T) {
 }
 
 func TestPanelListenerSpecsUseBothIPVersionsForWildcard(t *testing.T) {
-	for _, bind := range []string{"", "0.0.0.0", "::"} {
+	for _, bind := range []string{"0.0.0.0", "::"} {
 		specs, err := panelListenerSpecs(bind, 9090)
 		if err != nil {
 			t.Fatalf("panelListenerSpecs(%q): %v", bind, err)

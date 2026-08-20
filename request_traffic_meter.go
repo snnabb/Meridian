@@ -1,9 +1,20 @@
 package main
 
 import (
+	"context"
 	"sync"
 	"time"
 )
+
+type requestTrafficMeterContextKey struct{}
+
+func requestTrafficMeterFromContext(ctx context.Context) *requestTrafficMeter {
+	if ctx == nil {
+		return nil
+	}
+	meter, _ := ctx.Value(requestTrafficMeterContextKey{}).(*requestTrafficMeter)
+	return meter
+}
 
 type requestTrafficMeter struct {
 	inst          *ProxyInstance
@@ -115,6 +126,7 @@ func (m *requestTrafficMeter) finish(at time.Time) {
 		m.localIn, m.localOut = 0, 0
 	}
 	m.inst.reqCount.Add(1)
+	m.inst.pendingRequests.Add(1)
 	m.mu.Unlock()
 	m.inst.activeTrafficMeters.Add(-1)
 }

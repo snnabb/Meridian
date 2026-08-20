@@ -113,6 +113,9 @@ validate_secret SETUP_TOKEN "$setup"
 [ "$setup" != "$jwt" ] || fail "SETUP_TOKEN must differ from JWT_SECRET"
 [ "$setup" != "$upstream" ] || fail "SETUP_TOKEN must differ from UPSTREAM_HEADER_KEY"
 [ "$setup" != "$dynamic" ] || fail "SETUP_TOKEN must differ from DYNAMIC_ROUTE_KEY"
+[ "$credential" != "$jwt" ] || fail "MERIDIAN_SECRET_KEY must differ from JWT_SECRET"
+[ "$credential" != "$upstream" ] || fail "MERIDIAN_SECRET_KEY must differ from UPSTREAM_HEADER_KEY"
+[ "$credential" != "$dynamic" ] || fail "MERIDIAN_SECRET_KEY must differ from DYNAMIC_ROUTE_KEY"
 
 umask 077
 mkdir -p "$data_dir"

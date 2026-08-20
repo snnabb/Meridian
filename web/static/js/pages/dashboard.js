@@ -6,6 +6,7 @@ let dashboardTrendState = { siteId: 'all', range: 'realtime', customStart: '', c
 let dashboardTrendCharts = new Map();
 let dashboardTrendData = null;
 let dashboardSites = [];
+let dashboardTrendRequestGeneration = 0;
 let dashboardSpeedSamples = new Map();
 let dashboardLiveSpeeds = new Map();
 let dashboardRealtimeTrendSamples = new Map();
@@ -632,14 +633,23 @@ function setupDashboardTrendControls() {
 }
 
 async function loadDashboardTrends() {
+  const generation = ++dashboardTrendRequestGeneration;
+  const requestState = {
+    siteId: dashboardTrendState.siteId,
+    range: dashboardTrendState.range,
+    customStart: dashboardTrendState.customStart,
+    customEnd: dashboardTrendState.customEnd,
+  };
   try {
     const data = await API.dashboardTrends(
-      dashboardTrendState.siteId,
-      dashboardTrendState.range,
-      dashboardTrendState.customStart,
-      dashboardTrendState.customEnd,
+      requestState.siteId,
+      requestState.range,
+      requestState.customStart,
+      requestState.customEnd,
     );
-    if (!data || Router.current !== 'dashboard') return;
+    if (!data || Router.current !== 'dashboard' || generation !== dashboardTrendRequestGeneration ||
+        requestState.siteId !== dashboardTrendState.siteId || requestState.range !== dashboardTrendState.range ||
+        requestState.customStart !== dashboardTrendState.customStart || requestState.customEnd !== dashboardTrendState.customEnd) return;
     if (typeof meridianSetTimezoneName === 'function' && data.timezone) meridianSetTimezoneName(data.timezone);
     if (typeof meridianSetTimezoneOffset === 'function') meridianSetTimezoneOffset(data.timezone_offset_minutes);
     const timezone = document.getElementById('dashboard-trend-timezone');

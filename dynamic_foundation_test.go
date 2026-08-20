@@ -714,6 +714,9 @@ func TestDynamicRollbackReadinessCountsArePrivacySafe(t *testing.T) {
 
 func TestDynamicProfilesEndpointIsAuthenticatedAndDoesNotDiscloseKey(t *testing.T) {
 	app := newTestApp(t)
+	if _, err := app.db.CreateInitialUser("admin", "test-password-123456"); err != nil {
+		t.Fatalf("create test administrator: %v", err)
+	}
 	secret := strings.Repeat("dynamic-route-secret-", 2)
 	key, err := resolveDynamicRouteKey(secret)
 	if err != nil {

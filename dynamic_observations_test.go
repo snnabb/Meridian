@@ -1266,6 +1266,9 @@ func TestDynamicObservationSiteDeleteCleansChildrenAndDropsOrphans(t *testing.T)
 
 func TestDynamicObservationAPIAuthAndExactPrivateEnvelope(t *testing.T) {
 	app := newTestApp(t)
+	if _, err := app.db.CreateInitialUser("observation-admin", "test-password-123456"); err != nil {
+		t.Fatalf("create test administrator: %v", err)
+	}
 	site, err := app.db.CreateSite(
 		"observation-api",
 		19001,
