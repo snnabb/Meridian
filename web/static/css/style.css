@@ -4404,7 +4404,7 @@ html {
 .request-log-filter-row {
   gap: 12px;
   margin-top: 10px;
-  padding-top: 0;
+  padding: 10px 0;
 }
 
 .request-log-filter-label {
@@ -4416,10 +4416,15 @@ html {
 }
 
 .request-log-pill {
-  min-height: 34px;
-  padding: 6px 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  padding: 7px 16px;
   border-radius: 8px;
   font-size: 14px;
+  line-height: 1.2;
+  text-align: center;
 }
 
 .request-log-actions {

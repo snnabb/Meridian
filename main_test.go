@@ -6715,7 +6715,13 @@ func TestReservedDynamicRouteReturnsNotFoundWithoutProxying(t *testing.T) {
 	if !configured || handler == nil {
 		t.Fatal("host handler not registered")
 	}
-	for _, requestPath := range []string{"/_meridian/d", "/_meridian/d/stale-token", "/emby/_meridian/d", "/emby/_meridian/d/stale-token"} {
+	for _, requestPath := range []string{
+		"/_meridian/d",
+		"/_meridian/d/stale-token",
+		"/emby/_meridian/d",
+		"/emby/_meridian/d/stale-token",
+		"/jellyfin/_meridian/d/stale-token",
+	} {
 		rr := httptest.NewRecorder()
 		handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, requestPath, nil))
 		if rr.Code != http.StatusNotFound {
@@ -6724,6 +6730,35 @@ func TestReservedDynamicRouteReturnsNotFoundWithoutProxying(t *testing.T) {
 	}
 	if got := upstreamCalls.Load(); got != 0 {
 		t.Fatalf("reserved dynamic route reached upstream %d times", got)
+	}
+}
+
+func TestNormalizeEmbeddedDynamicCapabilityRequestPath(t *testing.T) {
+	for _, test := range []struct {
+		path       string
+		wantPath   string
+		normalized bool
+	}{
+		{path: "/emby/_meridian/d/token", wantPath: "/_meridian/d/token", normalized: true},
+		{path: "/jellyfin/_meridian/d/token", wantPath: "/_meridian/d/token", normalized: true},
+		{path: "/EMBY/_meridian/d/token", wantPath: "/_meridian/d/token", normalized: true},
+		{path: "/emby/_meridian/d", wantPath: "/_meridian/d", normalized: true},
+		{path: "/emby/api/Items", wantPath: "/emby/api/Items", normalized: false},
+		{path: "/emby/_meridian/debug", wantPath: "/emby/_meridian/debug", normalized: false},
+		{path: "/other/emby/_meridian/d/token", wantPath: "/other/emby/_meridian/d/token", normalized: false},
+	} {
+		t.Run(test.path, func(t *testing.T) {
+			requestURL := &url.URL{Path: test.path, RawPath: test.path}
+			if got := normalizeEmbeddedDynamicCapabilityRequestPath(requestURL); got != test.normalized {
+				t.Fatalf("normalized=%v, want %v", got, test.normalized)
+			}
+			if requestURL.Path != test.wantPath {
+				t.Fatalf("path=%q, want %q", requestURL.Path, test.wantPath)
+			}
+			if test.normalized && requestURL.RawPath != "" {
+				t.Fatalf("normalized RawPath=%q, want empty", requestURL.RawPath)
+			}
+		})
 	}
 }
 

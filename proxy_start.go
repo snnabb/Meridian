@@ -316,6 +316,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			return
 		}
 		defer inst.endHTTPRequest(requestController)
+		normalizeEmbeddedDynamicCapabilityRequestPath(r.URL)
 		clientRequestContext := r.Context()
 		requestLogWriter := &requestLogResponseWriter{ResponseWriter: w}
 		requestLogEntry := newRequestLogEvent(site, r, inst.trustedProxies, policy)

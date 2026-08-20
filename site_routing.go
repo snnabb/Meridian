@@ -530,6 +530,29 @@ func isReservedDynamicRoute(requestPath string) bool {
 	return normalizeDynamicCapabilityPath(requestPath) != ""
 }
 
+// normalizeEmbeddedDynamicCapabilityRequestPath accepts the reserved dynamic
+// route when an Emby/Jellyfin client prepends the server's application Base
+// URL. Some servers advertise /emby or /jellyfin even though Meridian's
+// capability route is rooted at /_meridian/d/. Only the reserved namespace is
+// normalized; ordinary application requests keep their original paths.
+func normalizeEmbeddedDynamicCapabilityRequestPath(requestURL *url.URL) bool {
+	if requestURL == nil || requestURL.Path == "" {
+		return false
+	}
+	for _, appBase := range []string{"/emby", "/jellyfin"} {
+		embeddedRoot := appBase + strings.TrimSuffix(dynamicRoutePrefix, "/")
+		embeddedPrefix := appBase + dynamicRoutePrefix
+		if !strings.EqualFold(requestURL.Path, embeddedRoot) &&
+			(len(requestURL.Path) < len(embeddedPrefix) || !strings.EqualFold(requestURL.Path[:len(embeddedPrefix)], embeddedPrefix)) {
+			continue
+		}
+		requestURL.Path = requestURL.Path[len(appBase):]
+		requestURL.RawPath = ""
+		return true
+	}
+	return false
+}
+
 func requestPublicHost(hostport string) string {
 	hostport = strings.TrimSpace(hostport)
 	if hostport == "" || strings.HasPrefix(hostport, "[") {
