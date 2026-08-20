@@ -128,6 +128,8 @@ func validateCredentialKeySeparation(credential []byte, configured bool, effecti
 	if len(effectiveJWT) > 0 && subtle.ConstantTimeCompare(credential, effectiveJWT) == 1 {
 		return fmt.Errorf("MERIDIAN_SECRET_KEY must differ from JWT_SECRET")
 	}
+	// codeql[go/weak-cryptographic-algorithm] -- SHA-256 is used only for
+	// deterministic key-separation comparisons, never for password storage.
 	digest := sha256.Sum256(credential)
 	if len(dynamicKey) == len(digest) && subtle.ConstantTimeCompare(digest[:], dynamicKey) == 1 {
 		return fmt.Errorf("MERIDIAN_SECRET_KEY must differ from DYNAMIC_ROUTE_KEY")
