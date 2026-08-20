@@ -500,7 +500,7 @@ detect_platform() { printf 'linux-amd64\n'; }
 download() {
     local url="$1" output="$2" version
     version=$(printf '%s' "$url" | awk -F/ '{print $(NF-1)}')
-    if [[ "$url" == */SHA256SUMS.bundle ]]; then
+    if [[ "$url" == */SHA256SUMS.bundle* ]]; then
         return 1
     fi
     if [[ "$url" == */SHA256SUMS ]]; then
