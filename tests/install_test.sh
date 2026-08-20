@@ -752,6 +752,9 @@ if (
     MOCK_LATEST='v9.9.12'
     download() {
         local url="$1" output="$2"
+        if [[ "$url" == */SHA256SUMS.bundle* ]]; then
+            return 1
+        fi
         if [[ "$url" == */SHA256SUMS ]]; then
             printf '%s  meridian-linux-amd64\n' "$(sha256_file "$failing_binary")" > "$output"
             return
@@ -762,11 +765,7 @@ if (
 ) >"${TEST_ROOT}/update-rollback.log" 2>&1; then
     echo 'FAIL: failing update unexpectedly succeeded' >&2; exit 1
 fi
-if ! grep -Fq -- '自动回滚' "${TEST_ROOT}/update-rollback.log"; then
-    cat "${TEST_ROOT}/update-rollback.log" >&2
-    echo 'FAIL: update rollback log did not contain automatic rollback status' >&2
-    exit 1
-fi
+assert_contains "${TEST_ROOT}/update-rollback.log" '自动回滚'
 assert_eq 'v9.9.11' "$(get_current_version)" 'rollback must restore the previous binary'
 # The restored DATA_DIR is owned by the service user (0750, db 0600,
 # .env root:meridian 0640), so a non-root runner cannot read it directly.
@@ -1085,6 +1084,9 @@ if (
     MOCK_LATEST='v9.9.13'
     download() {
         local url="$1" output="$2"
+        if [[ "$url" == */SHA256SUMS.bundle* ]]; then
+            return 1
+        fi
         if [[ "$url" == */SHA256SUMS ]]; then
             printf '%s  meridian-linux-amd64\n' "$(sha256_file "$retry_failing_binary")" > "$output"
             return
