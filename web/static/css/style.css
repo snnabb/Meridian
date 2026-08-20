@@ -4404,7 +4404,7 @@ html {
 .request-log-filter-row {
   gap: 12px;
   margin-top: 10px;
-  padding-top: 0;
+  padding: 10px 0;
 }
 
 .request-log-filter-label {
@@ -4416,10 +4416,15 @@ html {
 }
 
 .request-log-pill {
-  min-height: 34px;
-  padding: 6px 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  padding: 7px 16px;
   border-radius: 8px;
   font-size: 14px;
+  line-height: 1.2;
+  text-align: center;
 }
 
 .request-log-actions {
@@ -4841,7 +4846,7 @@ html {
 .dashboard-trend-apply { min-height: 42px; white-space: nowrap; }
 .dashboard-trend-custom-error { flex: 1 0 100%; margin: -4px 0 0; color: var(--red); font-size: 12px; text-align: right; }
 .dashboard-trend-custom[hidden], .dashboard-trend-custom-error[hidden] { display: none !important; }
-.dashboard-trend-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-top: 14px; }
+.dashboard-trend-grid { position: relative; z-index: 3; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-top: 14px; }
 .dashboard-trend-grid .dashboard-trend-card { min-width: 0; margin-top: 0; padding: 16px; }
 .dashboard-trend-grid .dashboard-trend-wrap { position: relative; height: clamp(210px, 22vw, 290px); min-height: 210px; }
 .dashboard-trend-grid canvas { display: block; width: 100%; height: 100%; max-width: 100%; cursor: default; touch-action: none; }
@@ -4850,6 +4855,7 @@ html {
 .dashboard-chart-tooltip-row + .dashboard-chart-tooltip-row { margin-top: 3px; padding-top: 3px; border-top: 1px solid var(--panel-border); }
 .dashboard-chart-tooltip-row strong { color: var(--white-87); font-weight: 700; }
 .dashboard-chart-tooltip-row span { color: var(--white-70); text-align: right; white-space: nowrap; }
+.dashboard-insights-grid, .dashboard-site-status { position: relative; z-index: 1; }
 .dashboard-site-status { margin-top: 18px; }
 @media (max-width: 768px) {
   .sidebar-drawer-close { position: absolute; top: 16px; right: 10px; z-index: 3; display: grid; place-items: center; width: 36px; height: 36px; border: 1px solid var(--panel-border); border-radius: 9px; background: var(--panel); color: var(--white-60); }
@@ -5278,7 +5284,7 @@ html { font-size: 15px; }
 .request-log-backend { white-space: normal; overflow-wrap: anywhere; line-height: 1.35; }
 .request-log-time { display: block; overflow: hidden; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
 
-.dashboard-trend-card { min-width: 0; overflow: hidden; }
+.dashboard-trend-card { min-width: 0; overflow: visible; }
 .dashboard-trend-wrap { width: 100%; height: clamp(210px, 28vw, 360px); min-height: 210px; max-height: 360px; }
 #dashboardRequestTrend { display: block; width: 100% !important; height: 100% !important; max-width: 100%; }
 .dashboard-trend-note { display: none; }

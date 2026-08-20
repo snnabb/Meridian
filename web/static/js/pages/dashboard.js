@@ -180,6 +180,18 @@ function dashboardTrendPointerState(rect, geometry, event, pointCount) {
   return { x, y, index };
 }
 
+function dashboardTrendPointerInside(rect, event) {
+  if (!rect || !event) return false;
+  const x = Number(event.clientX);
+  const y = Number(event.clientY);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+  const left = Number(rect.left) || 0;
+  const top = Number(rect.top) || 0;
+  const right = Number.isFinite(Number(rect.right)) ? Number(rect.right) : left + (Number(rect.width) || 0);
+  const bottom = Number.isFinite(Number(rect.bottom)) ? Number(rect.bottom) : top + (Number(rect.height) || 0);
+  return x >= left && x <= right && y >= top && y <= bottom;
+}
+
 function dashboardTooltipPosition(pointerX, pointerY, wrapWidth, wrapHeight, tooltipWidth, tooltipHeight) {
   const width = Math.max(1, Number(wrapWidth) || 1);
   const height = Math.max(1, Number(wrapHeight) || 1);
@@ -187,13 +199,30 @@ function dashboardTooltipPosition(pointerX, pointerY, wrapWidth, wrapHeight, too
   const cardHeight = Math.max(1, Number(tooltipHeight) || 56);
   const gap = 14;
   const padding = 6;
-  let left = pointerX + gap;
-  if (left + cardWidth > width - padding) left = pointerX - cardWidth - gap;
-  left = Math.max(padding, Math.min(Math.max(padding, width - cardWidth - padding), left));
-  let top = pointerY - cardHeight - gap;
-  if (top < padding) top = pointerY + gap;
-  top = Math.max(padding, Math.min(Math.max(padding, height - cardHeight - padding), top));
-  return { left, top };
+  const rightSpace = width - pointerX - gap - padding;
+  const leftSpace = pointerX - gap - padding;
+  const clampLeft = left => Math.max(padding, Math.min(Math.max(padding, width - cardWidth - padding), left));
+
+  // Keep the tooltip beside the pointer whenever possible. This avoids
+  // covering the pointer even when the contents contain many site rows.
+  if (rightSpace >= cardWidth) {
+    let top = pointerY - cardHeight - gap;
+    if (top < padding) top = pointerY + gap;
+    return { left: clampLeft(pointerX + gap), top };
+  }
+  if (leftSpace >= cardWidth) {
+    let top = pointerY - cardHeight - gap;
+    if (top < padding) top = pointerY + gap;
+    return { left: clampLeft(pointerX - cardWidth - gap), top };
+  }
+
+  // If neither side has enough room, place the full card above or below the
+  // pointer. It is intentionally allowed to overflow the chart wrapper so
+  // long all-site tooltips keep all rows visible without covering the pointer.
+  const aboveSpace = Math.max(0, pointerY - gap - padding);
+  const belowSpace = Math.max(0, height - pointerY - gap - padding);
+  const below = belowSpace >= aboveSpace;
+  return { left: clampLeft(pointerX - cardWidth / 2), top: below ? pointerY + gap : pointerY - cardHeight - gap };
 }
 
 function dashboardTrendTimeLabel(timestamp, range) {
@@ -550,6 +579,13 @@ function setupDashboardTrendControls() {
       const points = dashboardTrendPoints();
       if (!points.length) return;
       const rect = canvas.getBoundingClientRect();
+      // Touch pointer capture continues delivering pointermove events after
+      // the finger leaves the canvas. Do not clamp those events to the edge:
+      // hide the tooltip until the finger comes back into the chart.
+      if (event.pointerType !== 'mouse' && !dashboardTrendPointerInside(rect, event)) {
+        clearHover();
+        return;
+      }
       const geometry = chart.geometry || { width: rect.width, height: rect.height, left: 0, top: 0, plotW: rect.width, plotH: rect.height };
       const pointer = dashboardTrendPointerState(rect, geometry, event, points.length);
       chart.hoverIndex = pointer.index;
@@ -590,9 +626,7 @@ function setupDashboardTrendControls() {
     canvas.addEventListener('pointercancel', clearHover);
     canvas.addEventListener('pointerleave', event => {
       if (event.pointerType !== 'mouse') return;
-      chart.hoverIndex = -1; chart.hoverX = null; chart.hoverY = null;
-      if (tooltip) tooltip.hidden = true;
-      drawDashboardTrendChart(metric);
+      clearHover();
     });
   });
 }
@@ -812,7 +846,7 @@ function updateDashboardSiteSpeeds(liveSites) {
       bytes_in: bytesIn,
       bytes_out: bytesOut,
       requests: dashboardSafeNonNegative(sample?.requests),
-      traffic_bytes: dashboardTrendData?.billing_mode === 'outbound' ? bytesOut : bytesIn + bytesOut,
+      traffic_bytes: dashboardTrendData?.billing_mode === 'outbound' ? bytesOut : 2 * (bytesIn + bytesOut),
     });
     // Keep the active dashboard session responsive without imposing a time
     // window; the X axis adapts to however many samples are available.
@@ -831,7 +865,9 @@ function updateDashboardSiteSpeeds(liveSites) {
       bytes_in: dashboardSafeNonNegative(delta.bytesIn),
       bytes_out: dashboardSafeNonNegative(delta.bytesOut),
       requests: dashboardSafeNonNegative(delta.requests),
-      traffic_bytes: dashboardTrendData?.billing_mode === 'outbound' ? dashboardSafeNonNegative(delta.bytesOut) : dashboardSafeNonNegative(delta.bytesIn) + dashboardSafeNonNegative(delta.bytesOut),
+      traffic_bytes: dashboardTrendData?.billing_mode === 'outbound'
+        ? dashboardSafeNonNegative(delta.bytesOut)
+        : 2 * (dashboardSafeNonNegative(delta.bytesIn) + dashboardSafeNonNegative(delta.bytesOut)),
     });
     dashboardRealtimeTrendSiteSamples.set(String(siteID), siteSamples.slice(-1800));
   }

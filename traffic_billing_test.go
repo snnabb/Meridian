@@ -57,8 +57,8 @@ func TestTrafficCycleUsageRespectsSiteAndBillingMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("outbound cycle usage: %v", err)
 	}
-	if dual != 400 || outbound != 300 {
-		t.Fatalf("cycle usage = dual %d outbound %d, want 400/300", dual, outbound)
+	if dual != 800 || outbound != 300 {
+		t.Fatalf("cycle usage = dual %d outbound %d, want 800/300", dual, outbound)
 	}
 }
 
@@ -93,8 +93,8 @@ func TestDisabledTrafficResetUsesAllPersistedUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sum no-reset usage: %v", err)
 	}
-	if usage != 400 {
-		t.Fatalf("no-reset usage = %d, want all-time 400", usage)
+	if usage != 800 {
+		t.Fatalf("no-reset usage = %d, want all-time 800", usage)
 	}
 }
 
@@ -111,8 +111,8 @@ func TestTrafficBillingModeAppliesToAllTrafficSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dual snapshot: %v", err)
 	}
-	if dual.TotalTraffic != 400 || dual.BillingMode != trafficBillingModeBidirectional {
-		t.Fatalf("dual snapshot = %+v, want 400 bidirectional", dual)
+	if dual.TotalTraffic != 800 || dual.BillingMode != trafficBillingModeBidirectional {
+		t.Fatalf("dual snapshot = %+v, want 800 bidirectional", dual)
 	}
 
 	settings := app.db.currentSystemSettings()
@@ -165,8 +165,8 @@ func TestCurrentTrafficCycleUsageCachesPersistedAndTracksFlushes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current usage: %v", err)
 	}
-	if usage != 330 {
-		t.Fatalf("current usage = %d, want 330", usage)
+	if usage != 660 {
+		t.Fatalf("current usage = %d, want 660", usage)
 	}
 	if err := app.pm.flushProxyTraffic(inst); err != nil {
 		t.Fatalf("flush traffic: %v", err)
@@ -175,8 +175,8 @@ func TestCurrentTrafficCycleUsageCachesPersistedAndTracksFlushes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("usage after flush: %v", err)
 	}
-	if usage != 330 {
-		t.Fatalf("usage after flush = %d, want 330 without double counting", usage)
+	if usage != 660 {
+		t.Fatalf("usage after flush = %d, want 660 without double counting", usage)
 	}
 
 	settings := app.db.currentSystemSettings()
@@ -190,5 +190,25 @@ func TestCurrentTrafficCycleUsageCachesPersistedAndTracksFlushes(t *testing.T) {
 	}
 	if usage != 220 {
 		t.Fatalf("outbound usage = %d, want 220", usage)
+	}
+}
+
+func TestTrafficBillableBytesCountsBothVPSNetworkLegs(t *testing.T) {
+	videoBytes := int64(784) * (1 << 30) / 100
+	if got := trafficBillableBytes(trafficBillingModeBidirectional, 0, videoBytes); got != videoBytes*2 {
+		t.Fatalf("bidirectional 7.84 GiB video = %d, want %d", got, videoBytes*2)
+	}
+	if got := trafficBillableBytes(trafficBillingModeOutbound, 0, videoBytes); got != videoBytes {
+		t.Fatalf("outbound 7.84 GiB video = %d, want %d", got, videoBytes)
+	}
+}
+
+func TestTrafficBillableBytesClampsInvalidAndOverflowingCounters(t *testing.T) {
+	if got := trafficBillableBytes(trafficBillingModeBidirectional, -10, 5); got != 10 {
+		t.Fatalf("negative input clamp = %d, want 10", got)
+	}
+	maxInt64 := int64(^uint64(0) >> 1)
+	if got := trafficBillableBytes(trafficBillingModeBidirectional, maxInt64, 1); got != maxInt64 {
+		t.Fatalf("overflow result = %d, want saturated %d", got, maxInt64)
 	}
 }
