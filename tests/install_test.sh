@@ -762,7 +762,11 @@ if (
 ) >"${TEST_ROOT}/update-rollback.log" 2>&1; then
     echo 'FAIL: failing update unexpectedly succeeded' >&2; exit 1
 fi
-assert_contains "${TEST_ROOT}/update-rollback.log" '自动回滚'
+if ! grep -Fq -- '自动回滚' "${TEST_ROOT}/update-rollback.log"; then
+    cat "${TEST_ROOT}/update-rollback.log" >&2
+    echo 'FAIL: update rollback log did not contain automatic rollback status' >&2
+    exit 1
+fi
 assert_eq 'v9.9.11' "$(get_current_version)" 'rollback must restore the previous binary'
 # The restored DATA_DIR is owned by the service user (0750, db 0600,
 # .env root:meridian 0640), so a non-root runner cannot read it directly.
