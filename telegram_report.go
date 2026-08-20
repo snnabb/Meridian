@@ -317,6 +317,7 @@ func (d *DB) telegramReportSettingsView() (telegramReportSettingsView, telegramR
 func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error) {
 	settings := d.currentSystemSettings()
 	location := timezoneLocationByName(settings.ScheduleTimezoneName, settings.ScheduleTimezone)
+	billingMode := settings.TrafficBillingMode
 	localNow := now.In(location)
 	todayStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, location)
 	tomorrow := todayStart.AddDate(0, 0, 1)
@@ -333,17 +334,13 @@ func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error
 	if err := d.db.QueryRow(`SELECT COALESCE(MAX(active_clients),0) FROM (SELECT COUNT(DISTINCT client_ip) AS active_clients FROM request_logs WHERE recorded_at_ms>=? AND recorded_at_ms<? GROUP BY CAST(recorded_at_ms/60000 AS INTEGER))`, todayStart.UnixMilli(), tomorrow.UnixMilli()).Scan(&stats.ActivePeak); err != nil {
 		return stats, err
 	}
-	trafficExpression := "bytes_in + bytes_out"
-	if trafficBillingModeLabel(settings.TrafficBillingMode) == trafficBillingModeOutbound {
-		trafficExpression = "bytes_out"
-	}
 	trafficSum := func(start time.Time) (int64, error) {
-		var value sql.NullInt64
-		err := d.db.QueryRow("SELECT SUM("+trafficExpression+") FROM traffic_logs WHERE recorded_at>=? AND recorded_at<?", trafficMinuteBucket(start), trafficMinuteBucket(tomorrow)).Scan(&value)
-		if err != nil || !value.Valid {
+		var bytesIn, bytesOut sql.NullInt64
+		err := d.db.QueryRow(`SELECT SUM(bytes_in), SUM(bytes_out) FROM traffic_logs WHERE recorded_at>=? AND recorded_at<?`, trafficMinuteBucket(start), trafficMinuteBucket(tomorrow)).Scan(&bytesIn, &bytesOut)
+		if err != nil || !bytesIn.Valid || !bytesOut.Valid {
 			return 0, err
 		}
-		return value.Int64, nil
+		return trafficBillableBytes(billingMode, bytesIn.Int64, bytesOut.Int64), nil
 	}
 	var err error
 	if stats.TodayTraffic, err = trafficSum(todayStart); err != nil {
@@ -355,9 +352,11 @@ func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error
 	if stats.ThirtyDayTraffic, err = trafficSum(todayStart.AddDate(0, 0, -29)); err != nil {
 		return stats, err
 	}
-	if err := d.db.QueryRow("SELECT COALESCE(SUM(" + trafficExpression + "),0) FROM traffic_logs").Scan(&stats.HistoryTraffic); err != nil {
+	var historyIn, historyOut int64
+	if err := d.db.QueryRow(`SELECT COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0) FROM traffic_logs`).Scan(&historyIn, &historyOut); err != nil {
 		return stats, err
 	}
+	stats.HistoryTraffic = trafficBillableBytes(billingMode, historyIn, historyOut)
 
 	requestRows, err := d.db.Query(`SELECT site_id, site_name, COUNT(*) FROM request_logs WHERE recorded_at_ms>=? AND recorded_at_ms<? GROUP BY site_id, site_name`, todayStart.UnixMilli(), tomorrow.UnixMilli())
 	if err != nil {
@@ -378,17 +377,18 @@ func (d *DB) buildTelegramReportStats(now time.Time) (telegramReportStats, error
 		return stats, err
 	}
 	requestRows.Close()
-	trafficRows, err := d.db.Query("SELECT traffic_logs.site_id, COALESCE(NULLIF(sites.name,''), '站点 ' || traffic_logs.site_id), COALESCE(SUM(traffic_logs."+trafficExpression+"),0) FROM traffic_logs LEFT JOIN sites ON sites.id=traffic_logs.site_id WHERE traffic_logs.recorded_at>=? AND traffic_logs.recorded_at<? GROUP BY traffic_logs.site_id, sites.name", trafficMinuteBucket(todayStart), trafficMinuteBucket(tomorrow))
+	trafficRows, err := d.db.Query(`SELECT traffic_logs.site_id, COALESCE(NULLIF(sites.name,''), '站点 ' || traffic_logs.site_id), COALESCE(SUM(traffic_logs.bytes_in),0), COALESCE(SUM(traffic_logs.bytes_out),0) FROM traffic_logs LEFT JOIN sites ON sites.id=traffic_logs.site_id WHERE traffic_logs.recorded_at>=? AND traffic_logs.recorded_at<? GROUP BY traffic_logs.site_id, sites.name`, trafficMinuteBucket(todayStart), trafficMinuteBucket(tomorrow))
 	if err != nil {
 		return stats, err
 	}
 	for trafficRows.Next() {
-		var id, traffic int64
+		var id, bytesIn, bytesOut int64
 		var name string
-		if err := trafficRows.Scan(&id, &name, &traffic); err != nil {
+		if err := trafficRows.Scan(&id, &name, &bytesIn, &bytesOut); err != nil {
 			trafficRows.Close()
 			return stats, err
 		}
+		traffic := trafficBillableBytes(billingMode, bytesIn, bytesOut)
 		if stat := requestBySite[id]; stat != nil {
 			stat.Traffic = traffic
 		} else {

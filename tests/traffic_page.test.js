@@ -467,6 +467,8 @@ test('dashboard live speed uses consecutive bidirectional SSE counters and rejec
   const html = elements['dash-table'].innerHTML;
   assert.ok(html.includes('↓ 512 KB/s'), html);
   assert.ok(html.includes('↑ 1 KB/s'), html);
+  const billedSample = vm.runInContext("dashboardRealtimeTrendSamples.get('all').at(-1).traffic_bytes", sandbox);
+  assert.equal(billedSample, 2 * (2048 + 1048576), 'bidirectional realtime traffic must count both VPS network legs');
 
   await vm.runInContext('loadDashboardTable()', sandbox);
   const refreshedHTML = elements['dash-table'].innerHTML;
@@ -546,6 +548,18 @@ test('dashboard trend pointer coordinates use the plot bounds and keep the cross
   assert.equal(right.index, 6, 'the last sample should be selected at the plot end');
 });
 
+test('dashboard trend touch pointers outside the canvas are treated as inactive', () => {
+  const { sandbox } = makeTrafficHarness();
+  assert.equal(vm.runInContext('dashboardTrendPointerInside({ left: 100, top: 50, right: 400, bottom: 250 }, { clientX: 250, clientY: 150 })', sandbox), true);
+  assert.equal(vm.runInContext('dashboardTrendPointerInside({ left: 100, top: 50, right: 400, bottom: 250 }, { clientX: 401, clientY: 150 })', sandbox), false);
+  assert.equal(vm.runInContext('dashboardTrendPointerInside({ left: 100, top: 50, right: 400, bottom: 250 }, { clientX: 250, clientY: 251 })', sandbox), false);
+  assert.equal(vm.runInContext('dashboardTrendPointerInside({ left: 100, top: 50, width: 300, height: 200 }, { clientX: 399, clientY: 249 })', sandbox), true);
+  const source = readScript('pages/dashboard.js');
+  assert.match(source, /event\.pointerType !== 'mouse' && !dashboardTrendPointerInside\(rect, event\)/);
+  assert.match(source, /canvas\.addEventListener\('pointerup',[\s\S]*?clearHover\(\);[\s\S]*?\}\);/);
+  assert.match(source, /Touch pointer capture continues delivering pointermove events/);
+});
+
 test('dashboard trend tooltip avoids the pointer and flips at chart edges', () => {
   const { sandbox } = makeTrafficHarness();
   const rightEdge = vm.runInContext('dashboardTooltipPosition(270, 100, 300, 200, 100, 50)', sandbox);
@@ -557,6 +571,20 @@ test('dashboard trend tooltip avoids the pointer and flips at chart edges', () =
   const css = readScript('../css/style.css');
   assert.match(css, /\.dashboard-chart-tooltip[^\n]*transform:\s*none/);
   assert.match(css, /\.dashboard-chart-tooltip[^\n]*pointer-events:\s*none/);
+  assert.match(css, /\.dashboard-trend-card\s*\{[^}]*overflow:\s*visible/);
+  assert.match(css, /\.dashboard-trend-grid\s*\{[^}]*position:\s*relative[^}]*z-index:\s*3/);
+  assert.match(css, /\.dashboard-insights-grid,\s*\.dashboard-site-status\s*\{[^}]*position:\s*relative[^}]*z-index:\s*1/);
+});
+
+test('dashboard trend tooltip keeps long content outside the pointer without clipping', () => {
+  const { sandbox } = makeTrafficHarness();
+  const middle = vm.runInContext('dashboardTooltipPosition(150, 100, 300, 200, 360, 300)', sandbox);
+  assert.equal(middle.top, 114, 'a long tooltip should move below a middle pointer');
+  assert.equal(middle.maxHeight, undefined, 'the tooltip should not receive a height limit');
+  assert.ok(middle.top >= 100 + 14, 'the tooltip should keep a gap below the pointer');
+  const top = vm.runInContext('dashboardTooltipPosition(150, 20, 300, 200, 360, 300)', sandbox);
+  assert.equal(top.top, 34, 'a top-edge pointer should use the space below it');
+  assert.equal(top.maxHeight, undefined, 'the tooltip should remain fully visible instead of scrolling');
 });
 
 test('dashboard zero-value trend scales never render negative or invalid labels', () => {

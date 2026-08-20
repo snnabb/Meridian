@@ -239,6 +239,15 @@ test('request log UA width slider stays compact', () => {
   assert.match(source, /\.request-log-ua-width-control input\[type="range"\]\s*\{[^}]*max-width:\s*220px;/s);
 });
 
+test('request log filter chips keep centered labels and balanced spacing', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'web', 'static', 'css', 'style.css'),
+    'utf8',
+  );
+  assert.match(source, /\.request-log-filter-row\s*\{[^}]*padding:\s*10px 0;/s);
+  assert.match(source, /\.request-log-pill\s*\{[^}]*display:\s*inline-flex;[^}]*align-items:\s*center;[^}]*justify-content:\s*center;[^}]*padding:\s*7px 16px;[^}]*text-align:\s*center;/s);
+});
+
 test('mobile request log table uses fixed readable columns without overlap', () => {
   const source = fs.readFileSync(
     path.join(__dirname, '..', 'web', 'static', 'css', 'style.css'),

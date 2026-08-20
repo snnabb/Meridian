@@ -21,7 +21,7 @@ type TrafficLog struct {
 
 // SiteTraffic is the authoritative per-site traffic state: the persisted
 // baseline plus in-memory pending bytes. TrafficUsed is always
-// PersistedTraffic + BytesIn + BytesOut (pending, not yet flushed).
+// the configured billing projection of persisted and pending raw directions.
 type SiteTraffic struct {
 	ID                 int64  `json:"id"`
 	Name               string `json:"name"`
@@ -168,28 +168,20 @@ func (d *DB) GetTrafficLogs(siteID int64, hours int) ([]TrafficLog, error) {
 // wall-clock buckets for backwards compatibility, so the comparison uses the
 // same text format as trafficMinuteBucket instead of UTC serialization.
 func (d *DB) SumTrafficSince(start time.Time, billingMode string) (int64, error) {
-	var total int64
-	expression := "bytes_in + bytes_out"
-	if trafficBillingModeLabel(billingMode) == trafficBillingModeOutbound {
-		expression = "bytes_out"
-	}
+	var bytesIn, bytesOut int64
 	err := d.db.QueryRow(
-		"SELECT COALESCE(SUM("+expression+"), 0) FROM traffic_logs WHERE recorded_at >= ?",
+		"SELECT COALESCE(SUM(bytes_in), 0), COALESCE(SUM(bytes_out), 0) FROM traffic_logs WHERE recorded_at >= ?",
 		start.In(time.Local).Format("2006-01-02 15:04:05"),
-	).Scan(&total)
-	return total, err
+	).Scan(&bytesIn, &bytesOut)
+	return trafficBillableBytes(billingMode, bytesIn, bytesOut), err
 }
 
 // SumTrafficSinceBySite returns the same billing-mode projection as
 // SumTrafficSince, grouped by site so dashboards can show each node's current
 // month usage without issuing one query per site.
 func (d *DB) SumTrafficSinceBySite(start time.Time, billingMode string) (map[int64]int64, error) {
-	expression := "bytes_in + bytes_out"
-	if trafficBillingModeLabel(billingMode) == trafficBillingModeOutbound {
-		expression = "bytes_out"
-	}
 	rows, err := d.db.Query(
-		"SELECT site_id, COALESCE(SUM("+expression+"), 0) FROM traffic_logs WHERE recorded_at >= ? GROUP BY site_id",
+		"SELECT site_id, COALESCE(SUM(bytes_in), 0), COALESCE(SUM(bytes_out), 0) FROM traffic_logs WHERE recorded_at >= ? GROUP BY site_id",
 		start.In(time.Local).Format("2006-01-02 15:04:05"),
 	)
 	if err != nil {
@@ -198,11 +190,11 @@ func (d *DB) SumTrafficSinceBySite(start time.Time, billingMode string) (map[int
 	defer rows.Close()
 	result := make(map[int64]int64)
 	for rows.Next() {
-		var siteID, total int64
-		if err := rows.Scan(&siteID, &total); err != nil {
+		var siteID, bytesIn, bytesOut int64
+		if err := rows.Scan(&siteID, &bytesIn, &bytesOut); err != nil {
 			return nil, err
 		}
-		result[siteID] = total
+		result[siteID] = trafficBillableBytes(billingMode, bytesIn, bytesOut)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -214,16 +206,12 @@ func (d *DB) SumTrafficSinceBySite(start time.Time, billingMode string) (map[int
 // Directional columns remain raw so changing the billing mode never destroys
 // the information needed to recalculate the current cycle.
 func (d *DB) SumTrafficSinceForSite(siteID int64, start time.Time, billingMode string) (int64, error) {
-	expression := "bytes_in + bytes_out"
-	if trafficBillingModeLabel(billingMode) == trafficBillingModeOutbound {
-		expression = "bytes_out"
-	}
-	var total int64
+	var bytesIn, bytesOut int64
 	err := d.db.QueryRow(
-		"SELECT COALESCE(SUM("+expression+"), 0) FROM traffic_logs WHERE site_id=? AND recorded_at >= ?",
+		"SELECT COALESCE(SUM(bytes_in), 0), COALESCE(SUM(bytes_out), 0) FROM traffic_logs WHERE site_id=? AND recorded_at >= ?",
 		siteID, start.In(time.Local).Format("2006-01-02 15:04:05"),
-	).Scan(&total)
-	return total, err
+	).Scan(&bytesIn, &bytesOut)
+	return trafficBillableBytes(billingMode, bytesIn, bytesOut), err
 }
 
 // GetTrafficTrendLogs returns minute/hour buckets in the requested wall-clock
