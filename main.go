@@ -87,7 +87,7 @@ func main() {
 	if err := validateDynamicRouteKeySeparation(dynamicRouteKey, jwtSecret, upstreamHeaderKey); err != nil {
 		log.Fatalf("invalid dynamic route key: %v", err)
 	}
-	if err := validateCredentialKeySeparation(meridianSecretKey, meridianSecretKeyConfigured, jwtSecret, dynamicRouteKey, upstreamHeaderKey); err != nil {
+	if err := validateCredentialKeySeparation(meridianSecretKey, meridianSecretKeyConfigured, jwtSecret, dynamicRouteKey, upstreamHeaderKey, os.Getenv("DYNAMIC_ROUTE_KEY"), os.Getenv("UPSTREAM_HEADER_KEY")); err != nil {
 		log.Fatalf("invalid credential key: %v", err)
 	}
 

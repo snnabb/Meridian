@@ -121,20 +121,26 @@ func setSessionGeneration(value uint64) {
 	sessionGeneration.Store(value)
 }
 
-func validateCredentialKeySeparation(credential []byte, configured bool, effectiveJWT, dynamicKey, upstreamKey []byte) error {
+func validateCredentialKeySeparation(credential []byte, configured bool, effectiveJWT, dynamicKey, upstreamKey []byte, dynamicRaw, upstreamRaw string) error {
 	if !configured || len(credential) == 0 {
 		return nil
 	}
 	if len(effectiveJWT) > 0 && subtle.ConstantTimeCompare(credential, effectiveJWT) == 1 {
 		return fmt.Errorf("MERIDIAN_SECRET_KEY must differ from JWT_SECRET")
 	}
-	// codeql[go/weak-cryptographic-algorithm] -- SHA-256 is used only for
-	// deterministic key-separation comparisons, never for password storage.
-	digest := sha256.Sum256(credential)
-	if len(dynamicKey) == len(digest) && subtle.ConstantTimeCompare(digest[:], dynamicKey) == 1 {
+	// Compare both the raw configured values and their derived runtime keys.
+	// This avoids hashing a password-shaped secret here; SHA-256 is used by the
+	// individual key resolvers only to derive their runtime keys.
+	if dynamicRaw != "" && subtle.ConstantTimeCompare(credential, []byte(dynamicRaw)) == 1 {
 		return fmt.Errorf("MERIDIAN_SECRET_KEY must differ from DYNAMIC_ROUTE_KEY")
 	}
-	if len(upstreamKey) == len(digest) && subtle.ConstantTimeCompare(digest[:], upstreamKey) == 1 {
+	if len(dynamicKey) > 0 && subtle.ConstantTimeCompare(credential, dynamicKey) == 1 {
+		return fmt.Errorf("MERIDIAN_SECRET_KEY must differ from DYNAMIC_ROUTE_KEY")
+	}
+	if upstreamRaw != "" && subtle.ConstantTimeCompare(credential, []byte(upstreamRaw)) == 1 {
+		return fmt.Errorf("MERIDIAN_SECRET_KEY must differ from UPSTREAM_HEADER_KEY")
+	}
+	if len(upstreamKey) > 0 && subtle.ConstantTimeCompare(credential, upstreamKey) == 1 {
 		return fmt.Errorf("MERIDIAN_SECRET_KEY must differ from UPSTREAM_HEADER_KEY")
 	}
 	return nil
