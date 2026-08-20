@@ -18,7 +18,7 @@
 
 Meridian 把多站点反代、UA 身份、流量管控和故障诊断整合进一个管理面板。适合希望直接部署、不想手写多套反代配置的个人或小型 Emby 环境。
 
-当前版本：`v1.9.3`。管理面板支持响应式趋势图、标准 IANA 调度时区（默认 `Asia/Shanghai`）、反向代理下的公开访问地址，以及账户变更后的旧会话失效。
+最新发布：`v1.12.0`。管理面板支持响应式趋势图、标准 IANA 调度时区（默认 `Asia/Shanghai`）、反向代理下的公开访问地址、Cloudflare DNS-01 泛域名证书，以及账户变更后的旧会话失效。
 
 ## 界面预览
 
@@ -30,6 +30,14 @@ Meridian 把多站点反代、UA 身份、流量管控和故障诊断整合进�
   <tr>
     <td align="center"><a href="docs/traffic.webp"><img src="docs/traffic.webp" width="380" alt="Meridian 流量统计"></a><br><strong>流量统计</strong></td>
     <td align="center"><a href="docs/diagnostics.webp"><img src="docs/diagnostics.webp" width="380" alt="Meridian 故障诊断"></a><br><strong>故障诊断</strong></td>
+  </tr>
+  <tr>
+    <td align="center"><a href="docs/images/tls-certificate.png"><img src="docs/images/tls-certificate.png" width="380" alt="Meridian TLS 与泛域名证书"></a><br><strong>TLS / Cloudflare ACME</strong></td>
+    <td align="center"><a href="docs/images/site-create.png"><img src="docs/images/site-create.png" width="380" alt="Meridian 站点编辑器"></a><br><strong>站点编辑器</strong></td>
+  </tr>
+  <tr>
+    <td align="center"><a href="docs/images/global-settings-ui.png"><img src="docs/images/global-settings-ui.png" width="380" alt="Meridian 全局系统设置"></a><br><strong>全局设置</strong></td>
+    <td align="center"><a href="docs/images/request-logs.png"><img src="docs/images/request-logs.png" width="380" alt="Meridian 请求日志"></a><br><strong>请求日志</strong></td>
   </tr>
 </table>
 
@@ -45,6 +53,13 @@ Meridian 把多站点反代、UA 身份、流量管控和故障诊断整合进�
 | **实时监控** | 按站点统计流量、限速和配额，SSE 实时更新仪表盘 |
 | **趋势与时区** | 速度、请求和流量趋势使用非负计费边界；日志、定时任务和趋势统一按所选 IANA 时区显示 |
 | **公开入口地址** | 站点路径入口跟随当前浏览器公开 Origin，适配 HTTPS 反向代理 |
+| **多入口模式** | 支持独立端口、路径入口、域名前缀入口，以及兼容模式；共享入口只接受精确 Host |
+| **线路容灾** | 主线路加最多 7 条备用线路，支持顺序切换、恢复回切、单条测速和延迟分级显示 |
+| **播放兼容** | 支持 UA 预设/自定义/透传、真实客户端 IP、自动播放后端发现、受限重定向跟随和 HLS/DASH 兼容 |
+| **TLS 与证书** | 安装器可申请面板精确域名证书；面板内可使用 Cloudflare DNS-01 申请 `*.example.com` 泛域名证书并自动续签 |
+| **全局设置** | 流量计费周期、调度时区、探测缓存、日志写入/展示字段和 UI 圆角等设置 |
+| **备份恢复** | 加密导出/恢复站点、账户、流量、日志、全局设置和 Telegram；TLS 数据需显式勾选 |
+| **通知与账户** | Telegram 日报、单管理员账户设置、密码/用户名修改后旧会话立即失效 |
 | **故障诊断** | 检查主回源、播放回源、TLS 证书和实际生效的 UA 配置 |
 | **轻量部署** | 单文件 Go 后端、原生前端、嵌入式 SQLite，无外部数据库和前端构建链 |
 
@@ -60,7 +75,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/insta
 
 安装完成后：
 
-1. 未配置域名时，安装器默认只绑定 `127.0.0.1`，请通过 HTTPS 反向代理访问；配置域名后访问对应的 HTTPS 地址。若确需临时直接暴露明文 HTTP，必须显式设置 `ALLOW_INSECURE_HTTP=true`，不建议用于生产环境。
+1. 未配置域名时，安装器默认只绑定 `127.0.0.1`，请通过 HTTPS 反向代理访问；配置域名后访问对应的 HTTPS 地址。安装器申请的是面板精确域名证书；共享站点入口需要泛域名证书时，请在登录面板后进入“全局设置 → TLS 设置”完成 Cloudflare DNS-01 申请。若确需临时直接暴露明文 HTTP，必须显式设置 `ALLOW_INSECURE_HTTP=true`，不建议用于生产环境。
 2. 输入 1–64 个 UTF-8 字节的管理员账号、12–72 个 UTF-8 字节的密码并再次确认，以及安装时显示的初始化令牌。
 3. 创建站点并选择入口模式、回源和播放策略。
 
@@ -91,6 +106,32 @@ bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/insta
 Linux 可自动安装或复用 Nginx、Certbot，并为管理面板配置 HTTPS。生成的 Nginx 配置只代理管理端口，不读取或修改站点回源和独立监听端口。macOS 支持安装，但不支持自动域名配置。
 
 </details>
+
+## 面板功能说明
+
+| 页面 | 主要功能 |
+|---|---|
+| **仪表盘** | 站点运行状态、实时连接、速度/请求/流量趋势、日志健康、Telegram 定时任务和当日概览；支持按站点和时间范围查看 |
+| **站点管理** | 添加、编辑、启停、删除和排序站点；显示入口地址、回源状态、流量额度、限速、缓存和线路延迟 |
+| **站点编辑器** | 配置入口模式、路径/域名前缀、主回源及备用线路、测速、UA、真实 IP、固定上游 Header、自动发现、播放策略、缓存和配额 |
+| **日志记录** | 按站点、状态、资源类别和关键词检索请求；可控制写入字段和页面展示字段，日志不保存查询参数、令牌、Cookie 或正文 |
+| **故障诊断** | 分别检查主回源、播放回源、备用线路、TLS、UA/请求头和本地代理状态；探针可达不等同于完整 Emby 播放可用 |
+| **全局设置** | 系统/UI、流量周期、IANA 调度时区、健康探测、日志存储及日志字段设置 |
+| **TLS 设置** | 配置面板前缀、节点泛域名和监听端口，使用 Cloudflare API Token 通过 DNS-01 申请和续签泛域名证书 |
+| **备份与恢复** | 创建密码保护的加密备份；恢复前进行解密、结构和 SQLite 完整性检查，并按备份内容决定是否替换 TLS 数据 |
+| **Telegram 日报** | 配置 Bot Token、Chat ID、每日/每周时间和星期，按全局时区发送统计摘要 |
+| **账户** | 查看账户信息，修改管理员用户名或密码，退出当前设备会话 |
+
+### Cloudflare 泛域名证书
+
+面板内置的证书申请目前使用 Cloudflare DNS-01，申请范围为节点泛域名，例如 `*.example.com`。使用前请满足：
+
+1. `panel.example.com` 和站点入口使用的子域名属于同一个 Cloudflare Zone，并按实际入口解析到 Meridian 或前置反向代理。
+2. 在 Cloudflare 创建 API Token，至少授予目标 Zone 的 **Zone Read** 和 **DNS Edit** 权限；不要使用全局 API Key。
+3. 在“全局设置 → TLS 设置”填写面板前缀、泛域名、ACME 邮箱和 Token，先保存域名设置，再点击“申请证书”。
+4. Token 只用于 DNS-01 验证，数据库中以加密密文保存，管理 API 不返回原文；生产环境必须固定 `MERIDIAN_SECRET_KEY`，否则重启或迁移后无法解密已保存凭据。
+
+证书申请支持 Let's Encrypt 生产环境和测试环境。申请成功后，若监听端口或 TLS 状态需要重新加载，页面会提示重启；自动续签由 Meridian 定时检查，当前 DNS 提供商实现为 Cloudflare。
 
 ## 其他部署方式
 
@@ -329,9 +370,9 @@ Meridian v1 专注于单管理员、轻量部署：
 
 - 仅支持一个管理员，不提供多用户或角色权限。
 - 暂无审计日志和 Webhook 通知；Telegram 日报可在全局设置中配置。
-- 管理面板支持配置 TLS；未启用 TLS 时默认只监听回环地址，公网明文 HTTP 必须显式设置 `ALLOW_INSECURE_HTTP=true`。
-- 共享入口只支持精确 Host，不支持通配符或 URL 路径前缀。
-- TLS 诊断不负责证书签发和续期；UA 诊断不是远端回显验证。
+- 管理面板支持配置 TLS；可在面板内通过 Cloudflare DNS-01 申请和自动续签节点泛域名证书。未启用 TLS 时默认只监听回环地址，公网明文 HTTP 必须显式设置 `ALLOW_INSECURE_HTTP=true`。
+- 共享 Host 入口只支持精确 Host；路径入口使用面板域名和显式路径前缀，不接受通配符路由。
+- TLS 诊断只负责检查证书链、有效期和主机名，不替代证书申请流程；Cloudflare 证书申请目前只支持面板内置的 DNS-01 流程。
 
 Roadmap：多用户与角色权限、Webhook 通知集成。
 
