@@ -90,3 +90,36 @@ func TestTelegramReportScheduleChangeRearmsCurrentPeriod(t *testing.T) {
 		t.Fatalf("changed schedule kept last_sent_key: %q", stored.LastSentKey)
 	}
 }
+
+func TestTelegramReportTrafficUsesGlobalBillingMode(t *testing.T) {
+	app := newTestApp(t)
+	site, err := app.db.CreateSite("telegram-billing", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	now := time.Now()
+	if err := app.db.addTrafficWithRequestsAt(site.ID, 10, 90, 1, now); err != nil {
+		t.Fatalf("add traffic: %v", err)
+	}
+
+	dual, err := app.db.buildTelegramReportStats(now)
+	if err != nil {
+		t.Fatalf("build bidirectional stats: %v", err)
+	}
+	if dual.TodayTraffic != 200 || dual.HistoryTraffic != 200 || len(dual.TopTraffic) != 1 || dual.TopTraffic[0].Traffic != 200 {
+		t.Fatalf("bidirectional stats = %+v, want traffic 200", dual)
+	}
+
+	settings := app.db.currentSystemSettings()
+	settings.TrafficBillingMode = trafficBillingModeOutbound
+	if err := app.db.saveSystemSettings(settings); err != nil {
+		t.Fatalf("save outbound mode: %v", err)
+	}
+	outbound, err := app.db.buildTelegramReportStats(now)
+	if err != nil {
+		t.Fatalf("build outbound stats: %v", err)
+	}
+	if outbound.TodayTraffic != 90 || outbound.HistoryTraffic != 90 || len(outbound.TopTraffic) != 1 || outbound.TopTraffic[0].Traffic != 90 {
+		t.Fatalf("outbound stats = %+v, want traffic 90", outbound)
+	}
+}

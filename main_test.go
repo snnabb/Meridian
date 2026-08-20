@@ -3817,7 +3817,7 @@ func findLiveSite(t *testing.T, snap *TrafficSnapshot, id int64) SiteTraffic {
 }
 
 // Pending bytes and requests are flushed to the DB exactly once, the authoritative total
-// traffic_used = persisted + pending is conserved across flushes, and the
+// traffic_used = billable persisted + billable pending is conserved across flushes, and the
 // current-minute log bucket aggregates without double counting.
 func TestFlushPersistsPendingExactlyOnceAndConservesTotals(t *testing.T) {
 	app := newTestApp(t)
@@ -3841,8 +3841,8 @@ func TestFlushPersistsPendingExactlyOnceAndConservesTotals(t *testing.T) {
 		t.Fatalf("TrafficSnapshot: %v", err)
 	}
 	live := findLiveSite(t, snap, site.ID)
-	if live.TrafficUsed != 200 || live.PersistedTraffic != 0 || live.BytesIn != 120 || live.BytesOut != 80 || live.CumulativeBytesIn != 120 || live.CumulativeBytesOut != 80 {
-		t.Fatalf("pre-flush live state = %+v, want used=200 persisted=0 in=120 out=80", live)
+	if live.TrafficUsed != 400 || live.PersistedTraffic != 0 || live.BytesIn != 120 || live.BytesOut != 80 || live.CumulativeBytesIn != 120 || live.CumulativeBytesOut != 80 {
+		t.Fatalf("pre-flush live state = %+v, want billed used=400 persisted=0 in=120 out=80", live)
 	}
 
 	app.pm.FlushTraffic()
@@ -3902,8 +3902,8 @@ func TestFlushPersistsPendingExactlyOnceAndConservesTotals(t *testing.T) {
 		t.Fatalf("TrafficSnapshot: %v", err)
 	}
 	live = findLiveSite(t, snap, site.ID)
-	if live.TrafficUsed != 240 || snap.TotalTraffic != 240 || live.Requests != 8 || snap.TotalRequests != 8 {
-		t.Fatalf("post-flush totals = site:%d snapshot:%d requests:%d/%d, want 240/240 and 8/8", live.TrafficUsed, snap.TotalTraffic, live.Requests, snap.TotalRequests)
+	if live.TrafficUsed != 480 || snap.TotalTraffic != 480 || live.Requests != 8 || snap.TotalRequests != 8 {
+		t.Fatalf("post-flush totals = site:%d snapshot:%d requests:%d/%d, want billed 480/480 and 8/8", live.TrafficUsed, snap.TotalTraffic, live.Requests, snap.TotalRequests)
 	}
 }
 
@@ -4017,8 +4017,8 @@ func TestSiteTrafficHistoryMergesPendingIntoCurrentMinuteBucket(t *testing.T) {
 	if current.ID != 0 || current.BytesIn != 30 || current.BytesOut != 20 || current.Requests != 4 || !(sameTrafficMinute(current.RecordedAt, minuteBefore) || sameTrafficMinute(current.RecordedAt, minuteAfter)) {
 		t.Fatalf("synthetic current bucket = %+v, want ID=0 30/20 and 4 requests at the current minute", current)
 	}
-	if !history.Snapshot.Running || history.Snapshot.PersistedTraffic != 150 || history.Snapshot.BytesIn != 30 || history.Snapshot.BytesOut != 20 || history.Snapshot.TrafficUsed != 200 || history.Snapshot.Requests != 9 {
-		t.Fatalf("snapshot = %+v, want running persisted=150 in=30 out=20 used=200 requests=9", history.Snapshot)
+	if !history.Snapshot.Running || history.Snapshot.PersistedTraffic != 300 || history.Snapshot.BytesIn != 30 || history.Snapshot.BytesOut != 20 || history.Snapshot.TrafficUsed != 400 || history.Snapshot.Requests != 9 {
+		t.Fatalf("snapshot = %+v, want running billed persisted=300 in=30 out=20 used=400 requests=9", history.Snapshot)
 	}
 
 	// All pending values at zero is a no-op: no synthetic bucket is appended.
@@ -4264,16 +4264,16 @@ func TestTrafficSnapshotUnifiedPayloadAndTotals(t *testing.T) {
 	if snap.TotalSites != 2 || snap.OnlineSites != 2 || snap.RunningSites != 1 {
 		t.Fatalf("counts = total:%d online:%d running:%d, want 2/2/1", snap.TotalSites, snap.OnlineSites, snap.RunningSites)
 	}
-	if snap.TotalTraffic != 190 {
-		t.Fatalf("total_traffic = %d, want 190 (100+30+20 persisted+pending + 40 DB)", snap.TotalTraffic)
+	if snap.TotalTraffic != 380 {
+		t.Fatalf("total_traffic = %d, want billed 380", snap.TotalTraffic)
 	}
 	a := findLiveSite(t, snap, siteA.ID)
-	if !a.Running || a.TrafficQuota != 1024 || a.PersistedTraffic != 100 || a.BytesIn != 30 || a.BytesOut != 20 || a.TrafficUsed != 150 {
-		t.Fatalf("running site entry = %+v, want running quota=1024 persisted=100 in=30 out=20 used=150", a)
+	if !a.Running || a.TrafficQuota != 1024 || a.PersistedTraffic != 200 || a.BytesIn != 30 || a.BytesOut != 20 || a.TrafficUsed != 300 {
+		t.Fatalf("running site entry = %+v, want running quota=1024 billed persisted=200 in=30 out=20 used=300", a)
 	}
 	b := findLiveSite(t, snap, siteB.ID)
-	if b.Running || b.PersistedTraffic != 40 || b.BytesIn != 0 || b.BytesOut != 0 || b.TrafficUsed != 40 {
-		t.Fatalf("idle site entry = %+v, want not running persisted=40 used=40", b)
+	if b.Running || b.PersistedTraffic != 80 || b.BytesIn != 0 || b.BytesOut != 0 || b.TrafficUsed != 80 {
+		t.Fatalf("idle site entry = %+v, want not running billed persisted=80 used=80", b)
 	}
 }
 
@@ -4317,8 +4317,8 @@ func TestHandleTrafficLegacyArrayAndSnapshotEnvelope(t *testing.T) {
 	}
 	body := decodeBody(t, rr)
 	snap := mustMapValue(t, body, "snapshot")
-	if mustNumberValue(t, snap, "traffic_used") != 50 || mustNumberValue(t, snap, "persisted_traffic") != 0 || mustNumberValue(t, snap, "bytes_in") != 40 || mustNumberValue(t, snap, "bytes_out") != 10 || mustNumberValue(t, snap, "requests") != 6 {
-		t.Fatalf("envelope snapshot = %v, want used=50 persisted=0 in=40 out=10 requests=6", snap)
+	if mustNumberValue(t, snap, "traffic_used") != 100 || mustNumberValue(t, snap, "persisted_traffic") != 0 || mustNumberValue(t, snap, "bytes_in") != 40 || mustNumberValue(t, snap, "bytes_out") != 10 || mustNumberValue(t, snap, "requests") != 6 {
+		t.Fatalf("envelope snapshot = %v, want billed used=100 persisted=0 in=40 out=10 requests=6", snap)
 	}
 	if !mustBoolValue(t, snap, "running") {
 		t.Fatal("envelope snapshot must report the site as running")
@@ -4558,7 +4558,7 @@ func TestConcurrentFlushSnapshotAndHistoryStayConsistent(t *testing.T) {
 				return
 			}
 			for _, st := range snap.LiveSites {
-				if st.ID == site.ID && st.TrafficUsed != st.PersistedTraffic+st.BytesIn+st.BytesOut {
+				if st.ID == site.ID && st.TrafficUsed != st.PersistedTraffic+trafficBillableBytes(trafficBillingModeBidirectional, st.BytesIn, st.BytesOut) {
 					t.Errorf("torn snapshot view: used=%d persisted=%d in=%d out=%d", st.TrafficUsed, st.PersistedTraffic, st.BytesIn, st.BytesOut)
 					return
 				}
@@ -4582,7 +4582,7 @@ func TestConcurrentFlushSnapshotAndHistoryStayConsistent(t *testing.T) {
 				t.Errorf("SiteTrafficHistory: %v", err)
 				return
 			}
-			if h.Snapshot.TrafficUsed != h.Snapshot.PersistedTraffic+h.Snapshot.BytesIn+h.Snapshot.BytesOut {
+			if h.Snapshot.TrafficUsed != h.Snapshot.PersistedTraffic+trafficBillableBytes(trafficBillingModeBidirectional, h.Snapshot.BytesIn, h.Snapshot.BytesOut) {
 				t.Errorf("torn history view: used=%d persisted=%d in=%d out=%d", h.Snapshot.TrafficUsed, h.Snapshot.PersistedTraffic, h.Snapshot.BytesIn, h.Snapshot.BytesOut)
 				return
 			}
@@ -4643,8 +4643,8 @@ func TestTrafficReadsDoNotWriteDatabase(t *testing.T) {
 	}
 	body := decodeBody(t, rr)
 	snap := mustMapValue(t, body, "snapshot")
-	if mustNumberValue(t, snap, "bytes_in") != 11 || mustNumberValue(t, snap, "traffic_used") != 20 {
-		t.Fatalf("read-only envelope snapshot = %v, want in=11 used=20", snap)
+	if mustNumberValue(t, snap, "bytes_in") != 11 || mustNumberValue(t, snap, "traffic_used") != 40 {
+		t.Fatalf("read-only envelope snapshot = %v, want in=11 billed used=40", snap)
 	}
 
 	// Dashboard and overview share the unified snapshot payload.
@@ -4655,8 +4655,8 @@ func TestTrafficReadsDoNotWriteDatabase(t *testing.T) {
 		t.Fatalf("dashboard status = %d body=%s", rr.Code, rr.Body.String())
 	}
 	body = decodeBody(t, rr)
-	if mustNumberValue(t, body, "total_traffic") != 20 || mustNumberValue(t, body, "running_sites") != 1 {
-		t.Fatalf("dashboard payload = %v, want total_traffic=20 running_sites=1", body)
+	if mustNumberValue(t, body, "total_traffic") != 40 || mustNumberValue(t, body, "running_sites") != 1 {
+		t.Fatalf("dashboard payload = %v, want billed total_traffic=40 running_sites=1", body)
 	}
 
 	rr = httptest.NewRecorder()
@@ -4666,8 +4666,8 @@ func TestTrafficReadsDoNotWriteDatabase(t *testing.T) {
 		t.Fatalf("overview status = %d body=%s", rr.Code, rr.Body.String())
 	}
 	body = decodeBody(t, rr)
-	if mustNumberValue(t, body, "total_traffic") != 20 {
-		t.Fatalf("overview payload = %v, want total_traffic=20", body)
+	if mustNumberValue(t, body, "total_traffic") != 40 {
+		t.Fatalf("overview payload = %v, want billed total_traffic=40", body)
 	}
 
 	// SSE event frame.
@@ -4675,8 +4675,8 @@ func TestTrafficReadsDoNotWriteDatabase(t *testing.T) {
 	if err := app.sendSSEEvent(rr, rr); err != nil {
 		t.Fatalf("sendSSEEvent against a read-only DB: %v", err)
 	}
-	if !strings.HasPrefix(rr.Body.String(), "data: ") || !strings.Contains(rr.Body.String(), "\"total_traffic\":20") {
-		t.Fatalf("SSE frame = %q, want data: frame with total_traffic 20", rr.Body.String())
+	if !strings.HasPrefix(rr.Body.String(), "data: ") || !strings.Contains(rr.Body.String(), "\"total_traffic\":40") {
+		t.Fatalf("SSE frame = %q, want data: frame with billed total_traffic 40", rr.Body.String())
 	}
 
 	// And the DB really is untouched: no logs, no usage.
@@ -4916,8 +4916,8 @@ func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 	if liveRow == nil || stoppedRow == nil {
 		t.Fatalf("expected both sites in the response: %+v", rows)
 	}
-	if liveRow.TrafficUsed != 120 {
-		t.Fatalf("live traffic_used = %d, want 120 (100 persisted + 11 + 9 pending)", liveRow.TrafficUsed)
+	if liveRow.TrafficUsed != 240 {
+		t.Fatalf("live traffic_used = %d, want billed 240", liveRow.TrafficUsed)
 	}
 	if !liveRow.Running {
 		t.Fatal("running site must be flagged running")

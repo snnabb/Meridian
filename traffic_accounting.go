@@ -7,8 +7,11 @@ const (
 	trafficBillingModeOutbound      = "outbound"
 )
 
-// trafficBillableBytes translates raw proxy directions into the amount charged
-// by the selected VPS billing policy. BytesOut is the response sent to clients.
+// trafficBillableBytes translates the two logical proxy payload directions into
+// the amount charged by the selected VPS billing policy. Every payload byte
+// relayed by Meridian crosses two VPS network legs: it is received once and
+// sent once. Outbound mode intentionally keeps the existing product meaning of
+// counting only responses delivered to clients.
 func trafficBillableBytes(mode string, bytesIn, bytesOut int64) int64 {
 	if bytesIn < 0 {
 		bytesIn = 0
@@ -19,7 +22,15 @@ func trafficBillableBytes(mode string, bytesIn, bytesOut int64) int64 {
 	if mode == trafficBillingModeOutbound {
 		return bytesOut
 	}
-	return bytesIn + bytesOut
+	const maxInt64 = int64(^uint64(0) >> 1)
+	if bytesIn > maxInt64-bytesOut {
+		return maxInt64
+	}
+	total := bytesIn + bytesOut
+	if total > maxInt64/2 {
+		return maxInt64
+	}
+	return total * 2
 }
 
 func trafficBillingModeLabel(mode string) string {

@@ -467,6 +467,8 @@ test('dashboard live speed uses consecutive bidirectional SSE counters and rejec
   const html = elements['dash-table'].innerHTML;
   assert.ok(html.includes('↓ 512 KB/s'), html);
   assert.ok(html.includes('↑ 1 KB/s'), html);
+  const billedSample = vm.runInContext("dashboardRealtimeTrendSamples.get('all').at(-1).traffic_bytes", sandbox);
+  assert.equal(billedSample, 2 * (2048 + 1048576), 'bidirectional realtime traffic must count both VPS network legs');
 
   await vm.runInContext('loadDashboardTable()', sandbox);
   const refreshedHTML = elements['dash-table'].innerHTML;
@@ -554,7 +556,7 @@ test('dashboard trend touch pointers outside the canvas are treated as inactive'
   assert.equal(vm.runInContext('dashboardTrendPointerInside({ left: 100, top: 50, width: 300, height: 200 }, { clientX: 399, clientY: 249 })', sandbox), true);
   const source = readScript('pages/dashboard.js');
   assert.match(source, /event\.pointerType !== 'mouse' && !dashboardTrendPointerInside\(rect, event\)/);
-  assert.match(source, /pointerType !== 'mouse' && !dashboardTrendPointerInside\(canvas\.getBoundingClientRect\(\), event\)/);
+  assert.match(source, /canvas\.addEventListener\('pointerup',[\s\S]*?clearHover\(\);[\s\S]*?\}\);/);
   assert.match(source, /Touch pointer capture continues delivering pointermove events/);
 });
 

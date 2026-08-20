@@ -89,7 +89,7 @@ async function loadTrafficChart() {
     const billingMode = data.billing_mode === 'outbound' ? 'outbound' : 'bidirectional';
     const totalIn = logs.reduce((sum, log) => sum + Math.max(0, Number(log.bytes_in) || 0), 0);
     const totalOut = logs.reduce((sum, log) => sum + Math.max(0, Number(log.bytes_out) || 0), 0);
-    const billableRange = billingMode === 'outbound' ? totalOut : totalIn + totalOut;
+    const billableRange = billingMode === 'outbound' ? totalOut : 2 * (totalIn + totalOut);
     const totalRequests = logs.reduce((sum, log) => sum + Math.max(0, Number(log.requests) || 0), 0);
     const rangeLabel = trafficRangeLabel(hours);
     const rangeNote = document.getElementById('traffic-range-note');

@@ -214,7 +214,7 @@ function paintGlobalSettings(page = document.getElementById('page-global-setting
 
 function renderSystemUIForm(s) {
   return `<section class="settings-panel"><header><span>SYSTEM</span><h2>系统设置</h2><b>全局运行参数</b></header>
-    <p class="settings-panel-help">单向仅计 VPS 发给客户端的出站流量；双向同时计源站回到 VPS 的入站与 VPS 发给客户端的出站流量。</p>
+    <p class="settings-panel-help">单向仅计 VPS 发给客户端的出站流量；双向按经过 Meridian 的代理载荷同时计算 VPS 接收与发送流量，例如反代 1 GB 视频约计 2 GB。</p>
     <span class="settings-label">计费方向</span><div class="settings-choice" id="traffic-billing-mode-choice"><button data-setting-choice="outbound" class="${s.traffic_billing_mode === 'outbound' ? 'active' : ''}">单向（仅下载）</button><button data-setting-choice="bidirectional" class="${s.traffic_billing_mode !== 'outbound' ? 'active' : ''}">双向（下载 + 上传）</button></div>
   </section>
   <section class="settings-panel"><header><span>TRAFFIC RESET</span><h2>流量周期</h2><b>可重置或累计</b></header>
