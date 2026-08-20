@@ -998,7 +998,7 @@ restore_previous_binary() {
 cleanup_update_transaction() {
     local exit_code=$?
     if [ "$exit_code" -ne 0 ] && [ "$UPDATE_TRANSACTION" = "1" ]; then
-        warn "更新中断，正在恢复更新前的二进制和数据状态..."
+        warn "更新中断，正在自动回滚并恢复更新前的二进制和数据状态..."
         if [ "$UPDATE_BINARY_CHANGED" = "1" ]; then
             restore_previous_binary || true
         fi
