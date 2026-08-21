@@ -37,6 +37,11 @@ jobs:
           printf 'value=%s\n' "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           printf 'commit_sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Verify curated release notes
+        env:
+          RELEASE_TAG: ${{ steps.release_tag.outputs.value }}
+        run: grep -Fxq "## ${RELEASE_TAG}" CHANGELOG.md
+
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22.16.0
@@ -79,7 +84,7 @@ jobs:
           gosec -quiet -severity medium -confidence medium ./...
 
       - name: Build
-        run: go build -trimpath -buildvcs=false -o meridian .
+        run: go build -trimpath -buildvcs=false -o meridian ./cmd/meridian
 
   build:
     needs: verify
@@ -107,7 +112,7 @@ jobs:
             echo "Building ${goos}/${goarch} -> meridian-${suffix}"
             GOOS="${goos}" GOARCH="${goarch}" go build -trimpath -buildvcs=false \
               -ldflags="-s -w -X main.appVersion=${RELEASE_TAG}" \
-              -o "meridian-${suffix}" .
+              -o "meridian-${suffix}" ./cmd/meridian
           }
           build linux amd64 linux-amd64
           build linux arm64 linux-arm64
@@ -130,6 +135,10 @@ jobs:
       id-token: write
 
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.commit_sha }}
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           merge-multiple: true
@@ -144,8 +153,20 @@ jobs:
       - name: Sign checksums with Sigstore
         run: |
           go version
-          go install github.com/sigstore/cosign/v2/cmd/cosign@v2.4.1
+          go install github.com/sigstore/cosign/v2/cmd/cosign@v2.6.4
           "$(go env GOPATH)/bin/cosign" sign-blob --yes --bundle SHA256SUMS.bundle SHA256SUMS
+
+      - name: Extract curated release notes
+        env:
+          RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+        run: |
+          awk -v heading="## ${RELEASE_TAG}" '
+            $0 == heading { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+            END { if (!found) exit 1 }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          test -s RELEASE_NOTES.md
 
       - name: Create Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
@@ -155,7 +176,7 @@ jobs:
             meridian-*
             SHA256SUMS
             SHA256SUMS.bundle
-          generate_release_notes: true
+          body_path: ${{ github.workspace }}/RELEASE_NOTES.md
 
   docker:
     needs: [verify, build]

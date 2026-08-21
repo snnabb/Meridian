@@ -916,9 +916,9 @@ function formatNumber(n) {
 function animateValue(id, newVal) {
   const el = document.getElementById(id);
   if (!el) return;
-  const current = parseInt(el.textContent, 10) || 0;
-  if (current === newVal) return;
-  el.textContent = newVal;
+  const nextValue = String(newVal);
+  if (el.textContent === nextValue) return;
+  el.textContent = nextValue;
   el.style.transition = 'transform .15s';
   el.style.transform = 'scale(1.08)';
   setTimeout(() => { el.style.transform = ''; }, 150);

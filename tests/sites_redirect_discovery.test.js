@@ -350,9 +350,9 @@ test('availability and key status gate enablement without hiding legacy editing'
   assert.match(disabledControl, /id="m-dynamic-enabled"[^>]*checked/);
   assert.doesNotMatch(disabledControl, /m-dynamic-source-/);
 
-  const unavailablePayload = sandbox.buildDynamicPolicyPayload(policy, unavailable);
-  assert.equal(unavailablePayload.dynamic_discovery_enabled, true);
-  assert.deepEqual(plain(unavailablePayload.dynamic_discovery_sources), ['redirect', 'playback_info']);
+	  const unavailablePayload = sandbox.buildDynamicPolicyPayload(policy, unavailable);
+	  assert.equal(unavailablePayload.dynamic_discovery_enabled, true);
+	  assert.equal(Object.hasOwn(unavailablePayload, 'dynamic_discovery_sources'), false);
 
   const unavailableNewControl = sandbox.renderDynamicEnableControl(unavailable, {});
   assert.match(unavailableNewControl, /id="m-dynamic-enabled"[^>]*disabled/);
@@ -440,22 +440,59 @@ test('site modal presents proxy, direct main-video, and automatic discovery cont
   assert.match(body, /直连/);
   assert.match(body, /直连仅适用于主视频文件/);
   assert.match(body, /面板、API、HLS\/DASH 等仍由 Meridian 代理/);
-  assert.equal(document.getElementById('m-main-video-mode').value, 'proxy');
-  assert.ok(document.getElementById('m-dynamic-enabled'));
-  assert.ok(document.getElementById('m-dynamic-profile'));
-  assert.ok(document.getElementById('m-dynamic-source-hls'));
-  assert.ok(document.getElementById('m-dynamic-source-dash'));
-  assert.match(body, /自动发现/);
-  assert.match(body, /Compatible|兼容/);
-  assert.doesNotMatch(body, /播放回源/);
+	  assert.equal(document.getElementById('m-main-video-mode').value, 'proxy');
+	  assert.ok(document.getElementById('m-dynamic-enabled'));
+	  assert.ok(document.getElementById('m-dynamic-profile'));
+	  assert.ok(document.getElementById('m-target-scheme'));
+	  assert.equal(document.getElementById('m-target-scheme').value, 'https');
+	  assert.equal(document.getElementById('m-target-port').value, '443');
+	  assert.equal(document.getElementById('m-dynamic-source-hls'), null);
+	  assert.equal(document.getElementById('m-dynamic-source-dash'), null);
+	  assert.equal(document.getElementById('m-dynamic-downgrade'), null);
+	  assert.match(body, /自动发现/);
+	  assert.match(body, /Compatible|兼容/);
+	  assert.match(body, /端口留空时自动使用 HTTPS 443 或 HTTP 80/);
+	  assert.match(body, /处理来源与 HTTPS 降级策略由所选模式自动设置/);
+	  assert.doesNotMatch(body, /播放回源/);
 });
 
-test('new site submission enables every automatic proxy source without manual playback origins', async () => {
-  const { sandbox, document, state } = loadModalHarness();
-  await sandbox.showSiteModal(null);
-  document.getElementById('m-name').value = 'Media';
-  document.getElementById('m-target-address').value = 'https://origin.example';
-  document.getElementById('m-target-port').value = '443';
+test('upstream line helpers preserve legacy targets and default new HTTPS ports', () => {
+	  const sandbox = loadScripts('api.js', 'pages/sites.js');
+
+	  assert.deepEqual(plain(sandbox.splitUpstreamTargetAddress('', 'https')), {
+	    scheme: 'https',
+	    address: '',
+	    port: '443',
+	  });
+	  assert.deepEqual(plain(sandbox.splitUpstreamTargetAddress('media.example.com:443/emby', 'https')), {
+	    scheme: 'https',
+	    address: 'media.example.com/emby',
+	    port: '443',
+	  });
+	  assert.deepEqual(plain(sandbox.splitUpstreamTargetAddress('media.example.com:8096/emby', 'https')), {
+	    scheme: 'http',
+	    address: 'media.example.com/emby',
+	    port: '8096',
+	  });
+	  assert.deepEqual(plain(sandbox.splitUpstreamTargetAddress('https://media.example.com/base?q=1', 'http')), {
+	    scheme: 'https',
+	    address: 'media.example.com/base?q=1',
+	    port: '443',
+	  });
+	  assert.equal(sandbox.joinUpstreamTargetAddress('https', 'media.example.com/emby', ''), 'https://media.example.com/emby');
+	  assert.equal(sandbox.joinUpstreamTargetAddress('http', 'media.example.com/emby', ''), 'http://media.example.com/emby');
+	  assert.equal(sandbox.joinUpstreamTargetAddress('https', 'media.example.com/emby', '8443'), 'https://media.example.com:8443/emby');
+	  assert.equal(sandbox.joinUpstreamTargetAddress('https', 'user:secret@media.example.com', '443'), '');
+	  assert.equal(sandbox.joinUpstreamTargetAddress('https', 'media.example.com/#fragment', '443'), '');
+});
+
+test('new site submission derives automatic discovery from the selected profile', async () => {
+	  const { sandbox, document, state } = loadModalHarness();
+	  await sandbox.showSiteModal(null);
+	  document.getElementById('m-name').value = 'Media';
+	  document.getElementById('m-target-scheme').value = 'https';
+	  document.getElementById('m-target-address').value = 'origin.example';
+	  document.getElementById('m-target-port').value = '';
   document.getElementById('m-ingress-mode').value = 'port';
   document.getElementById('m-ingress-mode').onchange();
   document.getElementById('m-port').value = '8096';
@@ -468,11 +505,11 @@ test('new site submission enables every automatic proxy source without manual pl
   assert.equal(state.creates[0].playback_mode, 'direct');
   assert.equal(state.creates[0].main_video_stream_mode, 'proxy');
   assert.equal(state.creates[0].client_ip_mode, 'both');
-  assert.deepEqual(state.creates[0].stream_hosts, []);
-  assert.equal(state.creates[0].dynamic_discovery_enabled, true);
-  assert.equal(state.creates[0].dynamic_profile, 'compatible');
-  assert.deepEqual(state.creates[0].dynamic_discovery_sources, ['redirect', 'playback_info', 'hls', 'dash']);
-  assert.equal(state.creates[0].dynamic_allow_https_downgrade, true);
+	  assert.deepEqual(state.creates[0].stream_hosts, []);
+	  assert.equal(state.creates[0].dynamic_discovery_enabled, true);
+	  assert.equal(state.creates[0].dynamic_profile, 'compatible');
+	  assert.equal(Object.hasOwn(state.creates[0], 'dynamic_discovery_sources'), false);
+	  assert.equal(state.creates[0].dynamic_allow_https_downgrade, true);
 });
 
 test('enabled discovery policy normalizes sources and rules and omits the response-only revision', () => {
@@ -492,12 +529,11 @@ test('enabled discovery policy normalizes sources and rules and omits the respon
 
   assert.equal(hydrated.dynamic_policy_revision, 9);
   assert.deepEqual(plain(hydrated.dynamic_discovery_sources), ['redirect', 'playback_info']);
-  const payload = sandbox.buildDynamicPolicyPayload(hydrated, structuredDiscoveryResponse());
-  assert.deepEqual(plain(payload), {
-    dynamic_discovery_enabled: true,
-    dynamic_profile: 'compatible',
-    dynamic_discovery_sources: ['redirect', 'playback_info'],
-    dynamic_domain_rules: [
+	  const payload = sandbox.buildDynamicPolicyPayload(hydrated, structuredDiscoveryResponse());
+	  assert.deepEqual(plain(payload), {
+	    dynamic_discovery_enabled: true,
+	    dynamic_profile: 'compatible',
+	    dynamic_domain_rules: [
       { type: 'exact', value: 'media.example.com' },
       { type: 'suffix', value: 'cdn.example.com' },
     ],
@@ -508,11 +544,8 @@ test('enabled discovery policy normalizes sources and rules and omits the respon
   const partial = sandbox.normalizeDynamicSitePolicy({
     dynamic_discovery_sources: ['HLS', 'dash', 'redirect', 'REDIRECT', 'unknown', null],
   });
-  assert.deepEqual(plain(partial.dynamic_discovery_sources), ['redirect', 'hls', 'dash']);
-  assert.deepEqual(
-    plain(sandbox.buildDynamicPolicyPayload(partial, structuredDiscoveryResponse()).dynamic_discovery_sources),
-    ['redirect', 'hls', 'dash'],
-  );
+	  assert.deepEqual(plain(partial.dynamic_discovery_sources), ['redirect', 'hls', 'dash']);
+	  assert.equal(Object.hasOwn(sandbox.buildDynamicPolicyPayload(partial, structuredDiscoveryResponse()), 'dynamic_discovery_sources'), false);
 });
 
 test('Safe enablement requires a plausible exact or suffix DNS rule', () => {

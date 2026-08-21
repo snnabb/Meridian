@@ -165,7 +165,19 @@ const API = {
       throw new Error(res.statusText || 'Request failed');
     }
     if (!res.ok) {
-      throw new Error(data.error || 'Request failed');
+      const error = new Error(data.error || 'Request failed');
+      error.status = res.status;
+      const bodyRetryAfter = Number(data.retry_after_seconds);
+      const headerRetryAfter = Number(res.headers && typeof res.headers.get === 'function'
+        ? res.headers.get('Retry-After')
+        : 0);
+      const retryAfterSeconds = Number.isFinite(bodyRetryAfter) && bodyRetryAfter > 0
+        ? bodyRetryAfter
+        : headerRetryAfter;
+      if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+        error.retryAfterSeconds = Math.ceil(retryAfterSeconds);
+      }
+      throw error;
     }
     return data;
   },

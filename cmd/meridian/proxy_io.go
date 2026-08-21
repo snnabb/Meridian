@@ -74,17 +74,20 @@ func addMeteredBytesWithMeter(primary, cumulative *atomic.Int64, meter *requestT
 
 func (m *meteredWriter) Write(b []byte) (int, error) {
 	quotaTruncated := false
+	var reservation trafficQuotaReservation
 	if m.quota != nil {
-		allowed, quotaErr := m.quota.allow(true, int64(len(b)), time.Now())
+		allowed, reserved, quotaErr := m.quota.reserve(true, int64(len(b)), time.Now())
 		if allowed == 0 {
 			return 0, quotaErr
 		}
+		reservation = reserved
 		if allowed < int64(len(b)) {
 			b = b[:allowed]
 			quotaTruncated = true
 		}
 	}
 	n, err := m.ResponseWriter.Write(b)
+	reservation.settle(int64(n))
 	addMeteredBytesWithMeter(m.written, m.cumulative, m.meter, false, n)
 	if quotaTruncated && int64(n) == int64(len(b)) && err == nil {
 		return n, errTrafficQuotaExceeded
@@ -118,17 +121,20 @@ type meteredReader struct {
 
 func (m *meteredReader) Read(p []byte) (int, error) {
 	quotaTruncated := false
+	var reservation trafficQuotaReservation
 	if m.quota != nil {
-		allowed, quotaErr := m.quota.allow(false, int64(len(p)), time.Now())
+		allowed, reserved, quotaErr := m.quota.reserve(false, int64(len(p)), time.Now())
 		if allowed == 0 {
 			return 0, quotaErr
 		}
+		reservation = reserved
 		if allowed < int64(len(p)) {
 			p = p[:allowed]
 			quotaTruncated = true
 		}
 	}
 	n, err := m.ReadCloser.Read(p)
+	reservation.settle(int64(n))
 	addMeteredBytesWithMeter(m.read, m.cumulative, m.meter, true, n)
 	if quotaTruncated && int64(n) == int64(len(p)) && err == nil {
 		return n, errTrafficQuotaExceeded
@@ -151,17 +157,20 @@ type rateLimitedWriter struct {
 func (w *rateLimitedWriter) Write(b []byte) (int, error) {
 	if w.bytesPerSec <= 0 {
 		quotaTruncated := false
+		var reservation trafficQuotaReservation
 		if w.quota != nil {
-			allowed, quotaErr := w.quota.allow(true, int64(len(b)), time.Now())
+			allowed, reserved, quotaErr := w.quota.reserve(true, int64(len(b)), time.Now())
 			if allowed == 0 {
 				return 0, quotaErr
 			}
+			reservation = reserved
 			if allowed < int64(len(b)) {
 				b = b[:allowed]
 				quotaTruncated = true
 			}
 		}
 		n, err := w.ResponseWriter.Write(b)
+		reservation.settle(int64(n))
 		addMeteredBytesWithMeter(w.written, w.cumulative, w.meter, false, n)
 		if quotaTruncated && int64(n) == int64(len(b)) && err == nil {
 			return n, errTrafficQuotaExceeded
@@ -189,20 +198,23 @@ func (w *rateLimitedWriter) Write(b []byte) (int, error) {
 		}
 		chunk := b
 		quotaTruncated := false
+		var reservation trafficQuotaReservation
 		if int64(len(chunk)) > allowed {
 			chunk = b[:allowed]
 		}
 		if w.quota != nil {
-			quotaAllowed, quotaErr := w.quota.allow(true, int64(len(chunk)), time.Now())
+			quotaAllowed, reserved, quotaErr := w.quota.reserve(true, int64(len(chunk)), time.Now())
 			if quotaAllowed == 0 {
 				return totalWritten, quotaErr
 			}
+			reservation = reserved
 			if quotaAllowed < int64(len(chunk)) {
 				chunk = chunk[:quotaAllowed]
 				quotaTruncated = true
 			}
 		}
 		n, err := w.ResponseWriter.Write(chunk)
+		reservation.settle(int64(n))
 		addMeteredBytesWithMeter(w.written, w.cumulative, w.meter, false, n)
 		w.requestWritten += int64(n)
 		totalWritten += n
@@ -252,17 +264,20 @@ type tunnelWriter struct {
 func (t *tunnelWriter) Write(b []byte) (int, error) {
 	if t.bytesPerSec <= 0 {
 		quotaTruncated := false
+		var reservation trafficQuotaReservation
 		if t.quota != nil {
-			allowed, quotaErr := t.quota.allow(!t.inbound, int64(len(b)), time.Now())
+			allowed, reserved, quotaErr := t.quota.reserve(!t.inbound, int64(len(b)), time.Now())
 			if allowed == 0 {
 				return 0, quotaErr
 			}
+			reservation = reserved
 			if allowed < int64(len(b)) {
 				b = b[:allowed]
 				quotaTruncated = true
 			}
 		}
 		n, err := t.dst.Write(b)
+		reservation.settle(int64(n))
 		addMeteredBytesWithMeter(t.counter, t.cumulative, t.meter, t.inbound, n)
 		if quotaTruncated && int64(n) == int64(len(b)) && err == nil {
 			return n, errTrafficQuotaExceeded
@@ -282,20 +297,23 @@ func (t *tunnelWriter) Write(b []byte) (int, error) {
 		}
 		chunk := b
 		quotaTruncated := false
+		var reservation trafficQuotaReservation
 		if int64(len(chunk)) > allowed {
 			chunk = b[:allowed]
 		}
 		if t.quota != nil {
-			quotaAllowed, quotaErr := t.quota.allow(!t.inbound, int64(len(chunk)), time.Now())
+			quotaAllowed, reserved, quotaErr := t.quota.reserve(!t.inbound, int64(len(chunk)), time.Now())
 			if quotaAllowed == 0 {
 				return total, quotaErr
 			}
+			reservation = reserved
 			if quotaAllowed < int64(len(chunk)) {
 				chunk = chunk[:quotaAllowed]
 				quotaTruncated = true
 			}
 		}
 		n, err := t.dst.Write(chunk)
+		reservation.settle(int64(n))
 		addMeteredBytesWithMeter(t.counter, t.cumulative, t.meter, t.inbound, n)
 		t.written += int64(n)
 		total += n

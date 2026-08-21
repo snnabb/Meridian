@@ -599,6 +599,58 @@ function normalizeDynamicProfile(value) {
 	const profile = String(value || '').trim().toLowerCase();
 	return DYNAMIC_PROFILE_IDS.includes(profile) ? profile : 'compatible';
 }
+
+function normalizeUpstreamScheme(value) {
+	return String(value || '').trim().toLowerCase() === 'http' ? 'http' : 'https';
+}
+
+function defaultUpstreamPort(value) {
+	return normalizeUpstreamScheme(value) === 'http' ? '80' : '443';
+}
+
+function splitUpstreamTargetAddress(value, fallbackScheme = 'https') {
+	const raw = String(value || '').trim();
+	const normalizedFallback = normalizeUpstreamScheme(fallbackScheme);
+	if (!raw) {
+		return { scheme: normalizedFallback, address: '', port: defaultUpstreamPort(normalizedFallback) };
+	}
+	const explicitScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw);
+	try {
+		const parsed = new URL(explicitScheme ? raw : `http://${raw}`);
+		let scheme = explicitScheme ? parsed.protocol.replace(':', '').toLowerCase() : (parsed.port === '443' ? 'https' : 'http');
+		if (scheme !== 'http' && scheme !== 'https') throw new Error('unsupported upstream scheme');
+		const hostname = parsed.hostname.startsWith('[')
+			? parsed.hostname
+			: (parsed.hostname.includes(':') ? `[${parsed.hostname}]` : parsed.hostname);
+		if (!hostname || parsed.username || parsed.password || parsed.hash) throw new Error('invalid upstream address');
+		const pathname = parsed.pathname === '/' ? '' : parsed.pathname;
+		return {
+			scheme,
+			address: `${hostname}${pathname}${parsed.search}`,
+			port: parsed.port || defaultUpstreamPort(scheme),
+		};
+	} catch (_) {
+		return { scheme: normalizedFallback, address: raw, port: defaultUpstreamPort(normalizedFallback) };
+	}
+}
+
+function joinUpstreamTargetAddress(scheme, address, port) {
+	const normalizedScheme = normalizeUpstreamScheme(scheme);
+	const rawAddress = String(address || '').trim();
+	if (!rawAddress) return '';
+	const explicitScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(rawAddress);
+	try {
+		const parsed = new URL(explicitScheme ? rawAddress : `${normalizedScheme}://${rawAddress}`);
+		if (!parsed.hostname || parsed.username || parsed.password || parsed.hash) return '';
+		parsed.protocol = `${normalizedScheme}:`;
+		parsed.port = String(port || '').trim() || defaultUpstreamPort(normalizedScheme);
+		const normalized = parsed.toString();
+		return parsed.pathname === '/' && !parsed.search ? normalized.replace(/\/$/, '') : normalized;
+	} catch (_) {
+		return '';
+	}
+}
+
 function dynamicSourcesForProfile(value) {
 	return [...DYNAMIC_PROFILE_SOURCE_IDS[normalizeDynamicProfile(value)]];
 }
@@ -664,9 +716,8 @@ function buildDynamicPolicyPayload(policy, capabilities) {
 	const dynamicCapabilities = normalizeDynamicProfiles(capabilities);
 	if (!dynamicCapabilities.recognized) return {};
 	return {
-        dynamic_discovery_enabled: normalized.dynamic_discovery_enabled,
+	        dynamic_discovery_enabled: normalized.dynamic_discovery_enabled,
 		dynamic_profile: normalized.dynamic_profile,
-		dynamic_discovery_sources: normalized.dynamic_discovery_sources,
 		dynamic_domain_rules: normalized.dynamic_domain_rules,
 		dynamic_allow_https_downgrade: normalized.dynamic_allow_https_downgrade,
 	};
@@ -1256,38 +1307,7 @@ async function showSiteModal(site) {
 	const domainPrefixAvailable = siteCapabilities.domain_prefix_available === true;
 	const panelTLSReady = siteCapabilities.panel_tls_enabled === true;
 	const canUseHostIngress = hostOnlyAvailable && domainPrefixAvailable && (panelTLSReady || (isEdit && String(site.public_host || '').trim() !== ''));
-	const splitTargetAddress = value => {
-		const raw = String(value || '').trim();
-		if (!raw) return { address: '', port: '' };
-		const explicitScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw);
-		try {
-			const parsed = new URL(explicitScheme ? raw : `http://${raw}`);
-			const defaultPort = parsed.protocol === 'https:' ? '443' : '80';
-			const hostname = parsed.hostname.includes(':') ? `[${parsed.hostname}]` : parsed.hostname;
-			const path = `${parsed.pathname === '/' ? '' : parsed.pathname}${parsed.search}${parsed.hash}`;
-			return {
-				address: `${explicitScheme ? `${parsed.protocol}//` : ''}${hostname}${path}`,
-				port: parsed.port || defaultPort,
-			};
-		} catch (_) {
-			return { address: raw, port: '' };
-		}
-	};
-	const joinTargetAddress = (address, port) => {
-		const rawAddress = String(address || '').trim();
-		const rawPort = String(port || '').trim();
-		if (!rawAddress) return '';
-		const explicitScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(rawAddress);
-		try {
-			const parsed = new URL(explicitScheme ? rawAddress : `http://${rawAddress}`);
-			parsed.port = rawPort;
-			const normalized = parsed.toString().replace(/\/$/, parsed.pathname === '/' && !parsed.search && !parsed.hash ? '' : '/');
-			return explicitScheme ? normalized : normalized.replace(/^http:\/\//i, '');
-		} catch (_) {
-			return rawPort ? `${rawAddress.replace(/:\d+$/, '')}:${rawPort}` : rawAddress;
-		}
-	};
-	const primaryTargetParts = splitTargetAddress(isEdit ? site.target_url : '');
+	const primaryTargetParts = splitUpstreamTargetAddress(isEdit ? site.target_url : '', 'https');
 	const hostIngressBlockedHint = !hostOnlyAvailable
 		? '当前面板未满足安全的域名前缀转发条件，请先设置 PANEL_BIND_ADDR 或 TRUSTED_PROXY_CIDRS 并重启。'
 		: !domainPrefixAvailable
@@ -1298,7 +1318,6 @@ async function showSiteModal(site) {
 	const dynamicPolicy = normalizeDynamicSitePolicy(isEdit ? site : {
 		dynamic_discovery_enabled: true,
 		dynamic_profile: 'compatible',
-		dynamic_discovery_sources: [...DEFAULT_DYNAMIC_SOURCE_IDS, ...ADVANCED_DYNAMIC_SOURCE_IDS],
 		dynamic_domain_rules: [],
 		dynamic_allow_https_downgrade: true,
 	});
@@ -1345,18 +1364,19 @@ async function showSiteModal(site) {
 	    </div>
 	  </div>
 	  <div class="upstream-lines" id="m-upstream-lines">
-	    <div class="upstream-line is-primary" data-line="primary">
-	      <label class="upstream-line-enabled"><input type="checkbox" checked disabled><span>主</span></label>
-	      <div class="upstream-line-field" data-label="线路名称"><input type="text" class="form-input upstream-line-name" id="m-primary-line-name" value="${esc(isEdit ? (site.primary_line_name || '主线路') : '主线路')}" maxlength="100" aria-label="主线路名称"></div>
-	      <div class="upstream-line-field" data-label="协议与域名 / 路径"><input type="text" class="form-input upstream-line-address" id="m-target-address" value="${esc(primaryTargetParts.address)}" placeholder="https://emby.example.com" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="2048" required aria-label="主回源域名或地址"></div>
-	      <div class="upstream-line-field" data-label="端口"><input type="number" class="form-input upstream-line-port" id="m-target-port" value="${esc(primaryTargetParts.port)}" placeholder="443" min="1" max="65535" inputmode="numeric" required aria-label="主回源端口"></div>
-	      <span class="upstream-line-latency" data-label="延迟">--</span>
-	      <div class="upstream-line-actions primary-actions" data-label="线路状态"><span class="upstream-line-primary-note">主线路</span></div>
-	      <input type="hidden" id="m-target">
+		    <div class="upstream-line upstream-line-v2 is-primary" data-line="primary">
+		      <label class="upstream-line-enabled"><input type="checkbox" checked disabled><span>主</span></label>
+		      <div class="upstream-line-field upstream-line-name-field" data-label="线路名称"><input type="text" class="form-input upstream-line-name" id="m-primary-line-name" value="${esc(isEdit ? (site.primary_line_name || '主线路') : '主线路')}" maxlength="100" aria-label="主线路名称"></div>
+		      <div class="upstream-line-field upstream-line-scheme-field" data-label="协议"><select class="form-select upstream-line-scheme" id="m-target-scheme" aria-label="主回源协议"><option value="https" ${primaryTargetParts.scheme === 'https' ? 'selected' : ''}>HTTPS</option><option value="http" ${primaryTargetParts.scheme === 'http' ? 'selected' : ''}>HTTP</option></select></div>
+		      <div class="upstream-line-field upstream-line-address-field" data-label="地址 / Base 路径"><input type="text" class="form-input upstream-line-address" id="m-target-address" value="${esc(primaryTargetParts.address)}" placeholder="emby.example.com/emby" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="2048" required aria-label="主回源地址"></div>
+		      <div class="upstream-line-field upstream-line-port-field" data-label="端口"><input type="number" class="form-input upstream-line-port" id="m-target-port" value="${esc(primaryTargetParts.port)}" placeholder="443" min="1" max="65535" inputmode="numeric" aria-label="主回源端口"></div>
+		      <span class="upstream-line-latency" data-label="延迟">--</span>
+		      <div class="upstream-line-actions primary-actions" data-label="线路状态"><span class="upstream-line-primary-note">主线路</span></div>
+		      <input type="hidden" id="m-target">
 	    </div>
 	    <div id="m-failover-lines"></div>
 	  </div>
-	  <div class="form-help">域名可包含协议和 Base URL 路径；端口单独填写。最多 7 条备用线路。</div>
+		  <div class="form-help">先选择 HTTP 或 HTTPS，再填写域名/IP 和可选 Base 路径。端口留空时自动使用 HTTPS 443 或 HTTP 80；最多 7 条备用线路。</div>
 	</div>
 		<div class="form-group site-form-wide">
 		  <label>主回源固定请求头（可选）</label>
@@ -1371,21 +1391,16 @@ async function showSiteModal(site) {
 		    ${renderDynamicEnableControl(dynamicCapabilities, dynamicPolicy)}
 		    <label class="site-dynamic-profile"><span>模式</span><select class="form-select modal-select" id="m-dynamic-profile" ${dynamicCapabilities.recognized ? '' : 'disabled'}>${renderDynamicProfileOptions(dynamicCapabilities, dynamicPolicy.dynamic_profile)}</select></label>
 		  </div>
-		  <div class="site-dynamic-sources" id="m-dynamic-sources" ${dynamicCapabilities.recognized ? '' : 'hidden'}>
-		    <span class="site-dynamic-label">处理来源</span>
-		    ${DYNAMIC_SOURCE_IDS.map(source => `<label><input type="checkbox" id="m-dynamic-source-${source}" data-dynamic-source="${source}" ${dynamicPolicy.dynamic_discovery_sources.includes(source) ? 'checked' : ''}>${DYNAMIC_SOURCE_LABELS[source]}</label>`).join('')}
-		  </div>
-		  <div class="site-dynamic-help" id="m-dynamic-help">兼容模式默认处理 HTTP 30x、PlaybackInfo、HLS 和 DASH；仍拒绝私网与回环目标。</div>
+			  <div class="site-dynamic-help" id="m-dynamic-help">兼容模式默认处理 HTTP 30x、PlaybackInfo、HLS 和 DASH；仍拒绝私网与回环目标。</div>
 		  <div class="site-dynamic-extreme" id="m-dynamic-extreme-confirm" hidden>
 		    <label class="site-dynamic-check"><input type="checkbox" id="m-dynamic-extreme-ack"><span>我了解 Extreme 会放宽动态兼容范围</span></label>
 		    <input type="text" class="form-input" id="m-dynamic-extreme-name" placeholder="输入站点名称确认" autocomplete="off">
 		  </div>
-		  <details class="site-dynamic-advanced">
-		    <summary>安全规则与观察记录</summary>
-		    <div class="site-dynamic-advanced-body">
-		      <label class="site-dynamic-check"><input type="checkbox" id="m-dynamic-downgrade" ${dynamicPolicy.dynamic_allow_https_downgrade ? 'checked' : ''}><span>允许 HTTPS 回源降级到 HTTP</span></label>
-		      <div class="form-help">仅兼容模式生效；Safe 模式始终禁止。</div>
-		      <div class="site-dynamic-rules-head"><span>Safe 域名规则</span><button type="button" class="btn-ghost" id="m-add-dynamic-rule">添加规则</button></div>
+			  <details class="site-dynamic-advanced">
+			    <summary>安全规则与观察记录</summary>
+			    <div class="site-dynamic-advanced-body">
+			      <div class="form-help">处理来源与 HTTPS 降级策略由所选模式自动设置，无需逐项勾选。</div>
+			      <div class="site-dynamic-rules-head"><span>Safe 域名规则</span><button type="button" class="btn-ghost" id="m-add-dynamic-rule">添加规则</button></div>
 		      <div id="m-dynamic-rules"></div>
 		      ${isEdit ? renderDynamicObservationsPanel(dynamicCapabilities.recognized && dynamicCapabilities.available) : ''}
 		    </div>
@@ -1478,13 +1493,44 @@ async function showSiteModal(site) {
     <button class="btn-modal primary" id="m-submit">${isEdit ? '保存' : '创建'}</button>
   `;
 
-	document.getElementById('m-cancel').addEventListener('click', closeModal);
+		document.getElementById('m-cancel').addEventListener('click', closeModal);
+
+	const bindUpstreamLineInputs = (schemeInput, addressInput, portInput, onChange) => {
+		if (!schemeInput || !addressInput || !portInput) return;
+		schemeInput.value = normalizeUpstreamScheme(schemeInput.value);
+		schemeInput.dataset.previousScheme = schemeInput.value;
+		schemeInput.onchange = event => {
+			const previousScheme = normalizeUpstreamScheme(event.target.dataset.previousScheme);
+			const nextScheme = normalizeUpstreamScheme(event.target.value);
+			const currentPort = String(portInput.value || '').trim();
+			if (!currentPort || currentPort === defaultUpstreamPort(previousScheme)) {
+				portInput.value = defaultUpstreamPort(nextScheme);
+			}
+			event.target.dataset.previousScheme = nextScheme;
+			if (onChange) onChange(nextScheme, portInput.value);
+		};
+		addressInput.onblur = () => {
+			if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(String(addressInput.value || '').trim())) return;
+			const parts = splitUpstreamTargetAddress(addressInput.value, schemeInput.value);
+			schemeInput.value = parts.scheme;
+			schemeInput.dataset.previousScheme = parts.scheme;
+			addressInput.value = parts.address;
+			portInput.value = parts.port;
+			if (onChange) onChange(parts.scheme, parts.port, parts.address);
+		};
+	};
+
+	const primarySchemeInput = document.getElementById('m-target-scheme');
+	const primaryAddressInput = document.getElementById('m-target-address');
+	const primaryPortInput = document.getElementById('m-target-port');
+	primarySchemeInput.value = primaryTargetParts.scheme;
+	bindUpstreamLineInputs(primarySchemeInput, primaryAddressInput, primaryPortInput);
 
 	const failoverLinesContainer = document.getElementById('m-failover-lines');
 	let failoverLines = isEdit && Array.isArray(site.failover_lines)
-		? site.failover_lines.map(line => ({ name: String(line.name || ''), url: String(line.url || ''), enabled: line.enabled !== false, ...splitTargetAddress(line.url) }))
+		? site.failover_lines.map(line => ({ name: String(line.name || ''), url: String(line.url || ''), enabled: line.enabled !== false, ...splitUpstreamTargetAddress(line.url, 'https') }))
 		: (isEdit && Array.isArray(site.failover_targets)
-			? site.failover_targets.map((url, index) => ({ name: `线路${index + 2}`, url: String(url || ''), enabled: true, ...splitTargetAddress(url) }))
+			? site.failover_targets.map((url, index) => ({ name: `线路${index + 2}`, url: String(url || ''), enabled: true, ...splitUpstreamTargetAddress(url, 'https') }))
 			: []);
 
 	function lineActionIcon(kind) {
@@ -1496,11 +1542,12 @@ async function showSiteModal(site) {
 
 	function renderFailoverLines() {
 		failoverLinesContainer.innerHTML = failoverLines.map((line, index) => `
-		  <div class="upstream-line" data-line-index="${index}">
+		  <div class="upstream-line upstream-line-v2" data-line-index="${index}">
 		    <label class="upstream-line-enabled"><input type="checkbox" class="upstream-line-toggle" ${line.enabled ? 'checked' : ''}><span>${line.enabled ? '开' : '关'}</span></label>
-		    <div class="upstream-line-field" data-label="线路名称"><input type="text" class="form-input upstream-line-name" value="${esc(line.name)}" placeholder="线路${index + 2}" maxlength="100" aria-label="备用线路名称"></div>
-		    <div class="upstream-line-field" data-label="协议与域名 / 路径"><input type="text" class="form-input upstream-line-address" value="${esc(line.address)}" placeholder="https://backup.example.com" maxlength="2048" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" aria-label="备用线路域名或地址"></div>
-		    <div class="upstream-line-field" data-label="端口"><input type="number" class="form-input upstream-line-port" value="${esc(line.port)}" placeholder="443" min="1" max="65535" inputmode="numeric" aria-label="备用线路端口"></div>
+		    <div class="upstream-line-field upstream-line-name-field" data-label="线路名称"><input type="text" class="form-input upstream-line-name" value="${esc(line.name)}" placeholder="线路${index + 2}" maxlength="100" aria-label="备用线路名称"></div>
+		    <div class="upstream-line-field upstream-line-scheme-field" data-label="协议"><select class="form-select upstream-line-scheme" aria-label="备用线路协议"><option value="https" ${line.scheme === 'https' ? 'selected' : ''}>HTTPS</option><option value="http" ${line.scheme === 'http' ? 'selected' : ''}>HTTP</option></select></div>
+		    <div class="upstream-line-field upstream-line-address-field" data-label="地址 / Base 路径"><input type="text" class="form-input upstream-line-address" value="${esc(line.address)}" placeholder="backup.example.com/emby" maxlength="2048" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" aria-label="备用线路地址"></div>
+		    <div class="upstream-line-field upstream-line-port-field" data-label="端口"><input type="number" class="form-input upstream-line-port" value="${esc(line.port)}" placeholder="443" min="1" max="65535" inputmode="numeric" aria-label="备用线路端口"></div>
 		    <span class="upstream-line-latency" data-label="延迟">--</span>
 		    <div class="upstream-line-actions" data-label="排序 / 删除">
 		      <button type="button" class="icon-button upstream-line-move-up" title="上移" aria-label="上移" ${index === 0 ? 'disabled' : ''}>${lineActionIcon('up')}</button>
@@ -1515,9 +1562,18 @@ async function showSiteModal(site) {
 				failoverLines[index].enabled = event.target.checked;
 				renderFailoverLines();
 			};
+			const schemeInput = row.querySelector('.upstream-line-scheme');
+			const addressInput = row.querySelector('.upstream-line-address');
+			const portInput = row.querySelector('.upstream-line-port');
+			schemeInput.value = normalizeUpstreamScheme(failoverLines[index].scheme);
+			bindUpstreamLineInputs(schemeInput, addressInput, portInput, (scheme, port, address) => {
+				failoverLines[index].scheme = scheme;
+				failoverLines[index].port = port;
+				if (address !== undefined) failoverLines[index].address = address;
+			});
 			row.querySelector('.upstream-line-name').oninput = event => { failoverLines[index].name = event.target.value; };
-			row.querySelector('.upstream-line-address').oninput = event => { failoverLines[index].address = event.target.value; };
-			row.querySelector('.upstream-line-port').oninput = event => { failoverLines[index].port = event.target.value; };
+			addressInput.oninput = event => { failoverLines[index].address = event.target.value; };
+			portInput.oninput = event => { failoverLines[index].port = event.target.value; };
 			row.querySelector('.upstream-line-move-up').onclick = () => {
 				[failoverLines[index - 1], failoverLines[index]] = [failoverLines[index], failoverLines[index - 1]];
 				renderFailoverLines();
@@ -1533,9 +1589,9 @@ async function showSiteModal(site) {
 		});
 	}
 
-	async function testUpstreamLine(row, addressInput, portInput) {
+	async function testUpstreamLine(row, schemeInput, addressInput, portInput) {
 		const latency = row.querySelector('.upstream-line-latency');
-		const targetURL = joinTargetAddress(addressInput.value, portInput.value);
+		const targetURL = joinUpstreamTargetAddress(schemeInput.value, addressInput.value, portInput.value);
 		if (!targetURL) {
 			latency.textContent = '请填写地址';
 			latency.className = 'upstream-line-latency bad';
@@ -1566,7 +1622,7 @@ async function showSiteModal(site) {
 			Toast.error('最多添加 7 条备用线路');
 			return;
 		}
-		failoverLines.push({ name: `线路${failoverLines.length + 2}`, url: '', address: '', port: '', enabled: true });
+		failoverLines.push({ name: `线路${failoverLines.length + 2}`, url: '', scheme: 'https', address: '', port: '443', enabled: true });
 		renderFailoverLines();
 		const inputs = failoverLinesContainer.querySelectorAll('.upstream-line-address');
 		if (inputs.length) inputs[inputs.length - 1].focus();
@@ -1581,7 +1637,7 @@ async function showSiteModal(site) {
 			return failoverLines[index] && failoverLines[index].enabled;
 		});
 		for (const row of rows) {
-			await testUpstreamLine(row, row.querySelector('.upstream-line-address'), row.querySelector('.upstream-line-port'));
+			await testUpstreamLine(row, row.querySelector('.upstream-line-scheme'), row.querySelector('.upstream-line-address'), row.querySelector('.upstream-line-port'));
 		}
 		button.disabled = false;
 		button.textContent = '线路测速';
@@ -1669,12 +1725,10 @@ async function showSiteModal(site) {
   toggleCustomUAFields();
   uaSelect.addEventListener('change', toggleCustomUAFields);
 
-  const dynamicEnabledInput = document.getElementById('m-dynamic-enabled');
-  const dynamicProfileSelect = document.getElementById('m-dynamic-profile');
-  const dynamicSourcesContainer = document.getElementById('m-dynamic-sources');
-  const dynamicHelp = document.getElementById('m-dynamic-help');
-  const dynamicDowngradeInput = document.getElementById('m-dynamic-downgrade');
-  const dynamicRulesContainer = document.getElementById('m-dynamic-rules');
+	  const dynamicEnabledInput = document.getElementById('m-dynamic-enabled');
+	  const dynamicProfileSelect = document.getElementById('m-dynamic-profile');
+	  const dynamicHelp = document.getElementById('m-dynamic-help');
+	  const dynamicRulesContainer = document.getElementById('m-dynamic-rules');
   const dynamicRulesButton = document.getElementById('m-add-dynamic-rule');
   const dynamicInitialPolicy = { ...dynamicPolicy };
   const renderDynamicRules = () => {
@@ -1689,25 +1743,17 @@ async function showSiteModal(site) {
     dynamicRulesContainer.querySelectorAll('.m-dynamic-rule-remove').forEach(button => {
       button.onclick = () => { dynamicRules.splice(Number(button.dataset.idx), 1); renderDynamicRules(); };
     });
-  };
-  const syncDynamicControls = () => {
-    const profile = normalizeDynamicProfile(dynamicProfileSelect?.value || dynamicPolicy.dynamic_profile);
-    const allowed = new Set(dynamicSourcesForProfile(profile));
-    if (dynamicSourcesContainer) dynamicSourcesContainer.querySelectorAll('[data-dynamic-source]').forEach(input => {
-      const available = dynamicCapabilities.recognized && allowed.has(input.dataset.dynamicSource);
-      input.disabled = !available || dynamicEnabledInput?.checked !== true;
-      if (!allowed.has(input.dataset.dynamicSource)) input.checked = false;
-    });
-    if (dynamicSourcesContainer) dynamicSourcesContainer.hidden = !dynamicCapabilities.recognized || dynamicEnabledInput?.checked !== true;
-    const extremeConfirm = document.getElementById('m-dynamic-extreme-confirm');
-    if (extremeConfirm) extremeConfirm.hidden = profile !== 'extreme' || dynamicEnabledInput?.checked !== true;
-    if (dynamicDowngradeInput) dynamicDowngradeInput.disabled = profile === 'safe' || dynamicEnabledInput?.checked !== true;
-    if (dynamicHelp) dynamicHelp.textContent = profile === 'safe'
-      ? 'Safe 仅允许 HTTPS:443，并要求命中明确的域名规则。'
-      : profile === 'extreme'
-        ? 'Extreme 提供更宽的兼容范围；只建议在普通模式无法播放时使用。'
-        : '兼容模式默认处理 HTTP 30x、PlaybackInfo、HLS 和 DASH；仍拒绝私网与回环目标。';
-  };
+	  };
+	  const syncDynamicControls = () => {
+	    const profile = normalizeDynamicProfile(dynamicProfileSelect?.value || dynamicPolicy.dynamic_profile);
+	    const extremeConfirm = document.getElementById('m-dynamic-extreme-confirm');
+	    if (extremeConfirm) extremeConfirm.hidden = profile !== 'extreme' || dynamicEnabledInput?.checked !== true;
+	    if (dynamicHelp) dynamicHelp.textContent = profile === 'safe'
+	      ? 'Safe：处理 HTTP 30x 与 PlaybackInfo，仅允许 HTTPS:443，并要求命中明确的域名规则。'
+	      : profile === 'extreme'
+	        ? 'Extreme：处理 HTTP 30x、PlaybackInfo、HLS 与 DASH，并启用最宽的公网兼容范围；只建议在其他模式无法播放时使用。'
+	        : 'Compatible：处理 HTTP 30x、PlaybackInfo、HLS 与 DASH并允许受控 HTTPS 降级；仍拒绝私网与回环目标。';
+	  };
   if (dynamicRulesButton) dynamicRulesButton.onclick = () => {
     dynamicRules.push({ type: 'exact', value: '' });
     renderDynamicRules();
@@ -1786,16 +1832,21 @@ async function showSiteModal(site) {
 		  siteCapabilities.route_domain,
 		  pathPrefixInput.value,
 		);
-		const primaryTargetURL = joinTargetAddress(
-			document.getElementById('m-target-address').value,
-			document.getElementById('m-target-port').value,
-		);
-		const nextDynamicPolicy = {
-			dynamic_discovery_enabled: dynamicEnabledInput?.checked === true,
-			dynamic_profile: normalizeDynamicProfile(dynamicProfileSelect?.value || dynamicPolicy.dynamic_profile),
-			dynamic_discovery_sources: DYNAMIC_SOURCE_IDS.filter(source => document.getElementById(`m-dynamic-source-${source}`)?.checked === true),
-			dynamic_domain_rules: dynamicRules,
-			dynamic_allow_https_downgrade: dynamicDowngradeInput?.checked === true,
+			const primaryTargetURL = joinUpstreamTargetAddress(
+				document.getElementById('m-target-scheme').value,
+				document.getElementById('m-target-address').value,
+				document.getElementById('m-target-port').value,
+			);
+			const nextDynamicProfile = normalizeDynamicProfile(dynamicProfileSelect?.value || dynamicPolicy.dynamic_profile);
+			const nextDynamicPolicy = {
+				dynamic_discovery_enabled: dynamicEnabledInput?.checked === true,
+				dynamic_profile: nextDynamicProfile,
+				dynamic_domain_rules: dynamicRules,
+				dynamic_allow_https_downgrade: nextDynamicProfile === 'safe'
+					? false
+					: (nextDynamicProfile === 'compatible' || dynamicInitialPolicy.dynamic_profile !== 'extreme'
+						? true
+						: dynamicInitialPolicy.dynamic_allow_https_downgrade),
 		};
 		const dynamicConfirmation = confirmDynamicProfileChange(
 			dynamicInitialPolicy,
@@ -1812,13 +1863,13 @@ async function showSiteModal(site) {
 		const data = {
 	      name: document.getElementById('m-name').value.trim(),
 	      target_url: primaryTargetURL,
-	      primary_line_name: document.getElementById('m-primary-line-name').value.trim() || '主线路',
-	      failover_lines: failoverLines.map((line, index) => ({
-	        name: String(line.name || '').trim() || `线路${index + 2}`,
-	        url: joinTargetAddress(line.address, line.port),
-	        enabled: line.enabled !== false,
-	      })),
-	      failover_targets: failoverLines.filter(line => line.enabled !== false).map(line => joinTargetAddress(line.address, line.port)).filter(Boolean),
+		      primary_line_name: document.getElementById('m-primary-line-name').value.trim() || '主线路',
+		      failover_lines: failoverLines.map((line, index) => ({
+		        name: String(line.name || '').trim() || `线路${index + 2}`,
+		        url: joinUpstreamTargetAddress(line.scheme, line.address, line.port),
+		        enabled: line.enabled !== false,
+		      })),
+		      failover_targets: failoverLines.filter(line => line.enabled !== false).map(line => joinUpstreamTargetAddress(line.scheme, line.address, line.port)).filter(Boolean),
       playback_target_url: isEdit ? String(site.playback_target_url || '') : '',
       playback_mode: isEdit ? String(site.playback_mode || 'direct') : 'direct',
 		main_video_stream_mode: mainVideoModeSelect.value,
@@ -1860,8 +1911,8 @@ async function showSiteModal(site) {
 			Toast.error('请完整填写新增请求头的名称和值；已有值可留空保持不变');
 			return;
 		}
-		if (!document.getElementById('m-target-port').value || data.failover_lines.some((line, index) => !line.url || !String(failoverLines[index].port || '').trim())) {
-			Toast.error('请完整填写每条线路的域名和端口，或删除空线路');
+			if (data.failover_lines.some(line => !line.url)) {
+				Toast.error('请完整填写每条线路的地址，或删除空线路');
 			return;
 		}
 		if (data.failover_targets.length > 0 && upstreamHeaders.some(header => String(header.name || '').trim())) {

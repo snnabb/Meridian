@@ -6,6 +6,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -87,7 +88,7 @@ func (l *loginRateLimiter) allow(client string, now time.Time) (bool, time.Durat
 	return true, 0
 }
 
-func (l *loginRateLimiter) recordFailure(client string, now time.Time) {
+func (l *loginRateLimiter) recordFailure(client string, now time.Time) (bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.pruneExpired(now)
@@ -104,6 +105,10 @@ func (l *loginRateLimiter) recordFailure(client string, now time.Time) {
 		attempt.blockedUntil = now.Add(loginLockoutDuration)
 	}
 	l.attempts[client] = attempt
+	if now.Before(attempt.blockedUntil) {
+		return true, attempt.blockedUntil.Sub(now)
+	}
+	return false, 0
 }
 
 func (l *loginRateLimiter) reset(client string) {
@@ -193,7 +198,7 @@ func cors(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func securityHeaders(next http.Handler) http.Handler {
+func securityHeaders(next http.Handler, trustedProxies []*net.IPNet) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -201,7 +206,7 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
 		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
-		if requestIsHTTPS(r, nil) {
+		if requestIsHTTPS(r, trustedProxies) {
 			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		}
 		next.ServeHTTP(w, r)
@@ -257,6 +262,19 @@ func (a *App) jsonOK(w http.ResponseWriter, data interface{}) {
 
 func (a *App) jsonErr(w http.ResponseWriter, status int, msg string) {
 	a.jsonResponse(w, status, map[string]string{"error": msg})
+}
+
+func (a *App) authRateLimitErr(w http.ResponseWriter, msg string, retryAfter time.Duration) {
+	seconds := int(retryAfter / time.Second)
+	if retryAfter%time.Second != 0 {
+		seconds++
+	}
+	seconds = max(1, seconds)
+	w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	a.jsonResponse(w, http.StatusTooManyRequests, map[string]interface{}{
+		"error":               msg,
+		"retry_after_seconds": seconds,
+	})
 }
 
 func (a *App) setSessionCookie(w http.ResponseWriter, r *http.Request, token string) {
@@ -354,8 +372,7 @@ func (a *App) handleSetup(w http.ResponseWriter, r *http.Request) {
 	}
 	client := requestClientKey(r, a.trustedProxies)
 	if allowed, retryAfter := a.limiter().allow(client, time.Now()); !allowed {
-		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(retryAfter.Seconds()+0.5))))
-		a.jsonErr(w, http.StatusTooManyRequests, "too many setup attempts; try again later")
+		a.authRateLimitErr(w, "too many setup attempts; try again later", retryAfter)
 		return
 	}
 	a.setupTokenMu.Lock()
@@ -384,14 +401,20 @@ func (a *App) handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if a.setupToken == "" || !setupTokenMatches(a.setupToken, req.SetupToken) {
-		a.limiter().recordFailure(client, time.Now())
+		if blocked, retryAfter := a.limiter().recordFailure(client, time.Now()); blocked {
+			a.authRateLimitErr(w, "too many setup attempts; try again later", retryAfter)
+			return
+		}
 		a.jsonErr(w, http.StatusForbidden, "invalid setup token")
 		return
 	}
 	id, err := a.db.CreateInitialUser(req.Username, req.Password)
 	if err != nil {
 		if errors.Is(err, errAdminAlreadyExists) {
-			a.limiter().recordFailure(client, time.Now())
+			if blocked, retryAfter := a.limiter().recordFailure(client, time.Now()); blocked {
+				a.authRateLimitErr(w, "too many setup attempts; try again later", retryAfter)
+				return
+			}
 			a.jsonErr(w, http.StatusConflict, errAdminAlreadyExists.Error())
 			return
 		}
@@ -422,26 +445,39 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	client := requestClientKey(r, a.trustedProxies)
 	if allowed, retryAfter := a.limiter().allow(client, time.Now()); !allowed {
-		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(retryAfter.Seconds()+0.5))))
-		a.jsonErr(w, http.StatusTooManyRequests, "too many login attempts; try again later")
+		a.authRateLimitErr(w, "too many login attempts; try again later", retryAfter)
 		return
 	}
 	if err := decodeJSONBody(w, r, &req); err != nil {
-		a.limiter().recordFailure(client, time.Now())
+		if blocked, retryAfter := a.limiter().recordFailure(client, time.Now()); blocked {
+			a.authRateLimitErr(w, "too many login attempts; try again later", retryAfter)
+			return
+		}
 		a.jsonErr(w, 400, "invalid request")
 		return
 	}
 	username := strings.TrimSpace(req.Username)
 	if username == "" || len(username) > 64 || req.Password == "" || len(req.Password) > 72 {
-		a.limiter().recordFailure(client, time.Now())
+		if blocked, retryAfter := a.limiter().recordFailure(client, time.Now()); blocked {
+			a.authRateLimitErr(w, "too many login attempts; try again later", retryAfter)
+			return
+		}
 		a.jsonErr(w, http.StatusUnauthorized, "用户名或密码错误")
 		return
 	}
 	id, err := a.db.VerifyUser(username, req.Password)
 	if err != nil {
-		a.limiter().recordFailure(client, time.Now())
+		blocked, retryAfter := a.limiter().recordFailure(client, time.Now())
 		if errors.Is(err, errInvalidCredentials) {
+			if blocked {
+				a.authRateLimitErr(w, "too many login attempts; try again later", retryAfter)
+				return
+			}
 			a.jsonErr(w, http.StatusUnauthorized, "用户名或密码错误")
+			return
+		}
+		if blocked {
+			a.authRateLimitErr(w, "too many login attempts; try again later", retryAfter)
 			return
 		}
 		a.jsonErr(w, http.StatusInternalServerError, "authentication unavailable")

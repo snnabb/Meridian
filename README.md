@@ -12,54 +12,49 @@
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://github.com/snnabb/Meridian/pkgs/container/meridian)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-[快速开始](#快速开始) · [功能概览](#功能概览) · [部署方式](#其他部署方式) · [基础配置](#基础配置) · [安全说明](SECURITY.md)
+[快速开始](#快速开始) · [功能概览](#功能概览) · [部署方式](#其他部署方式) · [更新记录](CHANGELOG.md) · [安全说明](SECURITY.md)
 
 </div>
 
 Meridian 把多站点反代、UA 身份、流量管控和故障诊断整合进一个管理面板。适合希望直接部署、不想手写多套反代配置的个人或小型 Emby 环境。
 
-最新发布：`v1.12.0`。管理面板支持响应式趋势图、标准 IANA 调度时区（默认 `Asia/Shanghai`）、反向代理下的公开访问地址、Cloudflare DNS-01 泛域名证书，以及账户变更后的旧会话失效。
+最新发布：`v1.12.2`。当前版本统一采用双向流量计费（入站 + 出站，各计算一次），支持响应式趋势图、三档自动发现、线路级 HTTP/HTTPS 配置、标准 IANA 调度时区、Cloudflare DNS-01 泛域名证书，以及账户变更后的旧会话失效。
 
 ## 界面预览
 
-<table>
-  <tr>
-    <td align="center"><a href="docs/dashboard.webp"><img src="docs/dashboard.webp" width="380" alt="Meridian 仪表盘"></a><br><strong>仪表盘</strong></td>
-    <td align="center"><a href="docs/sites.webp"><img src="docs/sites.webp" width="380" alt="Meridian 站点管理"></a><br><strong>站点管理</strong></td>
-  </tr>
-  <tr>
-    <td align="center"><a href="docs/traffic.webp"><img src="docs/traffic.webp" width="380" alt="Meridian 流量统计"></a><br><strong>流量统计</strong></td>
-    <td align="center"><a href="docs/diagnostics.webp"><img src="docs/diagnostics.webp" width="380" alt="Meridian 故障诊断"></a><br><strong>故障诊断</strong></td>
-  </tr>
-  <tr>
-    <td align="center"><a href="docs/images/tls-certificate.png"><img src="docs/images/tls-certificate.png" width="380" alt="Meridian TLS 与泛域名证书"></a><br><strong>TLS / Cloudflare ACME</strong></td>
-    <td align="center"><a href="docs/images/site-create.png"><img src="docs/images/site-create.png" width="380" alt="Meridian 站点编辑器"></a><br><strong>站点编辑器</strong></td>
-  </tr>
-  <tr>
-    <td align="center"><a href="docs/images/global-settings-ui.png"><img src="docs/images/global-settings-ui.png" width="380" alt="Meridian 全局系统设置"></a><br><strong>全局设置</strong></td>
-    <td align="center"><a href="docs/images/request-logs.png"><img src="docs/images/request-logs.png" width="380" alt="Meridian 请求日志"></a><br><strong>请求日志</strong></td>
-  </tr>
-</table>
+	<table>
+	  <tr>
+	    <td align="center"><a href="docs/images/dashboard.png"><img src="docs/images/dashboard.png" width="380" alt="Meridian 空站仪表盘"></a><br><strong>仪表盘</strong></td>
+	    <td align="center"><a href="docs/images/sites.png"><img src="docs/images/sites.png" width="380" alt="Meridian 空站站点管理"></a><br><strong>站点管理</strong></td>
+	  </tr>
+	  <tr>
+	    <td align="center"><a href="docs/images/site-create.png"><img src="docs/images/site-create.png" width="380" alt="Meridian 站点编辑器"></a><br><strong>站点编辑器</strong></td>
+	    <td align="center"><a href="docs/images/global-settings-ui.png"><img src="docs/images/global-settings-ui.png" width="380" alt="Meridian 双向流量计费设置"></a><br><strong>全局设置</strong></td>
+	  </tr>
+	  <tr>
+	    <td align="center" colspan="2"><a href="docs/images/request-logs.png"><img src="docs/images/request-logs.png" width="760" alt="Meridian 空站请求日志"></a><br><strong>请求日志</strong></td>
+	  </tr>
+	</table>
 
-<p align="center"><sub>点击图片查看原图</sub></p>
+	<p align="center"><sub>截图来自 v1.12.2 临时全新数据库，未添加任何站点；点击图片查看原图。</sub></p>
 
 ## 功能概览
 
 | 能力 | 说明 |
 |---|---|
 | **多站点反代** | 每个站点独立配置入口、回源、限速和流量配额 |
-| **自动后端发现** | 安全解析 30x、PlaybackInfo、HLS、DASH，并通过同源加密 capability 代理公网媒体后端 |
+| **自动后端发现** | Safe、Compatible、Extreme 三档模式自动选择 30x、PlaybackInfo、HLS、DASH 处理范围，并通过同源加密 capability 代理公网媒体后端 |
 | **身份与请求头** | 内置 UA 预设、自定义或透传模式；固定上游 Header 加密存储且不跨 authority 泄漏 |
 | **实时监控** | 按站点统计流量、限速和配额，SSE 实时更新仪表盘 |
 | **趋势与时区** | 速度、请求和流量趋势使用非负计费边界；日志、定时任务和趋势统一按所选 IANA 时区显示 |
 | **公开入口地址** | 站点路径入口跟随当前浏览器公开 Origin，适配 HTTPS 反向代理 |
 | **多入口模式** | 支持独立端口、路径入口、域名前缀入口，以及兼容模式；共享入口只接受精确 Host |
-| **线路容灾** | 主线路加最多 7 条备用线路，支持顺序切换、恢复回切、单条测速和延迟分级显示 |
+| **线路容灾** | 主线路加最多 7 条备用线路；每条线路独立选择 HTTP/HTTPS、地址和端口，支持顺序切换、恢复回切、测速和延迟分级显示 |
 | **播放兼容** | 支持 UA 预设/自定义/透传、真实客户端 IP、自动播放后端发现、受限重定向跟随和 HLS/DASH 兼容 |
 | **TLS 与证书** | 安装器可申请面板精确域名证书；面板内可使用 Cloudflare DNS-01 申请 `*.example.com` 泛域名证书并自动续签 |
-| **全局设置** | 流量计费周期、调度时区、探测缓存、日志写入/展示字段和 UI 圆角等设置 |
+| **全局设置** | 双向（入站 + 出站）或仅出站计费、流量周期、调度时区、探测缓存、日志字段和 UI 圆角等设置 |
 | **备份恢复** | 加密导出/恢复站点、账户、流量、日志、全局设置和 Telegram；TLS 数据需显式勾选 |
-| **通知与账户** | Telegram 日报、单管理员账户设置、密码/用户名修改后旧会话立即失效 |
+| **通知与账户** | Telegram 日报、单管理员账户设置、密码/用户名修改后旧会话立即失效；1 分钟内连续 5 次失败会锁定 60 秒并显示倒计时 |
 | **故障诊断** | 检查主回源、播放回源、TLS 证书和实际生效的 UA 配置 |
 | **轻量部署** | 单文件 Go 后端、原生前端、嵌入式 SQLite，无外部数据库和前端构建链 |
 
@@ -71,13 +66,13 @@ Meridian 把多站点反代、UA 身份、流量管控和故障诊断整合进�
 bash <(curl -fsSL https://raw.githubusercontent.com/snnabb/Meridian/master/install.sh)
 ```
 
-脚本会进入四项菜单：安装、更新、修改管理员密码、卸载。首次安装从最新 GitHub Release 下载二进制，校验 `SHA256SUMS` 及其 Sigstore/cosign 签名（旧版 Release 仅保留 SHA-256 兼容校验）；Linux systemd 部署默认使用独立的非 root 用户。
+脚本会进入四项菜单：安装、更新、修改管理员密码、卸载。首次安装会自动补齐 `curl`、证书、校验和文本处理等基础依赖；若 Release 带 Sigstore 签名，脚本会下载并校验固定版本的临时 cosign，再验证 `SHA256SUMS` 签名，无需用户预装 cosign。Linux systemd 部署默认使用独立的非 root 用户。
 
 安装完成后：
 
 1. 未配置域名时，安装器默认只绑定 `127.0.0.1`，请通过 HTTPS 反向代理访问；配置域名后访问对应的 HTTPS 地址。安装器申请的是面板精确域名证书；共享站点入口需要泛域名证书时，请在登录面板后进入“全局设置 → TLS 设置”完成 Cloudflare DNS-01 申请。若确需临时直接暴露明文 HTTP，必须显式设置 `ALLOW_INSECURE_HTTP=true`，不建议用于生产环境。
 2. 输入 1–64 个 UTF-8 字节的管理员账号、12–72 个 UTF-8 字节的密码并再次确认，以及安装时显示的初始化令牌。
-3. 创建站点并选择入口模式、回源和播放策略。
+3. 创建站点，选择入口模式，并按“协议、地址、端口”配置主线路和备用线路；HTTPS 新线路默认端口为 443。
 
 > [!IMPORTANT]
 > `SETUP_TOKEN` 等同于首次管理员创建权限。安装器将其保存在权限受限的 `/opt/meridian/.env`，新生成时只显示一次；若初始化仍待完成且安装器提示令牌已存在，root 可从该文件恢复。请同时存入密码管理器，不要放进 Issue、日志或截图。管理页面不会读取或返回服务端令牌。
@@ -113,7 +108,7 @@ Linux 可自动安装或复用 Nginx、Certbot，并为管理面板配置 HTTPS�
 |---|---|
 | **仪表盘** | 站点运行状态、实时连接、速度/请求/流量趋势、日志健康、Telegram 定时任务和当日概览；支持按站点和时间范围查看 |
 | **站点管理** | 添加、编辑、启停、删除和排序站点；显示入口地址、回源状态、流量额度、限速、缓存和线路延迟 |
-| **站点编辑器** | 配置入口模式、路径/域名前缀、主回源及备用线路、测速、UA、真实 IP、固定上游 Header、自动发现、播放策略、缓存和配额 |
+| **站点编辑器** | 配置入口模式、路径/域名前缀，以及采用独立协议/地址/端口字段的主线路和备用线路；自动发现只需选择三档模式，不再暴露无效的来源组合 |
 | **日志记录** | 按站点、状态、资源类别和关键词检索请求；可控制写入字段和页面展示字段，日志不保存查询参数、令牌、Cookie 或正文 |
 | **故障诊断** | 分别检查主回源、播放回源、备用线路、TLS、UA/请求头和本地代理状态；探针可达不等同于完整 Emby 播放可用 |
 | **全局设置** | 系统/UI、流量周期、IANA 调度时区、健康探测、日志存储及日志字段设置 |
@@ -185,6 +180,9 @@ services:
       - meridian-data:/app/data
     env_file:
       - .env
+    environment:
+      PANEL_BIND_ADDR: 0.0.0.0
+      ALLOW_INSECURE_HTTP: "true"
 
 volumes:
   meridian-data:
@@ -194,7 +192,7 @@ volumes:
 docker compose up -d
 ```
 
-`8001-8010` 是示例站点端口范围，请按实际配置调整。管理面板只映射到宿主机回环地址，建议由 HTTPS 反向代理对外提供访问。使用共享域名入口时，还需把 `TRUSTED_PROXY_CIDRS` 精确设置为实际代理 peer 网段；不要使用 `0.0.0.0/0`。
+`PANEL_BIND_ADDR=0.0.0.0` 只让面板监听容器网络，`ALLOW_INSECURE_HTTP=true` 只允许反向代理到容器的内部 HTTP 跳；宿主机仍通过 `127.0.0.1:9090:9090` 限制为回环访问。不要把该端口映射改成公网地址后继续使用明文 HTTP。`8001-8010` 是示例站点端口范围，请按实际配置调整。建议由 HTTPS 反向代理对外提供管理面板；使用共享域名入口时，还需把 `TRUSTED_PROXY_CIDRS` 精确设置为实际代理 peer 网段，不要使用 `0.0.0.0/0`。
 
 请备份 `.env` 和数据卷。不要把 `.env` 提交到版本库，也不要在重建容器时重新生成长期密钥。
 
@@ -229,7 +227,7 @@ $env:SETUP_TOKEN = New-MeridianSecret
 ```bash
 git clone https://github.com/snnabb/Meridian.git
 cd Meridian
-go build -trimpath -buildvcs=false -o meridian .
+go build -trimpath -buildvcs=false -o meridian ./cmd/meridian
 export JWT_SECRET="$(openssl rand -hex 32)"
 export UPSTREAM_HEADER_KEY="$(openssl rand -hex 32)"
 export DYNAMIC_ROUTE_KEY="$(openssl rand -hex 32)"
@@ -269,6 +267,10 @@ export SETUP_TOKEN="$(openssl rand -hex 32)"
 
 四个长期密钥必须两两不同，并与 SQLite 数据一起备份。丢失 `UPSTREAM_HEADER_KEY` 会让已有加密 Header 无法解密；丢失 `MERIDIAN_SECRET_KEY` 会让已保存的 Cloudflare/Telegram 凭据无法解密；轮换 `DYNAMIC_ROUTE_KEY` 会让正在使用的 capability 立即失效。一键安装器会生成并维护这些值。
 
+### 流量计费
+
+默认“入站 + 出站”模式会把客户端上传到 Meridian 的代理载荷字节与 Meridian 返回给客户端的代理载荷字节各计算一次，即 `入站 + 出站`，不会再额外乘以 2。“仅出站”模式只计算返回给客户端的字节。站点配额、总览、趋势图和 Telegram 报告统一使用所选模式。
+
 <details>
 <summary><strong>离线重置管理员密码</strong></summary>
 
@@ -289,7 +291,7 @@ systemd 部署优先使用安装器的 `password` 操作；它会先备份数据
 
 ### 自动播放后端发现
 
-自动发现按站点启用，需要 `DYNAMIC_ROUTE_KEY`。推荐从 **Safe** 开始，只有真实播放链需要时再逐级放宽：
+自动发现按站点启用，需要 `DYNAMIC_ROUTE_KEY`。新站点默认使用 **Compatible**；明确只需要 HTTPS:443 且可维护域名规则时可改用 **Safe**，只有真实播放链需要时才选择 **Extreme**：
 
 | Profile | 默认发现来源 | 未知目标网络边界 | 适用场景 |
 |---|---|---|---|
@@ -297,7 +299,7 @@ systemd 部署优先使用安装器的 `password` 操作；它会先备份数据
 | **Compatible** | 30x + PlaybackInfo + HLS + DASH | 公网 HTTP(S)、任意有效端口 | 使用标准 HLS/DASH 或非 443 公网后端 |
 | **Extreme** | Compatible + 扩展结构和方法兼容 | 同上，资源与解析预算更高 | 仅在证据表明前两档不足时启用 |
 
-“解析 PlaybackInfo”可以单独关闭；30x 发现始终保留，Compatible/Extreme 的 HLS/DASH 也始终保留。Safe 的空域名规则允许具有受识别公共后缀的公网 DNS 主机；配置 `exact` / `suffix` 后会收窄为规则并集。
+前端不再提供来源复选框或 HTTPS 降级开关：每个 Profile 都是完整、可审计的策略预设，切换模式时由后端统一选择处理来源和网络边界。Safe 启用时必须至少配置一条可信的 `exact` / `suffix` DNS 规则。
 
 手工“重定向跟随”独立于自动发现 Profile：对站点数据面的非 Upgrade GET/HEAD 处理 301/302/303/307/308，最多跟随 5 跳，每一跳只能命中管理员精确配置的播放回源 authority；因此可使用私网、HTTP 或非标准端口的显式目标，而不会扩大自动发现范围。跨 authority 仍清除 Cookie、Authorization、Emby token、固定上游 Header 和转发头；CONNECT、WebSocket/Upgrade、保留 capability 路径、POST/PUT/DELETE 和请求正文不会跟随。
 
@@ -332,10 +334,21 @@ flowchart LR
 
 | 组件 | 技术选型 |
 |---|---|
-| 后端 | 单文件 Go，标准库 `net/http` |
+| 后端 | Go 可执行程序，标准库 `net/http` |
 | 前端 | 原生 HTML/CSS/JavaScript SPA，通过 `embed.FS` 嵌入 |
 | 数据库 | `modernc.org/sqlite`，纯 Go、无 CGO |
 | 认证 | HMAC-SHA256 JWT + `HttpOnly`、`SameSite=Strict` Cookie |
+
+### 项目结构
+
+```text
+cmd/meridian/       Go 可执行程序与同包测试
+web/                通过 go:embed 打包的原生 SPA
+tests/              前端与安装脚本回归测试
+docs/               README 截图与项目文档资源
+.github/workflows/  CI、CodeQL 与发布签名流程
+install.sh          一键安装、更新、改密与卸载入口
+```
 
 ## 诊断与运维
 
@@ -383,10 +396,10 @@ git clone https://github.com/snnabb/Meridian.git
 cd Meridian
 go test -race ./...
 go vet ./...
-go build -trimpath -buildvcs=false -o meridian .
+go build -trimpath -buildvcs=false -o meridian ./cmd/meridian
 ```
 
-项目有意保持单文件 Go 后端、原生前端和纯 Go SQLite 驱动。提交改动前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。安全问题不要创建公开 Issue，请按 [SECURITY.md](SECURITY.md) 私下报告。
+项目有意保持单一 Go 可执行程序、原生前端和纯 Go SQLite 驱动。提交改动前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。安全问题不要创建公开 Issue，请按 [SECURITY.md](SECURITY.md) 私下报告。
 
 - [Releases](https://github.com/snnabb/Meridian/releases)
 - [Issues](https://github.com/snnabb/Meridian/issues)

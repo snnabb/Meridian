@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 type shortReadCloser struct {
@@ -34,6 +35,19 @@ type shortResponseWriter struct {
 	buf    bytes.Buffer
 }
 
+type shortErrorResponseWriter struct {
+	header http.Header
+}
+
+func (writer *shortErrorResponseWriter) Header() http.Header { return writer.header }
+func (writer *shortErrorResponseWriter) WriteHeader(int)     {}
+func (writer *shortErrorResponseWriter) Write(payload []byte) (int, error) {
+	if len(payload) == 0 {
+		return 0, nil
+	}
+	return 1, io.ErrUnexpectedEOF
+}
+
 func (w *shortResponseWriter) Header() http.Header { return w.header }
 func (w *shortResponseWriter) WriteHeader(int)     {}
 func (w *shortResponseWriter) Write(p []byte) (int, error) {
@@ -54,25 +68,110 @@ func newQuotaForRegressionTest(t *testing.T, quotaBytes int64) *trafficQuotaStat
 }
 
 func TestMeteredReaderDoesNotTreatOrdinaryShortReadAsQuota(t *testing.T) {
+	quota := newQuotaForRegressionTest(t, 100)
 	reader := &meteredReader{
 		ReadCloser: &shortReadCloser{data: []byte("x")},
-		quota:      newQuotaForRegressionTest(t, 100),
+		quota:      quota,
 	}
 	buf := make([]byte, 4)
 	n, err := reader.Read(buf)
 	if n != 1 || err != nil {
 		t.Fatalf("short read = (%d, %v), want (1, nil)", n, err)
 	}
+	quota.mu.Lock()
+	usage := quota.usage
+	quota.mu.Unlock()
+	if usage != 1 {
+		t.Fatalf("quota usage after short read = %d, want 1", usage)
+	}
 }
 
 func TestMeteredWriterDoesNotTreatOrdinaryShortWriteAsQuota(t *testing.T) {
+	quota := newQuotaForRegressionTest(t, 100)
 	writer := &meteredWriter{
 		ResponseWriter: &shortResponseWriter{header: make(http.Header)},
-		quota:          newQuotaForRegressionTest(t, 100),
+		quota:          quota,
 	}
 	n, err := writer.Write([]byte("abcd"))
 	if n != 1 || err != nil {
 		t.Fatalf("short write = (%d, %v), want (1, nil)", n, err)
+	}
+	quota.mu.Lock()
+	usage := quota.usage
+	quota.mu.Unlock()
+	if usage != 1 {
+		t.Fatalf("quota usage after short write = %d, want 1", usage)
+	}
+}
+
+func TestWriterAdaptersSettleQuotaUsingActualBytes(t *testing.T) {
+	tests := []struct {
+		name      string
+		write     func(*trafficQuotaState) (int, error)
+		wantError bool
+	}{
+		{
+			name: "unpaced rate-limited writer",
+			write: func(quota *trafficQuotaState) (int, error) {
+				writer := &rateLimitedWriter{ResponseWriter: &shortResponseWriter{header: make(http.Header)}, quota: quota}
+				return writer.Write([]byte("abcd"))
+			},
+		},
+		{
+			name: "paced rate-limited writer",
+			write: func(quota *trafficQuotaState) (int, error) {
+				writer := &rateLimitedWriter{
+					ResponseWriter: &shortErrorResponseWriter{header: make(http.Header)},
+					bytesPerSec:    1024,
+					quota:          quota,
+					start:          time.Now().Add(-time.Second),
+				}
+				return writer.Write([]byte("abcd"))
+			},
+			wantError: true,
+		},
+		{
+			name: "unpaced tunnel writer",
+			write: func(quota *trafficQuotaState) (int, error) {
+				writer := &tunnelWriter{dst: &shortResponseWriter{header: make(http.Header)}, quota: quota}
+				return writer.Write([]byte("abcd"))
+			},
+		},
+		{
+			name: "paced tunnel writer",
+			write: func(quota *trafficQuotaState) (int, error) {
+				writer := &tunnelWriter{
+					dst:         &shortErrorResponseWriter{header: make(http.Header)},
+					bytesPerSec: 1024,
+					quota:       quota,
+					start:       time.Now().Add(-time.Second),
+				}
+				return writer.Write([]byte("abcd"))
+			},
+			wantError: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			quota := newQuotaForRegressionTest(t, 100)
+			written, err := test.write(quota)
+			if written != 1 {
+				t.Fatalf("written = %d, want 1", written)
+			}
+			if test.wantError && !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("error = %v, want io.ErrUnexpectedEOF", err)
+			}
+			if !test.wantError && err != nil {
+				t.Fatalf("error = %v, want nil", err)
+			}
+			quota.mu.Lock()
+			usage := quota.usage
+			quota.mu.Unlock()
+			if usage != 1 {
+				t.Fatalf("quota usage = %d, want 1", usage)
+			}
+		})
 	}
 }
 

@@ -28,14 +28,14 @@ const (
 	maxSpeedLimitMbps      = 1000000
 	maxLoginFailures       = 5
 	maxTrackedLoginClients = 10000
-	loginFailureWindow     = 15 * time.Minute
-	loginLockoutDuration   = 15 * time.Minute
+	loginFailureWindow     = time.Minute
+	loginLockoutDuration   = time.Minute
 )
 
 var startTime = time.Now()
 
 // appVersion is overridable at build time via -ldflags "-X main.appVersion=vX.Y.Z".
-var appVersion = "v1.12.0"
+var appVersion = "v1.12.2"
 
 func main() {
 	if handled, err := runCommandLine(os.Args[1:], os.Stdin, os.Stdout); handled {
@@ -280,7 +280,7 @@ func main() {
 	// bound by ProxyManager and are not affected by PANEL_BIND_ADDR.
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           app.publicHostRouter(panelBodyReadDeadline(securityHeaders(mux))),
+		Handler:           app.publicHostRouter(panelBodyReadDeadline(securityHeaders(mux, app.trustedProxies))),
 		ReadHeaderTimeout: 10 * time.Second,
 		// Shared-host site traffic can include long-running uploads. Header and
 		// per-endpoint body limits protect the panel without imposing a 30-second

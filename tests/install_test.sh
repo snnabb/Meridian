@@ -79,6 +79,62 @@ assert_not_contains() {
 }
 
 assert_eq 'snnabb/Meridian' "$REPO" 'default repository owner'
+assert_eq 'v2.6.4' "$COSIGN_VERSION" 'pinned cosign bootstrap version'
+
+# Signed releases bootstrap a temporary, checksum-pinned cosign instead of
+# requiring a fresh machine to install it manually.
+(
+    bootstrap_dir=$(mktemp -d "${TEST_ROOT}/cosign-bootstrap.XXXXXX")
+    command() {
+        if [ "$1" = -v ] && [ "$2" = cosign ]; then return 1; fi
+        builtin command "$@"
+    }
+    detect_platform() { printf 'linux-amd64\n'; }
+    download() {
+        cat > "$2" <<'COSIGN'
+#!/usr/bin/env sh
+exit 0
+COSIGN
+    }
+    cosign_sha256_for_platform() { sha256_file "${bootstrap_dir}/expected-cosign"; }
+    cat > "${bootstrap_dir}/expected-cosign" <<'COSIGN'
+#!/usr/bin/env sh
+exit 0
+COSIGN
+    ensure_cosign "$bootstrap_dir"
+    assert_eq "${bootstrap_dir}/cosign-linux-amd64" "$COSIGN_BIN" 'temporary cosign path'
+    [ -x "$COSIGN_BIN" ] || { echo 'FAIL: bootstrapped cosign is not executable' >&2; exit 1; }
+)
+
+if (
+    bootstrap_dir=$(mktemp -d "${TEST_ROOT}/cosign-corrupt.XXXXXX")
+    command() {
+        if [ "$1" = -v ] && [ "$2" = cosign ]; then return 1; fi
+        builtin command "$@"
+    }
+    detect_platform() { printf 'linux-amd64\n'; }
+    download() { printf 'corrupt\n' > "$2"; }
+    cosign_sha256_for_platform() { printf '%064d\n' 0; }
+    ensure_cosign "$bootstrap_dir"
+) >/dev/null 2>&1; then
+    echo 'FAIL: corrupt bootstrapped cosign was accepted' >&2
+    exit 1
+fi
+
+(
+    signed_dir=$(mktemp -d "${TEST_ROOT}/cosign-signed.XXXXXX")
+    cosign_log="${signed_dir}/cosign.log"
+    cat > "${signed_dir}/cosign" <<COSIGN
+#!/usr/bin/env sh
+printf '%s\n' "\$*" > "${cosign_log}"
+COSIGN
+    chmod 0755 "${signed_dir}/cosign"
+    COSIGN_BIN="${signed_dir}/cosign"
+    download() { printf 'bundle\n' > "$2"; }
+    verify_release_signature v9.9.9 "${signed_dir}/SHA256SUMS" "${signed_dir}/SHA256SUMS.bundle"
+    assert_contains "$cosign_log" '--certificate-identity https://github.com/snnabb/Meridian/.github/workflows/release.yml@refs/tags/v9.9.9'
+    assert_not_contains "$cosign_log" '--certificate-identity-regexp'
+)
 
 write_legacy_systemd_service() {
     cat > "$SERVICE_FILE" <<'UNIT'

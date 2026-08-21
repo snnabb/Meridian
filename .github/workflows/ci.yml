@@ -70,4 +70,4 @@ jobs:
         run: bash tests/docker_entrypoint_test.sh
 
       - name: Build
-        run: go build -trimpath -buildvcs=false -o meridian .
+        run: go build -trimpath -buildvcs=false -o meridian ./cmd/meridian

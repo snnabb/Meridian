@@ -14,6 +14,7 @@ SERVICE_NAME="${MERIDIAN_SERVICE_NAME:-meridian}"
 NGINX_CONFIG="${MERIDIAN_NGINX_CONFIG:-/etc/nginx/conf.d/meridian-panel.conf}"
 NGINX_ROOT="${MERIDIAN_NGINX_ROOT:-/etc/nginx}"
 BIN_NAME="meridian"
+COSIGN_VERSION="v2.6.4"
 SERVICE_USER="meridian"
 SERVICE_GROUP="meridian"
 SYSTEMD_RESTRICT_ADDRESS_FAMILIES="AF_UNIX AF_INET AF_INET6 AF_NETLINK"
@@ -49,6 +50,7 @@ PASSWORD_DB_PATH=""
 PASSWORD_TRANSACTION=0
 PANEL_WORK_DIR=""
 PANEL_TRANSACTION=0
+COSIGN_BIN=""
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -350,17 +352,51 @@ download() {
         --retry 3 --retry-delay 2 --connect-timeout 15 -fsSL "$1" -o "$2"
 }
 
+cosign_sha256_for_platform() {
+    case "$1" in
+        darwin-amd64) printf '%s\n' 'ec648fddfedf1dad59dff9fbab177284a618204e03126ea37a87ab3cec4e7cb1' ;;
+        darwin-arm64) printf '%s\n' 'b2987c1b55a1e2735c59ac5c3e140acbf7ba5c1ed0cc07dbbf1b85676595237e' ;;
+        linux-amd64) printf '%s\n' '309779b0c4e409186b0a80daba99041fe2cf65a920ce645013901df6211895a9' ;;
+        linux-arm64) printf '%s\n' 'df408e5418129306fed7349ec46e27be0445d05c5127c07f435e9a566af67593' ;;
+        *) return 1 ;;
+    esac
+}
+
+ensure_cosign() {
+    local tmp_dir="$1" suffix expected actual candidate existing
+    if [ -n "$COSIGN_BIN" ] && [ -x "$COSIGN_BIN" ]; then
+        return 0
+    fi
+    existing=$(command -v cosign 2>/dev/null || true)
+    if [ -n "$existing" ]; then
+        COSIGN_BIN="$existing"
+        return 0
+    fi
+
+    suffix=$(detect_platform)
+    expected=$(cosign_sha256_for_platform "$suffix") \
+        || fail "cosign 不支持当前平台: $suffix"
+    candidate="${tmp_dir}/cosign-${suffix}"
+    info "本机缺少 cosign，正在获取经过固定校验的 Sigstore cosign ${COSIGN_VERSION}..."
+    download "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-${suffix}" "$candidate" \
+        || fail "cosign 下载失败，无法验证已签名 Release"
+    actual=$(sha256_file "$candidate" | tr '[:upper:]' '[:lower:]')
+    [ "$actual" = "$expected" ] || fail "cosign 下载文件 SHA-256 校验失败"
+    chmod 0755 "$candidate"
+    COSIGN_BIN="$candidate"
+    ok "cosign ${COSIGN_VERSION} 已准备就绪（仅用于本次校验）"
+}
+
 verify_release_signature() {
     local version="$1" checksum_file="$2" bundle_file="$3" identity
     if ! download "https://github.com/${REPO}/releases/download/${version}/SHA256SUMS.bundle" "$bundle_file" 2>/dev/null; then
         warn "该 Release 没有 Sigstore 签名清单，继续执行兼容的 SHA-256 校验"
         return 0
     fi
-    command -v cosign >/dev/null 2>&1 \
-        || fail "该 Release 已签名，但本机缺少 cosign；请先安装 Sigstore cosign 后重试"
+    ensure_cosign "${bundle_file%/*}"
     identity="https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${version}"
-    cosign verify-blob --bundle "$bundle_file" \
-        --certificate-identity-regexp "$identity" \
+    "$COSIGN_BIN" verify-blob --bundle "$bundle_file" \
+        --certificate-identity "$identity" \
         --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
         "$checksum_file" >/dev/null \
         || fail "SHA256SUMS 的 Sigstore 签名验证失败"
@@ -1049,6 +1085,53 @@ detect_package_manager() {
     elif command -v pacman >/dev/null 2>&1; then printf 'pacman\n'
     else return 1
     fi
+}
+
+install_cli_packages() {
+    local manager="$1"
+    case "$manager" in
+        apt)
+            as_root apt-get update
+            as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates coreutils gawk grep sed tar
+            ;;
+        dnf)
+            as_root dnf install -y curl ca-certificates coreutils gawk grep sed tar
+            ;;
+        yum)
+            as_root yum install -y curl ca-certificates coreutils gawk grep sed tar
+            ;;
+        apk)
+            as_root apk add --no-cache bash curl ca-certificates coreutils gawk grep sed tar
+            ;;
+        pacman)
+            as_root pacman -S --noconfirm --needed bash curl ca-certificates coreutils gawk grep sed tar
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+ensure_cli_dependencies() {
+    local action="$1" manager command_name
+    local required=(curl awk grep cmp install mktemp sed tr)
+    local missing=()
+    if [ "$action" = update ] || [ "$action" = password ]; then
+        required+=(tar)
+    fi
+    for command_name in "${required[@]}"; do
+        command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
+    done
+    [ "${#missing[@]}" -eq 0 ] && return 0
+    if [ "$(uname -s)" = Darwin ]; then
+        fail "缺少必要命令: ${missing[*]}；请先安装 Xcode Command Line Tools"
+    fi
+    manager=$(detect_package_manager) \
+        || fail "缺少必要命令 ${missing[*]}，且未找到受支持的包管理器"
+    info "正在使用 ${manager} 补齐安装依赖: ${missing[*]}"
+    install_cli_packages "$manager" \
+        || fail "自动安装基础依赖失败"
+    for command_name in "${required[@]}"; do
+        need_cmd "$command_name"
+    done
 }
 
 install_panel_packages() {
@@ -1757,15 +1840,8 @@ do_install() {
     local current_binary="${INSTALL_DIR}/${BIN_NAME}" tmp_dir version
     INITIAL_SETUP_TOKEN=""
     SETUP_TOKEN_ORIGIN=""
-    need_cmd curl
-    need_cmd awk
-    need_cmd grep
-    need_cmd cmp
-    need_cmd install
-    need_cmd mktemp
-    need_cmd sed
-    need_cmd tr
     init_privilege
+    ensure_cli_dependencies install
     validate_install_dir
     validate_data_dir
     validate_backup_dir
@@ -1829,14 +1905,8 @@ do_update() {
     UPDATE_SERVICE_SNAPSHOT=""
     UPDATE_SERVICE_CHANGED=0
     [ -x "$current_binary" ] || fail "Meridian 尚未安装，请先运行 install"
-    need_cmd curl
-    need_cmd tar
-    need_cmd mktemp
-    need_cmd awk
-    need_cmd grep
-    need_cmd sed
-    need_cmd cmp
     init_privilege
+    ensure_cli_dependencies update
     is_systemd && [ ! -f "$SERVICE_FILE" ] \
         && fail "找不到 Meridian systemd 服务，请重新运行 install 修复安装"
     as_root test -L "$(env_file_path)" \
@@ -2032,8 +2102,8 @@ do_password() {
     [ -x "$current_binary" ] || fail "Meridian 尚未安装"
     is_systemd || fail "自动修改密码要求 Meridian 由 systemd 管理"
     init_privilege
+    ensure_cli_dependencies password
     [ -f "$SERVICE_FILE" ] || fail "找不到 Meridian systemd 服务，请重新运行 install 修复安装"
-    need_cmd tar
     IFS= read -r -s -p "请输入新管理员密码（12-72 字节）: " password
     printf '\n'
     IFS= read -r -s -p "请再次输入新密码: " password_again

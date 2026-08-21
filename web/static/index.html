@@ -5,9 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Meridian — Emby 反代管理面板</title>
 <meta name="description" content="Meridian 轻量级 Emby 反向代理管理面板">
-<link rel="icon" type="image/svg+xml" href="/favicon.svg?v=1.12.0">
-<script src="/js/theme.js?v=1.12.0"></script>
-<link rel="stylesheet" href="/css/style.css?v=1.12.0">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg?v=1.12.2">
+<script src="/js/theme.js?v=1.12.2"></script>
+<link rel="stylesheet" href="/css/style.css?v=1.12.2">
 </head>
 <body class="auth-checking">
 
@@ -46,6 +46,7 @@
         <div class="form-help" id="setup-token-help">首次创建管理员时必须填写。仅在初始化仍待完成时，root 才可从 /opt/meridian/.env 恢复现有 SETUP_TOKEN；本页面不会读取或显示服务端令牌。</div>
       </div>
       <button type="submit" class="btn-login" id="btn-login" disabled>正在检查...</button>
+      <div class="login-rate-limit" id="login-rate-limit" role="status" hidden></div>
     </form>
     <div class="login-footer" id="login-footer" hidden></div>
   </div>
@@ -58,7 +59,7 @@
     <div class="sidebar-brand">
       <img src="/favicon.svg" alt="" class="sidebar-logo">
       <span class="sidebar-brand-name">Meridian</span>
-      <span class="sidebar-version" id="sidebar-version">v1.12.0</span>
+      <span class="sidebar-version" id="sidebar-version">v1.12.2</span>
     </div>
     <nav class="sidebar-nav" aria-label="功能菜单">
       <a href="#dashboard" class="topnav-link active" data-page="dashboard" title="仪表盘">
@@ -143,16 +144,16 @@
 <!-- Login errors must remain visible while the application shell is hidden. -->
 <div id="toast-container" aria-live="polite"></div>
 
-<script src="/js/api.js?v=1.12.0"></script>
-<script src="/js/toast.js?v=1.12.0"></script>
-<script src="/js/router.js?v=1.12.0"></script>
-<script src="/js/pages/dashboard.js?v=1.12.0"></script>
-<script src="/js/pages/sites.js?v=1.12.0"></script>
-<script src="/js/pages/diag.js?v=1.12.0"></script>
-<script src="/js/pages/request-logs.js?v=1.12.0"></script>
-<script src="/js/pages/telegram-report.js?v=1.12.0"></script>
-<script src="/js/pages/global-settings.js?v=1.12.0"></script>
-<script src="/js/pages/account.js?v=1.12.0"></script>
-<script src="/js/app.js?v=1.12.0"></script>
+<script src="/js/api.js?v=1.12.2"></script>
+<script src="/js/toast.js?v=1.12.2"></script>
+<script src="/js/router.js?v=1.12.2"></script>
+<script src="/js/pages/dashboard.js?v=1.12.2"></script>
+<script src="/js/pages/sites.js?v=1.12.2"></script>
+<script src="/js/pages/diag.js?v=1.12.2"></script>
+<script src="/js/pages/request-logs.js?v=1.12.2"></script>
+<script src="/js/pages/telegram-report.js?v=1.12.2"></script>
+<script src="/js/pages/global-settings.js?v=1.12.2"></script>
+<script src="/js/pages/account.js?v=1.12.2"></script>
+<script src="/js/app.js?v=1.12.2"></script>
 </body>
 </html>

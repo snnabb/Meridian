@@ -81,15 +81,15 @@ func dashboardTrendWindowWithLocation(name string, now, customStart, customEnd t
 		if elapsed < time.Minute {
 			elapsed = time.Minute
 		}
-			// Keep month samples fine enough to expose short traffic spikes. A
-			// 15-minute bucket is preferred for the first three weeks; longer
-			// months fall back to 30 minutes so the response stays compact.
-			const maxMonthPoints = 2048
-			candidates := []time.Duration{15 * time.Minute, 30 * time.Minute, time.Hour, 2 * time.Hour, 6 * time.Hour, 12 * time.Hour, 24 * time.Hour}
-			bucket = 24 * time.Hour
-			for _, candidate := range candidates {
-				count := (elapsed + candidate - time.Nanosecond) / candidate
-				if count <= maxMonthPoints {
+		// Keep month samples fine enough to expose short traffic spikes. A
+		// 15-minute bucket is preferred for the first three weeks; longer
+		// months fall back to 30 minutes so the response stays compact.
+		const maxMonthPoints = 2048
+		candidates := []time.Duration{15 * time.Minute, 30 * time.Minute, time.Hour, 2 * time.Hour, 6 * time.Hour, 12 * time.Hour, 24 * time.Hour}
+		bucket = 24 * time.Hour
+		for _, candidate := range candidates {
+			count := (elapsed + candidate - time.Nanosecond) / candidate
+			if count <= maxMonthPoints {
 				bucket = candidate
 				break
 			}
@@ -155,7 +155,7 @@ func (pm *ProxyManager) pendingDashboardTraffic(siteID *int64) map[int64]dashboa
 	return result
 }
 
-func dashboardTrendPoints(start, end time.Time, bucket time.Duration, rangeName string, billingMode string, logs []TrafficLog, pending dashboardPendingTraffic) []dashboardTrendPoint {
+func dashboardTrendPoints(start, end time.Time, bucket time.Duration, rangeName string, billingMode string, logs []TrafficLog, pending dashboardPendingTraffic, pendingAt time.Time) []dashboardTrendPoint {
 	count := int((end.Sub(start) + bucket - time.Nanosecond) / bucket)
 	if count < 1 {
 		count = 1
@@ -183,16 +183,17 @@ func dashboardTrendPoints(start, end time.Time, bucket time.Duration, rangeName 
 			points[index].Requests += logRow.Requests
 		}
 	}
-	if len(points) > 0 {
-		last := &points[len(points)-1]
+	if !pendingAt.IsZero() && !pendingAt.Before(start) && pendingAt.Before(end) {
+		index := int((pendingAt.UnixMilli() - start.UnixMilli()) / bucketMS)
+		current := &points[index]
 		if pending.BytesIn > 0 {
-			last.BytesIn += pending.BytesIn
+			current.BytesIn += pending.BytesIn
 		}
 		if pending.BytesOut > 0 {
-			last.BytesOut += pending.BytesOut
+			current.BytesOut += pending.BytesOut
 		}
 		if pending.Requests > 0 {
-			last.Requests += pending.Requests
+			current.Requests += pending.Requests
 		}
 	}
 	for i := range points {
@@ -239,7 +240,8 @@ func (pm *ProxyManager) dashboardTrends(siteID *int64, rangeName string, customW
 		}
 		customStart, customEnd = customWindow[0], customWindow[1]
 	}
-	name, start, end, bucket, err := dashboardTrendWindowWithLocation(rangeName, time.Now(), customStart, customEnd, trendLocation)
+	now := time.Now()
+	name, start, end, bucket, err := dashboardTrendWindowWithLocation(rangeName, now, customStart, customEnd, trendLocation)
 	if err != nil {
 		return nil, err
 	}
@@ -268,13 +270,13 @@ func (pm *ProxyManager) dashboardTrends(siteID *int64, rangeName string, customW
 		aggregatePending.BytesOut += value.BytesOut
 		aggregatePending.Requests += value.Requests
 	}
-	points := dashboardTrendPoints(start, end, bucket, name, billingMode, logs, aggregatePending)
+	points := dashboardTrendPoints(start, end, bucket, name, billingMode, logs, aggregatePending, now)
 	siteSeries := make([]dashboardTrendSite, 0, len(selectedSites))
 	for _, site := range selectedSites {
 		siteSeries = append(siteSeries, dashboardTrendSite{
 			SiteID:   site.ID,
 			SiteName: site.Name,
-			Points:   dashboardTrendPoints(start, end, bucket, name, billingMode, logsBySite[site.ID], pendingBySite[site.ID]),
+			Points:   dashboardTrendPoints(start, end, bucket, name, billingMode, logsBySite[site.ID], pendingBySite[site.ID], now),
 		})
 	}
 	return &dashboardTrendsResponse{

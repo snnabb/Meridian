@@ -106,8 +106,8 @@ func TestTelegramReportTrafficUsesGlobalBillingMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build bidirectional stats: %v", err)
 	}
-	if dual.TodayTraffic != 200 || dual.HistoryTraffic != 200 || len(dual.TopTraffic) != 1 || dual.TopTraffic[0].Traffic != 200 {
-		t.Fatalf("bidirectional stats = %+v, want traffic 200", dual)
+	if dual.TodayTraffic != 100 || dual.HistoryTraffic != 100 || len(dual.TopTraffic) != 1 || dual.TopTraffic[0].Traffic != 100 {
+		t.Fatalf("bidirectional stats = %+v, want traffic 100", dual)
 	}
 
 	settings := app.db.currentSystemSettings()

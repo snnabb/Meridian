@@ -15,7 +15,7 @@
 说明你如何验证这个改动是正确的：
 
 - [ ] `go test ./...` 通过
-- [ ] `go build -o meridian .` 编译通过
+- [ ] `go build -o meridian ./cmd/meridian` 编译通过
 - [ ] 手动测试了以下场景：
   - ...
 

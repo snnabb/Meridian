@@ -92,7 +92,7 @@ class FakeDocument {
       'inp-username', 'admin-username-help', 'inp-password', 'admin-password-help',
       'confirm-password-group', 'inp-confirm-password', 'setup-token-group',
       'inp-setup-token', 'btn-toggle-setup-token', 'auth-check-status',
-      'auth-check-message', 'btn-auth-retry', 'modal-overlay', 'modal-body',
+      'auth-check-message', 'btn-auth-retry', 'login-rate-limit', 'modal-overlay', 'modal-body',
       'modal-close', 'avatar-btn', 'page-diagnostics',
     ];
     for (const id of ids) {
@@ -169,15 +169,21 @@ function loadAuthHarness(options = {}) {
   const setupHandler = typeof options.setupHandler === 'function'
     ? options.setupHandler
     : username => ({ username });
+  const loginHandler = typeof options.loginHandler === 'function'
+    ? options.loginHandler
+    : username => ({ username });
   let checkIndex = 0;
   let timerId = 0;
+  let nowMs = 1_800_000_000_000;
+  const timers = new Map();
 
   const sandbox = {
     document,
     console,
     confirm: () => false,
-    setInterval: () => ++timerId,
-    clearInterval() {},
+    Date: class extends Date { static now() { return nowMs; } },
+    setInterval(callback) { const id = ++timerId; timers.set(id, callback); return id; },
+    clearInterval(id) { timers.delete(id); },
     loadDashboardData() {},
     stopDashSSE() {},
     stopTrafficRefresh() {},
@@ -209,7 +215,7 @@ function loadAuthHarness(options = {}) {
       },
       login(username, password) {
         state.logins.push({ username, password });
-        return { username };
+        return loginHandler(username, password);
       },
       logout() {},
       recordSession(data) { state.sessions.push(data); },
@@ -243,6 +249,10 @@ function loadAuthHarness(options = {}) {
     document,
     state,
     get(id) { return document.getElementById(id); },
+    advance(milliseconds) {
+      nowMs += milliseconds;
+      for (const callback of [...timers.values()]) callback();
+    },
   };
 }
 
@@ -343,6 +353,33 @@ test('setup and existing-admin login remain separate with no manual register pat
   await login.get('loginForm').dispatch('submit');
   assert.deepEqual(login.state.logins, [{ username: 'u'.repeat(65), password: 'p'.repeat(73) }],
     'login performs only the generic nonempty-field check');
+});
+
+test('rate-limited login shows and completes the server countdown', async () => {
+  const rateLimitError = new Error('too many login attempts; try again later');
+  rateLimitError.status = 429;
+  rateLimitError.retryAfterSeconds = 60;
+  const harness = loadAuthHarness({
+    checks: [{ needs_setup: false, authenticated: false, mode: 'single_admin' }],
+    loginHandler() { return Promise.reject(rateLimitError); },
+  });
+  await flushTasks();
+  harness.get('inp-username').value = 'admin';
+  harness.get('inp-password').value = 'wrong password';
+  await harness.get('loginForm').dispatch('submit');
+
+  assert.equal(harness.state.errors.at(-1), '登录尝试次数过多，请在 60 秒后重试');
+  assert.equal(harness.get('btn-login').disabled, true);
+  assert.equal(harness.get('btn-login').textContent, '60 秒后重试');
+  assert.equal(harness.get('login-rate-limit').hidden, false);
+  assert.match(harness.get('login-rate-limit').textContent, /60 秒后/);
+
+  harness.advance(1000);
+  assert.equal(harness.get('btn-login').textContent, '59 秒后重试');
+  harness.advance(59000);
+  assert.equal(harness.get('btn-login').disabled, false);
+  assert.equal(harness.get('btn-login').textContent, '登录');
+  assert.equal(harness.get('login-rate-limit').hidden, true);
 });
 
 test('a setup conflict rechecks once and switches the stale client to login', async () => {

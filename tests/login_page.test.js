@@ -20,7 +20,8 @@ test('login notifications remain outside the hidden application shell', () => {
 
 test('login failures show Chinese credential and rate-limit messages', () => {
   assert.match(app, /return '用户名或密码错误'/);
-  assert.match(app, /return '登录尝试次数过多，请稍后重试'/);
+  assert.match(app, /登录尝试次数过多，请在 \$\{Math\.ceil\(seconds\)\} 秒后重试/);
+  assert.match(app, /loginButtonEl\.textContent = `\$\{remaining\} 秒后重试`/);
   assert.match(app, /Toast\.error\(loginErrorMessage\(err\)\)/);
 });
 

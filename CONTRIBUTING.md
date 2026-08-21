@@ -9,16 +9,16 @@
 - 无 CGO 依赖（SQLite 使用纯 Go 实现 `modernc.org/sqlite`）
 
 ```bash
-git clone https://github.com/chanhui800/Meridian.git
+git clone https://github.com/snnabb/Meridian.git
 cd Meridian
-go build -o meridian .
+go build -o meridian ./cmd/meridian
 go test ./...
 node --test tests/*.test.js
 ```
 
 ## 项目架构约定
 
-- **后端保持轻量**：核心代理逻辑位于 `main.go`，独立模块按现有职责文件组织，不引入不必要的包层级
+- **后端保持轻量**：可执行程序位于 `cmd/meridian/`，独立模块按现有职责文件组织，不引入不必要的包层级
 - **前端是原生 JS**：不使用框架，不引入构建工具。页面按文件拆分在 `web/static/js/pages/` 下
 - **SQLite 驱动名是 `sqlite`**（不是 `sqlite3`），不要更换驱动
 - **嵌入方式**：前端通过 `web/embed.go` 的 `go:embed` 指令嵌入二进制
@@ -29,7 +29,7 @@ node --test tests/*.test.js
 2. 从 `main` 分支创建你的特性分支
 3. 修改代码
 4. 确保 `go test ./...`、`go vet ./...` 和 `node --test tests/*.test.js` 通过
-5. 确保 `go build -trimpath -buildvcs=false -o meridian .` 能正常编译
+5. 确保 `go build -trimpath -buildvcs=false -o meridian ./cmd/meridian` 能正常编译
 6. 提交 PR，使用 [PR 模板](.github/PULL_REQUEST_TEMPLATE.md) 填写说明
 
 ## 提交规范
@@ -55,7 +55,7 @@ Commit message 应简明扼要地说明改了什么：
 
 ## 什么样的改动会被拒绝
 
-- 仅为形式统一而进行的大范围目录或包拆分
+- 仅为形式统一而进行、没有构建或维护收益的包拆分
 - 引入前端构建工具链（webpack、vite 等）
 - 更换 SQLite 驱动
 - 没有实际用途的"优化"或过度抽象

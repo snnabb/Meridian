@@ -44,16 +44,16 @@ func TestDashboardTrendsAggregateAllAndSingleSite(t *testing.T) {
 		t.Fatalf("all metadata = %+v", all)
 	}
 	traffic, requests := sumDashboardTrend(all.Points)
-	if traffic != 860 || requests != 6 {
-		t.Fatalf("all totals = traffic %d requests %d, want 860/6", traffic, requests)
+	if traffic != 430 || requests != 6 {
+		t.Fatalf("all totals = traffic %d requests %d, want 430/6", traffic, requests)
 	}
 	if len(all.SiteSeries) != 2 || all.SiteSeries[0].SiteName != "first" || all.SiteSeries[1].SiteName != "second" {
 		t.Fatalf("all site series = %+v, want both named sites", all.SiteSeries)
 	}
 	firstTraffic, firstRequests := sumDashboardTrend(all.SiteSeries[0].Points)
 	secondTraffic, secondRequests := sumDashboardTrend(all.SiteSeries[1].Points)
-	if firstTraffic != 660 || firstRequests != 4 || secondTraffic != 200 || secondRequests != 2 {
-		t.Fatalf("all site series totals = first %d/%d second %d/%d, want 660/4 and 200/2", firstTraffic, firstRequests, secondTraffic, secondRequests)
+	if firstTraffic != 330 || firstRequests != 4 || secondTraffic != 100 || secondRequests != 2 {
+		t.Fatalf("all site series totals = first %d/%d second %d/%d, want 330/4 and 100/2", firstTraffic, firstRequests, secondTraffic, secondRequests)
 	}
 
 	single, err := app.pm.dashboardTrends(&first.ID, "hour")
@@ -61,11 +61,11 @@ func TestDashboardTrendsAggregateAllAndSingleSite(t *testing.T) {
 		t.Fatalf("dashboardTrends single: %v", err)
 	}
 	traffic, requests = sumDashboardTrend(single.Points)
-	if traffic != 660 || requests != 4 {
-		t.Fatalf("single totals = traffic %d requests %d, want 660/4", traffic, requests)
+	if traffic != 330 || requests != 4 {
+		t.Fatalf("single totals = traffic %d requests %d, want 330/4", traffic, requests)
 	}
 	last := single.Points[len(single.Points)-1]
-	if last.Traffic < 60 || last.Requests < 1 {
+	if last.Traffic < 30 || last.Requests < 1 {
 		t.Fatalf("current bucket = %+v, want pending traffic and request", last)
 	}
 	if len(single.SiteSeries) != 1 || single.SiteSeries[0].SiteID != first.ID || single.SiteSeries[0].SiteName != "first" {
@@ -124,11 +124,11 @@ func TestDashboardTrendRangesAndMonthlyTraffic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TrafficSnapshot: %v", err)
 	}
-	if snapshot.MonthlyTraffic != 240 || snapshot.TotalTraffic != 240 {
-		t.Fatalf("snapshot traffic = monthly %d total %d, want 240/240", snapshot.MonthlyTraffic, snapshot.TotalTraffic)
+	if snapshot.MonthlyTraffic != 120 || snapshot.TotalTraffic != 120 {
+		t.Fatalf("snapshot traffic = monthly %d total %d, want 120/120", snapshot.MonthlyTraffic, snapshot.TotalTraffic)
 	}
-	if len(snapshot.LiveSites) != 1 || snapshot.LiveSites[0].MonthlyTraffic != 240 {
-		t.Fatalf("site monthly traffic = %+v, want 240", snapshot.LiveSites)
+	if len(snapshot.LiveSites) != 1 || snapshot.LiveSites[0].MonthlyTraffic != 120 {
+		t.Fatalf("site monthly traffic = %+v, want 120", snapshot.LiveSites)
 	}
 }
 
@@ -156,8 +156,31 @@ func TestDashboardTrendCustomWindowUsesMinutePrecisionAndAggregates(t *testing.T
 		t.Fatalf("custom bounds = %d/%d, want %d/%d", trend.StartMS, trend.EndMS, start.UnixMilli(), end.UnixMilli())
 	}
 	traffic, requests := sumDashboardTrend(trend.Points)
-	if traffic != 280 || requests != 3 {
-		t.Fatalf("custom totals = traffic %d requests %d, want 280/3", traffic, requests)
+	if traffic != 140 || requests != 3 {
+		t.Fatalf("custom totals = traffic %d requests %d, want 140/3", traffic, requests)
+	}
+}
+
+func TestDashboardTrendHistoricalCustomWindowExcludesCurrentPendingTraffic(t *testing.T) {
+	app := newTestApp(t)
+	site, err := app.db.CreateSite("historical", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 0, 0)
+	if err != nil {
+		t.Fatalf("CreateSite: %v", err)
+	}
+	inst := &ProxyInstance{Site: *site}
+	inst.bytesIn.Store(10)
+	inst.bytesOut.Store(20)
+	inst.pendingRequests.Store(1)
+	app.pm.proxies[site.ID] = inst
+
+	now := time.Now().In(time.Local).Truncate(time.Minute)
+	trend, err := app.pm.dashboardTrends(&site.ID, "custom", now.Add(-48*time.Hour), now.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatalf("historical dashboardTrends: %v", err)
+	}
+	traffic, requests := sumDashboardTrend(trend.Points)
+	if traffic != 0 || requests != 0 {
+		t.Fatalf("historical totals = traffic %d requests %d, want no current pending data", traffic, requests)
 	}
 }
 

@@ -257,6 +257,14 @@ input, select { font-family: inherit; }
 
 .btn-login:active { transform: scale(.98); }
 
+.login-rate-limit {
+  margin-top: 12px;
+  color: var(--orange);
+  font-size: .78rem;
+  line-height: 1.5;
+  text-align: center;
+}
+
 .login-footer {
   text-align: center;
   margin-top: 32px;
@@ -6553,4 +6561,47 @@ body {
   }
   .site-config-modal .upstream-test-all { min-width: 88px; }
   .site-config-modal .upstream-add-line { min-width: 104px; }
+}
+
+/* Site line editor v2: protocol, address and port are separate fields. */
+.site-config-modal .upstream-line-v2 {
+  grid-template-columns: 54px minmax(130px, .72fr) 100px minmax(260px, 1.55fr) 82px 78px 124px !important;
+  grid-template-areas: "enabled name scheme address port latency actions" !important;
+}
+.site-config-modal .upstream-line-v2 .upstream-line-name-field { grid-area: name !important; }
+.site-config-modal .upstream-line-v2 .upstream-line-scheme-field { grid-area: scheme !important; }
+.site-config-modal .upstream-line-v2 .upstream-line-address-field { grid-area: address !important; }
+.site-config-modal .upstream-line-v2 .upstream-line-port-field { grid-area: port !important; }
+.site-config-modal .upstream-line-v2 .upstream-line-field .form-select {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  padding: 9px 30px 9px 11px;
+  font-size: .82rem;
+}
+.site-config-modal .upstream-line-v2 > input[type="hidden"] { display: none !important; }
+
+@media (max-width: 768px) {
+  .site-config-modal .upstream-line-v2 {
+    grid-template-columns: minmax(0, 1fr) 116px !important;
+    grid-template-areas:
+      "enabled enabled"
+      "name scheme"
+      "address address"
+      "port latency"
+      "actions actions" !important;
+  }
+  .site-config-modal .upstream-line-v2 .upstream-line-name-field { grid-area: name !important; }
+  .site-config-modal .upstream-line-v2 .upstream-line-scheme-field { grid-area: scheme !important; }
+  .site-config-modal .upstream-line-v2 .upstream-line-address-field { grid-area: address !important; }
+  .site-config-modal .upstream-line-v2 .upstream-line-port-field { grid-area: port !important; }
+  .site-config-modal .upstream-line-v2 .upstream-line-latency { justify-content: flex-end; }
+  .site-config-modal .upstream-line-v2 .upstream-line-actions { justify-content: flex-start; }
+}
+
+@media (max-width: 420px) {
+  .site-config-modal .upstream-line-v2 {
+    grid-template-columns: minmax(0, 1fr) !important;
+    grid-template-areas: "enabled" "name" "scheme" "address" "port" "latency" "actions" !important;
+  }
 }

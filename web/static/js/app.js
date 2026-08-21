@@ -6,6 +6,7 @@
   const loginFormEl = document.getElementById('loginForm');
   const loginFooterEl = document.getElementById('login-footer');
   const loginButtonEl = document.getElementById('btn-login');
+  const loginRateLimitEl = document.getElementById('login-rate-limit');
   const usernameInputEl = document.getElementById('inp-username');
   const usernameHelpEl = document.getElementById('admin-username-help');
   const passwordInputEl = document.getElementById('inp-password');
@@ -25,6 +26,8 @@
   let activeModalClass = '';
   let authMode = 'checking';
   let authSubmissionInFlight = false;
+  let loginRetryTimer = null;
+  let loginRetryDeadline = 0;
   let authStatus = {
     needs_setup: false,
     mode: 'single_admin',
@@ -155,6 +158,7 @@
   });
 
   function setAuthChecking() {
+    stopLoginRetryCountdown();
     authMode = 'checking';
     loginFormEl.setAttribute('aria-busy', 'true');
     loginButtonEl.disabled = true;
@@ -235,6 +239,7 @@
   }
 
   function showSetupMode() {
+    stopLoginRetryCountdown();
     revealAuthScreen();
     authMode = 'setup';
     loginFormEl.setAttribute('aria-busy', 'false');
@@ -256,6 +261,7 @@
   }
 
   function showLoginMode() {
+    stopLoginRetryCountdown();
     revealAuthScreen();
     authMode = 'login';
     loginFormEl.setAttribute('aria-busy', 'false');
@@ -315,10 +321,49 @@
 
   function loginErrorMessage(error) {
     const message = String(error && error.message || '登录失败');
-    if (message.includes('too many login attempts') || message.includes('登录尝试次数过多')) return '登录尝试次数过多，请稍后重试';
+    if (message.includes('too many login attempts') || message.includes('登录尝试次数过多')) {
+      const seconds = Math.max(1, Number(error && error.retryAfterSeconds) || 60);
+      return `登录尝试次数过多，请在 ${Math.ceil(seconds)} 秒后重试`;
+    }
     if (message === 'invalid username or password' || message === '用户名或密码错误') return '用户名或密码错误';
     return message;
   }
+
+  function stopLoginRetryCountdown() {
+    if (loginRetryTimer !== null) clearInterval(loginRetryTimer);
+    loginRetryTimer = null;
+    loginRetryDeadline = 0;
+    if (loginRateLimitEl) {
+      loginRateLimitEl.hidden = true;
+      loginRateLimitEl.textContent = '';
+    }
+  }
+
+  function startLoginRetryCountdown(seconds) {
+    stopLoginRetryCountdown();
+    const waitSeconds = Math.max(1, Math.ceil(Number(seconds) || 60));
+    loginRetryDeadline = Date.now() + waitSeconds * 1000;
+    const update = () => {
+      const remaining = Math.max(0, Math.ceil((loginRetryDeadline - Date.now()) / 1000));
+      if (remaining === 0) {
+        stopLoginRetryCountdown();
+        if (authMode === 'login' && !authSubmissionInFlight) {
+          loginButtonEl.disabled = false;
+          loginButtonEl.textContent = '登录';
+        }
+        return;
+      }
+      loginButtonEl.disabled = true;
+      loginButtonEl.textContent = `${remaining} 秒后重试`;
+      if (loginRateLimitEl) {
+        loginRateLimitEl.hidden = false;
+        loginRateLimitEl.textContent = `密码错误次数过多，请在 ${remaining} 秒后重试。`;
+      }
+    };
+    update();
+    loginRetryTimer = setInterval(update, 1000);
+  }
+
   loginFormEl.addEventListener('submit', async function(e) {
     e.preventDefault();
     if (authSubmissionInFlight) return;
@@ -382,6 +427,8 @@
       Toast.error(loginErrorMessage(err));
       if (submittingSetup) {
         await checkAuth();
+      } else if (err && err.status === 429) {
+        startLoginRetryCountdown(err.retryAfterSeconds);
       } else {
         loginButtonEl.disabled = false;
         loginButtonEl.textContent = '登录';
@@ -393,6 +440,7 @@
 
 
   function enterApp() {
+    stopLoginRetryCountdown();
     loginEl.classList.add('hidden');
     shellEl.classList.add('active');
 

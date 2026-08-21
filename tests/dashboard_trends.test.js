@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
+const vm = require('node:vm');
 
 const dashboardSource = fs.readFileSync(
   path.join(__dirname, '..', 'web', 'static', 'js', 'pages', 'dashboard.js'),
@@ -45,4 +46,20 @@ test('dashboard trend rendering clamps invalid values and bounds smoothing contr
   assert.match(dashboardSource, /if \(liveMap\.size > 0\) appendRealtimeTrendSample/);
   assert.match(dashboardSource, /const unit = units\[i\] \|\| units\[0\]/);
   assert.match(dashboardSource, /bucketSeconds > 0 && bucketSeconds < 3600/);
+});
+
+test('dashboard renders a numeric zero over the initial placeholder', () => {
+  const element = { style: {}, textContent: '—' };
+  const sandbox = {
+    document: {
+      getElementById(id) {
+        return id === 's-total' ? element : null;
+      },
+    },
+    setTimeout(callback) { callback(); },
+  };
+  vm.runInNewContext(dashboardSource, sandbox, { filename: 'dashboard.js' });
+
+  sandbox.animateValue('s-total', 0);
+  assert.equal(element.textContent, '0');
 });
