@@ -246,7 +246,7 @@ export SETUP_TOKEN="$(openssl rand -hex 32)"
 ### 命令行
 
 ```bash
-./meridian                          # 默认监听 :9090，数据库在当前目录
+./meridian                          # 默认监听 127.0.0.1:9090，数据库在当前目录
 ./meridian --port 8080              # 自定义管理端口
 ./meridian --db /data/meridian.db   # 自定义数据库路径
 ```

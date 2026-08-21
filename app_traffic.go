@@ -170,6 +170,11 @@ func (a *App) handleDynamicProfiles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleSSE(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		a.jsonErr(w, 500, "SSE not supported")

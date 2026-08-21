@@ -23,7 +23,13 @@ func panelListenerSpecs(bindAddress string, port int) ([]panelListenerSpec, erro
 	}
 	bindAddress = strings.TrimSpace(bindAddress)
 	portText := strconv.Itoa(port)
-	if bindAddress == "" || bindAddress == "0.0.0.0" || bindAddress == "::" {
+	// Keep the empty/default configuration loopback-only. The startup path uses
+	// panelListenAddress for security decisions, so treating an empty value as a
+	// wildcard here would make the effective listener disagree with those checks.
+	if bindAddress == "" {
+		bindAddress = "127.0.0.1"
+	}
+	if bindAddress == "0.0.0.0" || bindAddress == "::" {
 		return []panelListenerSpec{
 			{network: "tcp4", address: net.JoinHostPort("0.0.0.0", portText)},
 			{network: "tcp6", address: net.JoinHostPort("::", portText)},

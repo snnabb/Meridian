@@ -34,6 +34,13 @@ const (
 
 var telegramReportTimePattern = regexp.MustCompile(`^(?:[01][0-9]|2[0-3]):[0-5][0-9]$`)
 
+var telegramReportHTTPClient = &http.Client{
+	Timeout: 15 * time.Second,
+	CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
 type TelegramReportSettings struct {
 	Enabled            bool   `json:"enabled"`
 	Configured         bool   `json:"configured"`
@@ -515,8 +522,10 @@ func sendTelegramReport(ctx context.Context, botToken, chatID, message string) e
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	// Telegram should never be able to redirect this credential-bearing request
+	// to an attacker-controlled host. Treat redirects as terminal responses and
+	// report them as an API failure below.
+	resp, err := telegramReportHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("Telegram request failed: %w", err)
 	}
@@ -543,7 +552,7 @@ func (a *App) handleTelegramReport(w http.ResponseWriter, r *http.Request) {
 		a.jsonOK(w, telegramReportPublicSettings(stored))
 	case http.MethodPost:
 		var input telegramReportInput
-		if err := json.NewDecoder(io.LimitReader(r.Body, 32<<10)).Decode(&input); err != nil {
+		if err := decodeJSONBody(w, r, &input); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, "invalid Telegram report settings")
 			return
 		}
