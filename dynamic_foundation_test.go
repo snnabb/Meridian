@@ -871,16 +871,23 @@ func TestNormalizeDynamicURLAndDomainRules(t *testing.T) {
 	if err != nil {
 		t.Fatalf("normalize IDNA URL: %v", err)
 	}
-	if target.String() != "https://xn--bcher-kva.de:443/media?q=1" {
+	if target.String() != "https://xn--bcher-kva.de/media?q=1" {
 		t.Fatalf("normalized URL=%q", target.String())
+	}
+	if authority := dynamicCanonicalAuthority(target); authority != "https://xn--bcher-kva.de:443" {
+		t.Fatalf("canonical authority=%q", authority)
 	}
 	httpTarget, err := normalizeDynamicURL("http://Example.COM:080/path")
 	if err != nil || httpTarget.Host != "example.com:80" {
 		t.Fatalf("canonical HTTP target=%v err=%v", httpTarget, err)
 	}
 	escapedTarget, err := normalizeDynamicURL("https://cdn.example.com/media/My%20Movie.mkv?label=Director%20Cut&signature=a+b")
-	if err != nil || escapedTarget.String() != "https://cdn.example.com:443/media/My%20Movie.mkv?label=Director%20Cut&signature=a+b" {
+	if err != nil || escapedTarget.String() != "https://cdn.example.com/media/My%20Movie.mkv?label=Director%20Cut&signature=a+b" {
 		t.Fatalf("encoded-space target=%v err=%v", escapedTarget, err)
+	}
+	explicitDefaultPort, err := normalizeDynamicURL("https://CDN.example.com:0443/media?X-Amz-SignedHeaders=host")
+	if err != nil || explicitDefaultPort.String() != "https://cdn.example.com:443/media?X-Amz-SignedHeaders=host" {
+		t.Fatalf("explicit default-port target=%v err=%v", explicitDefaultPort, err)
 	}
 
 	invalidURLs := []string{

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -341,17 +340,9 @@ func dynamicCanonicalAuthority(target *url.URL) string {
 	if err != nil {
 		return ""
 	}
-	port := target.Port()
-	if port == "" {
-		if scheme == "https" {
-			port = "443"
-		} else {
-			port = "80"
-		}
-	}
-	parsedPort, err := strconv.Atoi(port)
-	if err != nil || parsedPort < 1 || parsedPort > 65535 {
+	port, ok := dynamicEffectivePort(target)
+	if !ok {
 		return ""
 	}
-	return scheme + "://" + net.JoinHostPort(host, strconv.Itoa(parsedPort))
+	return scheme + "://" + net.JoinHostPort(host, port)
 }

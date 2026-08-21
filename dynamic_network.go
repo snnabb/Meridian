@@ -159,9 +159,42 @@ func dynamicURLPathHasDotSegments(value string) bool {
 	return false
 }
 
+func dynamicEffectivePort(target *url.URL) (string, bool) {
+	if target == nil {
+		return "", false
+	}
+	port := target.Port()
+	if port == "" {
+		switch strings.ToLower(target.Scheme) {
+		case "http":
+			return "80", true
+		case "https":
+			return "443", true
+		default:
+			return "", false
+		}
+	}
+	parsedPort, err := strconv.Atoi(port)
+	if err != nil || parsedPort < 1 || parsedPort > 65535 {
+		return "", false
+	}
+	return strconv.Itoa(parsedPort), true
+}
+
+func dynamicURLHost(host, port string, explicitPort bool) string {
+	if explicitPort {
+		return net.JoinHostPort(host, port)
+	}
+	if strings.Contains(host, ":") {
+		return "[" + host + "]"
+	}
+	return host
+}
+
 // normalizeDynamicURL is deliberately separate from normalizeTargetURL: the
 // latter preserves v1.7's manual-site conveniences, while future discovered
-// targets use this strict, canonical security boundary.
+// targets use this strict security boundary. Default-port presentation stays
+// intact because signed media URLs can bind the exact HTTP Host authority.
 func normalizeDynamicURL(value string) (*url.URL, error) {
 	if value == "" {
 		return nil, fmt.Errorf("dynamic URL is required")
@@ -219,19 +252,15 @@ func normalizeDynamicURL(value string) (*url.URL, error) {
 			return nil, fmt.Errorf("invalid dynamic URL host: %w", err)
 		}
 	}
-	port := 80
-	if parsed.Scheme == "https" {
-		port = 443
-	}
-	if parsed.Port() != "" {
-		port, err = strconv.Atoi(parsed.Port())
-		if err != nil || port < 1 || port > 65535 {
-			return nil, fmt.Errorf("dynamic URL contains an invalid port")
-		}
-	} else if strings.HasSuffix(parsed.Host, ":") {
+	explicitPort := parsed.Port() != ""
+	if !explicitPort && strings.HasSuffix(parsed.Host, ":") {
 		return nil, fmt.Errorf("dynamic URL contains an invalid port")
 	}
-	parsed.Host = net.JoinHostPort(host, strconv.Itoa(port))
+	port, ok := dynamicEffectivePort(parsed)
+	if !ok {
+		return nil, fmt.Errorf("dynamic URL contains an invalid port")
+	}
+	parsed.Host = dynamicURLHost(host, port, explicitPort)
 	return parsed, nil
 }
 
@@ -391,8 +420,7 @@ func (p *dynamicSelfTargetPolicy) validateNormalizedTarget(target *url.URL) erro
 	if _, denied := p.deniedHosts[host]; denied {
 		return fmt.Errorf("%w: authority host %s is served by Meridian", errDynamicSelfTarget, host)
 	}
-	port := target.Port()
-	if port == "" {
+	if _, ok := dynamicEffectivePort(target); !ok {
 		return fmt.Errorf("validate dynamic self-target authority: target has no effective port")
 	}
 	if isIP {
@@ -538,7 +566,10 @@ func newDynamicTransportWithDialerTimeout(target *url.URL, pinnedIPs []net.IP, d
 		return nil, err
 	}
 	expectedHost := normalized.Hostname()
-	expectedPort := normalized.Port()
+	expectedPort, ok := dynamicEffectivePort(normalized)
+	if !ok {
+		return nil, fmt.Errorf("dynamic transport target has no effective port")
+	}
 	if directIP := net.ParseIP(expectedHost); directIP != nil {
 		for _, pinnedIP := range validated {
 			if !pinnedIP.Equal(directIP) {

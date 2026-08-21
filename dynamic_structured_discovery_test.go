@@ -528,8 +528,8 @@ func TestHLSRenditionReportCyclesReusePublishedShallowCapabilities(t *testing.T)
 		}
 		routesByTarget[claims.Target] = route
 	}
-	aRoute := routesByTarget["https://cdn.example.com:443/a.m3u8"]
-	bRoute := routesByTarget["https://cdn.example.com:443/b.m3u8"]
+	aRoute := routesByTarget["https://cdn.example.com/a.m3u8"]
+	bRoute := routesByTarget["https://cdn.example.com/b.m3u8"]
 	if aRoute == "" || bRoute == "" {
 		t.Fatalf("master rendition routes = %#v\n%s", routesByTarget, rewrittenMaster)
 	}
@@ -1212,7 +1212,7 @@ func TestConfiguredOriginHLSUsesTypedRecursiveCapabilities(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open configured manifest capability: %v", err)
 	}
-	if !claims.Trusted || claims.Kind != dynamicCapabilityKindManifest || claims.Depth != 1 || claims.Source != dynamicDiscoverySourceHLS || claims.Target != "https://origin.example.com:443/child.m3u8" {
+	if !claims.Trusted || claims.Kind != dynamicCapabilityKindManifest || claims.Depth != 1 || claims.Source != dynamicDiscoverySourceHLS || claims.Target != "https://origin.example.com/child.m3u8" {
 		t.Fatalf("configured manifest claims = %#v", claims)
 	}
 
@@ -1234,10 +1234,10 @@ func TestConfiguredOriginHLSUsesTypedRecursiveCapabilities(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open configured resource capability: %v", err)
 	}
-	if !childClaims.Trusted || childClaims.Kind != dynamicCapabilityKindResource || childClaims.Depth != 0 || childClaims.Target != "https://origin.example.com:443/segment.ts" {
+	if !childClaims.Trusted || childClaims.Kind != dynamicCapabilityKindResource || childClaims.Depth != 0 || childClaims.Target != "https://origin.example.com/segment.ts" {
 		t.Fatalf("configured resource claims = %#v", childClaims)
 	}
-	if captured == nil || captured.URL.String() != "https://origin.example.com:443/child.m3u8" || captured.Header.Get("Authorization") != "Bearer primary-origin" || strings.Contains(captured.Header.Get("Cookie"), sessionCookieName+"=") || !strings.Contains(captured.Header.Get("Cookie"), "emby=allowed") {
+	if captured == nil || captured.URL.String() != "https://origin.example.com/child.m3u8" || captured.Header.Get("Authorization") != "Bearer primary-origin" || strings.Contains(captured.Header.Get("Cookie"), sessionCookieName+"=") || !strings.Contains(captured.Header.Get("Cookie"), "emby=allowed") {
 		t.Fatalf("configured transport request = %#v", captured)
 	}
 	if recorder.Header().Get("Content-Security-Policy") == "" || recorder.Header().Get("Cache-Control") != "private, no-store" {
@@ -1443,7 +1443,7 @@ func TestConfiguredPrefixPlaybackInfoUsesExpectedSourceAndTrustedAbsoluteCapabil
 	if err != nil {
 		t.Fatalf("open configured absolute PlaybackInfo capability: %v", err)
 	}
-	if !claims.Trusted || claims.Source != dynamicDiscoverySourcePlaybackInfo || claims.Target != "https://origin.example.com:443/jellyfin/Videos/1/stream.mp4?api_key=absolute-secret" || strings.Count(claims.Target, "/jellyfin/") != 1 {
+	if !claims.Trusted || claims.Source != dynamicDiscoverySourcePlaybackInfo || claims.Target != "https://origin.example.com/jellyfin/Videos/1/stream.mp4?api_key=absolute-secret" || strings.Count(claims.Target, "/jellyfin/") != 1 {
 		t.Fatalf("configured absolute PlaybackInfo claims = %#v", claims)
 	}
 	if !issuer.state.hasLearnedPlaybackPath("/Videos/1/master.m3u8", time.Now()) {
@@ -1502,7 +1502,7 @@ func TestPathIngressPlaybackInfoPrefixesRelativeAndDynamicRoutes(t *testing.T) {
 		t.Fatalf("path dynamic URL=%q", media.DirectStreamURL)
 	}
 	claims, err := openDynamicCapability(issuer.key, issuer.capabilityToken(media.DirectStreamURL))
-	if err != nil || claims.Target != "https://origin.example.com:443/Videos/1/stream.mp4?api_key=absolute-secret" {
+	if err != nil || claims.Target != "https://origin.example.com/Videos/1/stream.mp4?api_key=absolute-secret" {
 		t.Fatalf("path capability claims=%#v err=%v", claims, err)
 	}
 }
@@ -1584,7 +1584,7 @@ func TestConfiguredOriginDASHTemplateUsesTrustedTransport(t *testing.T) {
 	if recorder.Code != http.StatusOK || recorder.Body.String() != "chunk" {
 		t.Fatalf("configured DASH template response = %d %q", recorder.Code, recorder.Body.String())
 	}
-	if fetched != "https://origin.example.com:443/chunk-00001.m4s" {
+	if fetched != "https://origin.example.com/chunk-00001.m4s" {
 		t.Fatalf("configured DASH template fetched %q", fetched)
 	}
 }
@@ -1679,7 +1679,7 @@ func TestDASHTemplateFixedClaimsPreserveURLStructureAndNumericIdentity(t *testin
 		t.Fatalf("fixed-authority claims = %#v", claims)
 	}
 	target, err := resolveDASHCapabilityTarget(claims, "v0-7")
-	if err != nil || target.String() != "https://cdn-1080p.example.com:443/chunk-7.m4s?id=1080p" {
+	if err != nil || target.String() != "https://cdn-1080p.example.com/chunk-7.m4s?id=1080p" {
 		t.Fatalf("fixed-authority target = %v err=%v", target, err)
 	}
 
@@ -1710,7 +1710,7 @@ func TestDASHTemplateFixedClaimsPreserveURLStructureAndNumericIdentity(t *testin
 		t.Fatalf("open pct-encoded RepresentationID claims: %v", err)
 	}
 	encodedTarget, err := resolveDASHCapabilityTarget(encodedClaims, "v0-2")
-	if err != nil || encodedTarget.String() != "https://cdn.example.com:443/video/video%3Amain$alt/chunk-2.m4s" {
+	if err != nil || encodedTarget.String() != "https://cdn.example.com/video/video%3Amain$alt/chunk-2.m4s" {
 		t.Fatalf("pct-encoded RepresentationID target = %v err=%v", encodedTarget, err)
 	}
 	querySession := &dynamicRewriteSession{ctx: context.Background(), issuer: issuer, base: base, source: dynamicDiscoverySourceDASH}
@@ -1781,13 +1781,13 @@ func TestDASHInheritedSegmentAddressingUsesEachRepresentationBase(t *testing.T) 
 		targets = append(targets, claims.Target)
 	}
 	for _, want := range []string{
-		"https://template.example.com:443/init.mp4?sig=init",
-		"https://template.example.com:443/index.sidx?sig=index",
-		"https://template.example.com:443/switch.m4s?sig=switch",
-		"https://a.example.com:443/video/init.mp4", "https://a.example.com:443/video/segment.m4s",
-		"https://b.example.com:443/video/init.mp4", "https://b.example.com:443/video/segment.m4s",
-		"https://c.example.com:443/video/init.mp4", "https://c.example.com:443/video/index.sidx",
-		"https://d.example.com:443/video/init.mp4", "https://d.example.com:443/video/index.sidx",
+		"https://template.example.com/init.mp4?sig=init",
+		"https://template.example.com/index.sidx?sig=index",
+		"https://template.example.com/switch.m4s?sig=switch",
+		"https://a.example.com/video/init.mp4", "https://a.example.com/video/segment.m4s",
+		"https://b.example.com/video/init.mp4", "https://b.example.com/video/segment.m4s",
+		"https://c.example.com/video/init.mp4", "https://c.example.com/video/index.sidx",
+		"https://d.example.com/video/init.mp4", "https://d.example.com/video/index.sidx",
 	} {
 		found := false
 		for _, target := range targets {
@@ -2327,11 +2327,11 @@ func TestExtremePlaybackInfoAcceptsStringifiedCollectionsAndWholeStringURLs(t *t
 			}
 
 			expectedTargets := map[string]bool{
-				"https://media.example.com:443/video.mp4?token=direct-secret":          true,
-				"https://captions.example.com:443/subtitle.vtt?token=caption-secret":   true,
-				"https://attachments.example.com:443/font.bin?token=attachment-secret": true,
-				"https://art.example.com:443/poster.jpg?token=art-secret":              true,
-				"https://root-assets.example.com:443/catalog.json?token=root-secret":   false,
+				"https://media.example.com/video.mp4?token=direct-secret":          true,
+				"https://captions.example.com/subtitle.vtt?token=caption-secret":   true,
+				"https://attachments.example.com/font.bin?token=attachment-secret": true,
+				"https://art.example.com/poster.jpg?token=art-secret":              true,
+				"https://root-assets.example.com/catalog.json?token=root-secret":   false,
 			}
 			routes := structuredCapabilityRoutes(string(rewritten))
 			if len(routes) != len(expectedTargets) {
@@ -2402,7 +2402,7 @@ func TestExtremePlaybackInfoAbsoluteHTTPPathOverridesProtocol(t *testing.T) {
 				t.Fatalf("absolute Extreme Path was not capability-bound: %s", rewritten)
 			}
 			claims, err := openDynamicCapability(issuer.key, capabilityTokenFromRoute(t, routes[0]))
-			if err != nil || claims.Target != "https://path.example.com:443/live/manifest.mpd?token=path-secret" || claims.Source != dynamicDiscoverySourceDASH || claims.Kind != dynamicCapabilityKindManifest {
+			if err != nil || claims.Target != "https://path.example.com/live/manifest.mpd?token=path-secret" || claims.Source != dynamicDiscoverySourceDASH || claims.Kind != dynamicCapabilityKindManifest {
 				t.Fatalf("absolute Extreme Path claims = %#v err=%v", claims, err)
 			}
 		})
@@ -2529,7 +2529,7 @@ func TestExtremeRequiredHeadersAreAEADBoundExactAndNotPropagatedAcrossRedirect(t
 		"Referer":         "https://player.example.com/watch",
 		"User-Agent":      "Extreme Player/1.0",
 	}
-	if !claims.Trusted || claims.Target != "https://origin.example.com:443/initial.m3u8?sig=parent-secret" || claims.Source != dynamicDiscoverySourceHLS || claims.Kind != dynamicCapabilityKindManifest || claims.Depth != 1 || len(claims.RequiredHeaders) != len(expectedHeaders) {
+	if !claims.Trusted || claims.Target != "https://origin.example.com/initial.m3u8?sig=parent-secret" || claims.Source != dynamicDiscoverySourceHLS || claims.Kind != dynamicCapabilityKindManifest || claims.Depth != 1 || len(claims.RequiredHeaders) != len(expectedHeaders) {
 		t.Fatalf("RequiredHeaders parent claims = %#v", claims)
 	}
 	for _, header := range claims.RequiredHeaders {
@@ -2573,7 +2573,7 @@ func TestExtremeRequiredHeadersAreAEADBoundExactAndNotPropagatedAcrossRedirect(t
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("redirected RequiredHeaders manifest response = %d %q", recorder.Code, recorder.Body.String())
 	}
-	if len(captures) != 2 || captures[0].URL.String() != "https://origin.example.com:443/initial.m3u8?sig=parent-secret" || captures[1].URL.String() != "https://origin.example.com:443/final.m3u8" {
+	if len(captures) != 2 || captures[0].URL.String() != "https://origin.example.com/initial.m3u8?sig=parent-secret" || captures[1].URL.String() != "https://origin.example.com/final.m3u8" {
 		t.Fatalf("RequiredHeaders redirect captures = %#v", captures)
 	}
 	for name, value := range expectedHeaders {
@@ -2589,7 +2589,7 @@ func TestExtremeRequiredHeadersAreAEADBoundExactAndNotPropagatedAcrossRedirect(t
 		t.Fatalf("redirected manifest child was not capability-bound: %s", recorder.Body.String())
 	}
 	childClaims, err := openDynamicCapability(issuer.key, capabilityTokenFromRoute(t, childRoutes[0]))
-	if err != nil || childClaims.Target != "https://origin.example.com:443/child.ts?sig=child-secret" || len(childClaims.RequiredHeaders) != 0 {
+	if err != nil || childClaims.Target != "https://origin.example.com/child.ts?sig=child-secret" || len(childClaims.RequiredHeaders) != 0 {
 		t.Fatalf("redirected parser inherited RequiredHeaders: claims=%#v err=%v", childClaims, err)
 	}
 }
@@ -2650,12 +2650,12 @@ func TestExtremeRequiredHeadersInheritOnlyToSameAuthorityHLSChildren(t *testing.
 			t.Fatalf("open child RequiredHeaders capability: %v", err)
 		}
 		switch claims.Target {
-		case "https://cdn.example.com:443/live/child.m3u8?sig=same-secret":
+		case "https://cdn.example.com/live/child.m3u8?sig=same-secret":
 			seenSame = true
 			if len(claims.RequiredHeaders) != 2 || claims.RequiredHeaders[0] != (dynamicCapabilityHeaderClaim{Name: "Accept-Language", Value: "fr-CA"}) || claims.RequiredHeaders[1] != (dynamicCapabilityHeaderClaim{Name: "Referer", Value: "https://player.example.com/watch"}) {
 				t.Fatalf("same-authority child headers = %#v", claims)
 			}
-		case "https://other.example.com:443/other.m3u8?sig=cross-secret":
+		case "https://other.example.com/other.m3u8?sig=cross-secret":
 			seenCross = true
 			if len(claims.RequiredHeaders) != 0 {
 				t.Fatalf("cross-authority child inherited headers = %#v", claims)
@@ -2750,10 +2750,10 @@ func TestExtremeHLSDefinesLocalVariablesAndRewritesSafeExtensionURIs(t *testing.
 		}
 	}
 	expected := map[string]string{
-		"https://cdn.example.com:443/video/metadata.json?sig=unknown-secret": dynamicCapabilityKindResource,
-		"https://alt.example.com:443/metadata.bin?sig=alternate-secret":      dynamicCapabilityKindResource,
-		"https://start.example.com:443/start.bin?sig=start-secret":           dynamicCapabilityKindResource,
-		"https://cdn.example.com:443/video/child.m3u8?sig=variant-secret":    dynamicCapabilityKindManifest,
+		"https://cdn.example.com/video/metadata.json?sig=unknown-secret": dynamicCapabilityKindResource,
+		"https://alt.example.com/metadata.bin?sig=alternate-secret":      dynamicCapabilityKindResource,
+		"https://start.example.com/start.bin?sig=start-secret":           dynamicCapabilityKindResource,
+		"https://cdn.example.com/video/child.m3u8?sig=variant-secret":    dynamicCapabilityKindManifest,
 	}
 	routes := structuredCapabilityRoutes(text)
 	if len(routes) != len(expected) {
@@ -2853,7 +2853,7 @@ func TestExtremeDASHPreservesSafeDRMAndForeignWrappersWhileRewritingStandardURLs
 		t.Fatalf("Extreme DASH safe-wrapper routes = %v\n%s", routes, text)
 	}
 	claims, err := openDynamicCapability(issuer.key, capabilityTokenFromRoute(t, routes[0]))
-	if err != nil || claims.Target != "https://cdn.example.com:443/video/main.mp4?sig=dash-secret" || claims.Source != dynamicDiscoverySourceDASH || claims.Kind != dynamicCapabilityKindResource {
+	if err != nil || claims.Target != "https://cdn.example.com/video/main.mp4?sig=dash-secret" || claims.Source != dynamicDiscoverySourceDASH || claims.Kind != dynamicCapabilityKindResource {
 		t.Fatalf("Extreme DASH safe-wrapper claims = %#v err=%v", claims, err)
 	}
 	var root struct {

@@ -10,7 +10,6 @@ import (
 	"io"
 	"log"
 	"mime"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -201,15 +200,15 @@ func normalizeTrustedCapabilityURL(value string) (*url.URL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid trusted capability URL")
 	}
-	port := target.Port()
-	if port == "" {
-		if target.Scheme == "https" {
-			port = "443"
-		} else if target.Scheme == "http" {
-			port = "80"
-		}
+	explicitPort := target.Port() != ""
+	if !explicitPort && strings.HasSuffix(target.Host, ":") {
+		return nil, fmt.Errorf("invalid trusted capability URL")
 	}
-	target.Host = net.JoinHostPort(host, port)
+	port, ok := dynamicEffectivePort(target)
+	if !ok {
+		return nil, fmt.Errorf("invalid trusted capability URL")
+	}
+	target.Host = dynamicURLHost(host, port, explicitPort)
 	if err := validateSameAuthorityStructuredURL(target); err != nil {
 		return nil, fmt.Errorf("invalid trusted capability URL")
 	}

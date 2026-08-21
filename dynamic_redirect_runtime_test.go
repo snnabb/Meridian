@@ -847,7 +847,7 @@ func TestDynamicRedirectRuntimeReturnsEncryptedCapabilityToClient(t *testing.T) 
 	if err != nil {
 		t.Fatalf("open redirect capability: %v", err)
 	}
-	if claims.Source != dynamicDiscoverySourceRedirect || claims.Kind != dynamicCapabilityKindResource || claims.Target != "https://cdn.example.com:443/media/movie.mkv?sig=secret" {
+	if claims.Source != dynamicDiscoverySourceRedirect || claims.Kind != dynamicCapabilityKindResource || claims.Target != "https://cdn.example.com/media/movie.mkv?sig=secret" {
 		t.Fatalf("redirect capability claims=%#v", claims)
 	}
 	if !state.hasCapability(token, time.Now()) || runtime.authorities["https://cdn.example.com:443"] != 1 {
@@ -887,7 +887,7 @@ func TestDynamicRedirectRuntimeDirectModeExposesValidatedMainVideoTarget(t *test
 	if resp.StatusCode != http.StatusTemporaryRedirect || !redirectBody.closed.Load() {
 		t.Fatalf("direct response status/bodyClosed=%d/%t", resp.StatusCode, redirectBody.closed.Load())
 	}
-	if got := resp.Header.Get("Location"); got != "https://cdn.example.com:443/media/movie.mkv?sig=client-target" {
+	if got := resp.Header.Get("Location"); got != "https://cdn.example.com/media/movie.mkv?sig=client-target" {
 		t.Fatalf("direct Location = %q", got)
 	}
 	if resp.Header.Get("Set-Cookie") != "" || resp.Header.Get("Content-Length") != "0" || resp.Header.Get("Cache-Control") != "private, no-store" {
@@ -954,11 +954,27 @@ func TestDynamicRedirectRuntimeInternallyFollowsMediaRedirects(t *testing.T) {
 	}
 	select {
 	case capture := <-captures:
-		if capture.err != nil || capture.request.Host != "cdn.example.com:443" || capture.request.RequestURI != "/media/movie.mkv" {
+		if capture.err != nil || capture.request.Host != "cdn.example.com" || capture.request.RequestURI != "/media/movie.mkv" {
 			t.Fatalf("dynamic capture=%#v host=%q requestURI=%q", capture, capture.request.Host, capture.request.RequestURI)
 		}
 	default:
 		t.Fatal("internal media redirect did not reach the validated target")
+	}
+}
+
+func TestDynamicRedirectRequestPreservesExplicitDefaultPort(t *testing.T) {
+	previous := redirectRuntimeEligibleRequest(http.MethodGet, "https://origin.example.net/Videos/42/stream")
+	target, err := normalizeDynamicURL("https://cdn.example.com:443/media/movie.mkv?X-Amz-SignedHeaders=host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := &redirectFollowTransport{dynamicPolicy: redirectRuntimePolicy(dynamicProfileCompatible, true)}
+	request, stripBodyHeaders, reasonCode := transport.newExtremeCompatibleDynamicRedirectRequest(previous.Context(), previous, http.StatusFound, target)
+	if reasonCode != "" || request == nil || stripBodyHeaders {
+		t.Fatalf("request=%#v strip=%t reason=%q", request, stripBodyHeaders, reasonCode)
+	}
+	if request.Host != "cdn.example.com:443" || request.URL.String() != target.String() {
+		t.Fatalf("request host/URL=%q/%q", request.Host, request.URL)
 	}
 }
 
@@ -1604,7 +1620,7 @@ func TestDynamicRedirectRuntimeRebuildsHeadersAndCleansResponse(t *testing.T) {
 	if !initialBody.closed.Load() {
 		t.Fatal("initial redirect body was not closed")
 	}
-	if resolverHost != "cdn.example.com" || factoryTarget != "https://cdn.example.com:443/media/file.mp4?opaque=1" {
+	if resolverHost != "cdn.example.com" || factoryTarget != "https://cdn.example.com/media/file.mp4?opaque=1" {
 		t.Fatalf("resolver=%q target=%q", resolverHost, factoryTarget)
 	}
 	if len(factoryPins) != 1 || factoryPins[0] != "1.1.1.1" {
@@ -1624,7 +1640,7 @@ func TestDynamicRedirectRuntimeRebuildsHeadersAndCleansResponse(t *testing.T) {
 	if capture.network != "tcp" || capture.address != "1.1.1.1:443" {
 		t.Fatalf("dial network/address=%q/%q, want tcp/1.1.1.1:443", capture.network, capture.address)
 	}
-	if capture.request.Host != "cdn.example.com:443" || capture.request.URL.RequestURI() != "/media/file.mp4?opaque=1" {
+	if capture.request.Host != "cdn.example.com" || capture.request.URL.RequestURI() != "/media/file.mp4?opaque=1" {
 		t.Fatalf("pinned request host/URI=%q/%q", capture.request.Host, capture.request.URL.RequestURI())
 	}
 	if !capture.request.Close || strings.Contains(strings.ToLower(capture.request.Header.Get("Connection")), "keep-alive") {

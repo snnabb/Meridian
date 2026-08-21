@@ -142,10 +142,11 @@ func (p dynamicRedirectPolicy) validateTarget(previous, target *url.URL, selfTar
 	if !allowedScheme {
 		return dynamicObservationReasonSchemeDenied
 	}
-	port, err := strconv.Atoi(target.Port())
-	if err != nil {
+	portText, ok := dynamicEffectivePort(target)
+	if !ok {
 		return dynamicObservationReasonPortDenied
 	}
+	port, _ := strconv.Atoi(portText)
 	if !p.limits.AllowAnyPort {
 		allowedPort := false
 		for _, candidate := range p.limits.AllowedPorts {
