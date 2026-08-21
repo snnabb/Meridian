@@ -1,9 +1,7 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -130,7 +128,7 @@ func defaultSystemSettings() SystemSettings {
 		UIMode: "novice", UIRadius: 10, TrafficBillingMode: trafficBillingModeBidirectional, TrafficResetDay: 1, ProbeTimeoutMS: 5000, PingCacheMinutes: 10,
 		ScheduleTimezone:     beijingTimezoneOffsetMinutes,
 		ScheduleTimezoneName: defaultTimezoneName,
-		LogEnabled:       true, LogLevel: "info", LogRetentionDays: 30, LogFlushThreshold: 1,
+		LogEnabled:           true, LogLevel: "info", LogRetentionDays: 30, LogFlushThreshold: 1,
 		LogBatchSize: 50, LogRetryCount: 2, LogRetryBackoffMS: 75, LogTaskLeaseMS: 300000,
 		LogWriteImage: false, LogWritePlayback: true, LogWriteMetadata: false, LogWriteVideo: true, LogWriteSubtitle: true, LogWriteAsset: true, LogWriteWebSocket: true, LogWriteAPI: true, LogWriteAuth: true,
 		LogWriteNode: true, LogWriteCategory: true, LogWriteStatus: true, LogWriteClientIP: true, LogWriteUA: true, LogWriteUpstreamUA: true, LogWriteBackendAddress: true, LogWriteTimeline: true,
@@ -249,18 +247,18 @@ func (a *App) handleSystemSettings(w http.ResponseWriter, r *http.Request) {
 		a.jsonOK(w, a.db.currentSystemSettings())
 	case http.MethodPost:
 		settings := a.db.currentSystemSettings()
-		if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&settings); err != nil {
+		if err := decodeJSONBody(w, r, &settings); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, "invalid system settings")
 			return
 		}
-			if err := a.db.saveSystemSettings(settings); err != nil {
-				a.jsonErr(w, http.StatusBadRequest, err.Error())
-				return
-			}
-			// Return the normalized persisted value (including the current legacy
-			// offset compatibility field) so clients immediately render the same
-			// timezone the server will use for trends, logs, and scheduling.
-			a.jsonOK(w, a.db.currentSystemSettings())
+		if err := a.db.saveSystemSettings(settings); err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		// Return the normalized persisted value (including the current legacy
+		// offset compatibility field) so clients immediately render the same
+		// timezone the server will use for trends, logs, and scheduling.
+		a.jsonOK(w, a.db.currentSystemSettings())
 	default:
 		w.Header().Set("Allow", "GET, POST")
 		a.jsonErr(w, http.StatusMethodNotAllowed, "method not allowed")

@@ -290,7 +290,10 @@ func main() {
 		IdleTimeout:    120 * time.Second,
 		MaxHeaderBytes: 64 << 10,
 	}
-	panelListeners, listenerFailures, err := listenPanel(os.Getenv("PANEL_BIND_ADDR"), port)
+	// Use the same normalized bind host for listener creation and security
+	// decisions. This prevents an empty PANEL_BIND_ADDR from being interpreted as
+	// loopback in one path and wildcard in another.
+	panelListeners, listenerFailures, err := listenPanel(panelBindHost, port)
 	if err != nil {
 		log.Fatalf("listen %s: %v", addr, err)
 	}
