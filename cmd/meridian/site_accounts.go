@@ -879,6 +879,7 @@ type siteImportRecord struct {
 	AssetCacheRules            string              `json:"asset_cache_rules"`
 	TrafficQuota               int64               `json:"traffic_quota"`
 	SpeedLimit                 int                 `json:"speed_limit"`
+	TotalSpeedLimit            int                 `json:"total_speed_limit"`
 	Enabled                    bool                `json:"enabled"`
 	Accounts                   []SiteAccountInput  `json:"accounts"`
 }
@@ -928,7 +929,7 @@ func (a *App) siteDataRecords(options ...siteExportOptions) ([]siteImportRecord,
 			ImageCacheEnabled: site.ImageCacheEnabled, ProgressCoalescingEnabled: site.ProgressCoalescingEnabled,
 			AssetCacheEnabled: site.AssetCacheEnabled, AssetCacheTTLSec: site.AssetCacheTTLSec,
 			AssetCacheMaxBytes: site.AssetCacheMaxBytes, AssetCacheRules: site.AssetCacheRules,
-			TrafficQuota: site.TrafficQuota, SpeedLimit: site.SpeedLimit,
+			TrafficQuota: site.TrafficQuota, SpeedLimit: site.SpeedLimit, TotalSpeedLimit: site.TotalSpeedLimit,
 			Enabled: site.Enabled, Accounts: plain,
 		})
 	}

@@ -137,11 +137,11 @@ const API = {
     this.authenticated = false;
   },
 
-  async request(method, path, body) {
+  async request(method, path, body, options = {}) {
     const opts = {
       method,
       credentials: 'same-origin',
-      headers: {},
+      headers: { ...options.headers },
     };
     if (body !== undefined) {
       opts.headers['Content-Type'] = 'application/json';
@@ -213,9 +213,10 @@ const API = {
   checkPanelSettings(data) { return this.request('POST', '/api/panel-settings/check', data); },
   requestPanelCertificate(data) { return this.request('POST', '/api/panel-certificate/issue', data); },
   importPanelCertificate(data) { return this.request('POST', '/api/panel-certificate/import', data); },
-  checkSystemUpdate() { return this.request('GET', '/api/system/update/check'); },
+  checkSystemUpdate(channel = 'stable') { return this.request('GET', '/api/system/update/check?channel=' + encodeURIComponent(channel)); },
   systemUpdateStatus() { return this.request('GET', '/api/system/update'); },
-  startSystemUpdate(version) { return this.request('POST', '/api/system/update', {version}); },
+  startSystemUpdate(version, channel = 'stable') { return this.request('POST', '/api/system/update', {version, channel}); },
+  rollbackSystemUpdate() { return this.request('POST', '/api/system/update', {action: 'rollback'}); },
   restartSystem() { return this.request('POST', '/api/system/restart', {}); },
   async exportBackup(password, includeTLS) {
     const res = await fetch('/api/backup/export', {
@@ -262,7 +263,8 @@ const API = {
   listSites() { return this.request('GET', '/api/sites'); },
   createSite(data) { return this.request('POST', '/api/sites', data); },
   reorderSites(siteIds) { return this.request('PUT', '/api/sites/reorder', { site_ids: siteIds }); },
-  updateSite(id, data) { return this.request('PUT', '/api/sites/' + id, data); },
+  previewSite(id, data) { return this.request('POST', '/api/sites/' + id + '/preview', data); },
+  updateSite(id, data, fingerprint) { return this.request('PUT', '/api/sites/' + id, data, fingerprint ? {headers: {'If-Match': fingerprint}} : {}); },
   deleteSite(id) { return this.request('DELETE', '/api/sites/' + id); },
   toggleSite(id) { return this.request('POST', '/api/sites/' + id + '/toggle'); },
   diagSite(id) { return this.request('GET', '/api/sites/' + id + '/diag'); },

@@ -29,6 +29,9 @@ func siteConfigurationFingerprint(site Site) string {
 }
 func (a *App) checkSiteCommandPrecondition(w http.ResponseWriter, r *http.Request, site *Site) bool {
 	expected, _ := r.Context().Value(siteCommandPreconditionKey{}).(string)
+	if expected == "" {
+		expected = r.Header.Get("If-Match")
+	}
 	if expected != "" && (site == nil || expected != siteConfigurationFingerprint(*site)) {
 		a.jsonErr(w, http.StatusConflict, "站点已被其他操作修改，请重新选择站点后再试")
 		return false

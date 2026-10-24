@@ -66,6 +66,7 @@ nav:
       - 备份与恢复: backup-and-restore.md
       - 更新与维护: updates.md
   - 参考:
+      - 第一阶段测试说明: phase1.md
       - 配置参考: configuration.md
       - 故障排查: troubleshooting.md
       - 安全与隐私: security.md

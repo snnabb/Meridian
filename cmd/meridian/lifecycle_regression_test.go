@@ -222,7 +222,7 @@ func TestToggleOffAfterFinalFlushFailureDisablesSiteAndReportsCleanupPending(t *
 func TestSamePortPutAfterFinalFlushFailureReturnsUnavailableAndDisablesOldRecord(t *testing.T) {
 	fixture := newFinalFlushFailureFixture(t, "put-final-flush")
 	payload := fmt.Sprintf(
-		`{"name":"put-should-not-commit","listen_port":%d,"target_url":%q,"ua_mode":"infuse"}`,
+		`{"name":"put-should-not-commit","listen_port":%d,"target_url":%q,"ua_mode":"web"}`,
 		fixture.site.ListenPort,
 		fixture.site.TargetURL,
 	)

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Meridian one-click installer.
 # Install, update, TLS configuration, password reset and uninstall.
-# Backups and rollback remain internal safety mechanisms.
+# Updates retain a paired binary/data snapshot for explicit rollback.
 
 REPO="${MERIDIAN_REPO:-snnabb/Meridian}"
 INSTALL_DIR="${MERIDIAN_INSTALL_DIR:-/usr/local/bin}"
@@ -180,18 +180,25 @@ normalize_port() {
 
 version_gt() {
     # Returns 0 (true) when $1 (vA.B.C[-suffix]) is newer than $2. The numeric
-    # major.minor.patch triple decides; pre-release/build suffixes ("-rc1",
-    # "+build") are stripped before parsing so v1.5.6-rc1 compares as 1.5.6,
-    # not as a patch of 61.
+    # major.minor.patch triple decides first. Official beta.N releases sort
+    # below the matching stable release, with numeric beta ordering. Other
+    # local suffixes retain the legacy base-version comparison.
     # shellcheck disable=SC2016
     printf '%s\n%s\n' "${1#v}" "${2#v}" | awk -F. '
         function num(s) { sub(/[-+].*$/, "", s); gsub(/[^0-9]/, "", s); return s+0 }
-        NR == 1 { a1=num($1); a2=num($2); a3=num($3) }
-        NR == 2 { b1=num($1); b2=num($2); b3=num($3) }
+        NR == 1 { a=$0; a1=num($1); a2=num($2); a3=num($3) }
+        NR == 2 { b=$0; b1=num($1); b2=num($2); b3=num($3) }
         END {
             if (a1 != b1) exit (a1 > b1) ? 0 : 1
             if (a2 != b2) exit (a2 > b2) ? 0 : 1
-            exit (a3 > b3) ? 0 : 1
+            if (a3 != b3) exit (a3 > b3) ? 0 : 1
+            pattern="^[0-9]+[.][0-9]+[.][0-9]+(-beta[.][1-9][0-9]*)?$"
+            if (a ~ pattern && b ~ pattern) {
+                ap=index(a, "-beta."); bp=index(b, "-beta.")
+                if (!ap && bp) exit 0
+                if (ap && bp) exit (substr(a, ap+6)+0 > substr(b, bp+6)+0) ? 0 : 1
+            }
+            exit 1
         }'
 }
 
@@ -414,6 +421,7 @@ ensure_cosign() {
 verify_release_signature() {
     local version="$1" checksum_file="$2" bundle_file="$3" identity
     if ! download "https://github.com/${REPO}/releases/download/${version}/SHA256SUMS.bundle" "$bundle_file" 2>/dev/null; then
+        [[ "$version" != *-beta.* ]] || fail "测试版本缺少 Sigstore 签名清单；已停止安装"
         warn "该 Release 没有 Sigstore 签名清单，继续执行兼容的 SHA-256 校验"
         return 0
     fi
@@ -502,6 +510,18 @@ get_latest_version() {
 
 resolve_latest_version() {
     local version
+    case "${MERIDIAN_UPDATE_CHANNEL:-stable}" in
+        stable) ;;
+        beta)
+            local helper="${INSTALL_DIR}/${BIN_NAME}"
+            if ! "$helper" --version --features 2>/dev/null | grep -x panel-updater-v2 >/dev/null; then
+                fail "请先升级到支持测试通道的正式版"
+            fi
+            "$helper" update-version beta
+            return
+            ;;
+        *) fail "更新通道只能是 stable 或 beta" ;;
+    esac
     info "获取最新 Release..." >&2
     version=$(get_latest_version) || true
     valid_version "$version" || fail "无法获取有效的最新 Release 版本: ${version:-<empty>}"
@@ -1217,6 +1237,7 @@ cleanup_update_transaction() {
     local exit_code=$?
     if [ "$exit_code" -ne 0 ] && [ "$UPDATE_TRANSACTION" = "1" ]; then
         warn "更新中断，正在自动回滚并恢复更新前的二进制和数据状态..."
+        if is_systemd; then as_root systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true; fi
         if [ "$UPDATE_BINARY_CHANGED" = "1" ]; then
             restore_previous_binary || true
         fi
@@ -2545,6 +2566,91 @@ do_install() {
     print_setup_token_notice || return 1
 }
 
+stage_rollback_snapshot() {
+    local version="$1" staging="$2"
+    valid_version "$version" || return 1
+    local db_path component
+    db_path=$(read_env_value DB_PATH)
+    db_path="${db_path:-meridian.db}"
+    case "$db_path" in /*) ;; *) db_path="${DATA_DIR}/${db_path#./}" ;; esac
+    validate_db_path "$db_path" || return 1
+    case "$db_path" in
+        "$DATA_DIR"/*) ;;
+        *) warn "回滚要求数据库位于数据目录内；请先将 DB_PATH 调整为该目录下的数据库"; return 1 ;;
+    esac
+    component="$db_path"
+    while [ "$component" != "$DATA_DIR" ]; do
+        as_root test ! -L "$component" || { warn "回滚不支持符号链接形式的数据库路径"; return 1; }
+        component=$(dirname -- "$component")
+    done
+    as_root install -d -o root -g "$ROOT_GROUP" -m 0700 "$staging"
+    as_root cp -a -- "${UPDATE_SNAPSHOT_DIR}/data" "${staging}/data" || return 1
+    as_root install -o root -g "$ROOT_GROUP" -m 0755 "${INSTALL_DIR}/${BIN_NAME}" "${staging}/meridian" || return 1
+    if is_systemd; then as_root cp -p -- "$SERVICE_FILE" "${staging}/service" || return 1; fi
+    printf '%s\n' "$version" | as_root tee "${staging}/version" >/dev/null
+}
+
+publish_rollback_snapshot() {
+    local staging="$1" destination="${BACKUP_DIR}/rollback-current" old="${BACKUP_DIR}/rollback-previous.$$" ready
+    validate_backup_dir
+    as_root test ! -L "$destination" || return 1
+    as_root install -d -o root -g "$ROOT_GROUP" -m 0700 "$BACKUP_DIR"
+    ready=$(as_root mktemp -d "${BACKUP_DIR}/rollback-ready.XXXXXX") || return 1
+    if ! as_root cp -a -- "$staging"/. "$ready"/; then as_root rm -rf -- "$ready"; return 1; fi
+    if as_root test -e "$destination"; then as_root mv -- "$destination" "$old" || return 1; fi
+    if ! as_root mv -- "$ready" "$destination"; then
+        if as_root test -e "$old"; then as_root mv -- "$old" "$destination" || true; fi
+        return 1
+    fi
+    as_root rm -rf -- "$old"
+}
+
+do_rollback() {
+    local snapshot="${BACKUP_DIR}/rollback-current" tmp_dir current_binary="${INSTALL_DIR}/${BIN_NAME}" version
+    validate_install_dir; validate_data_dir; validate_backup_dir
+    init_privilege
+    is_systemd || fail "手动回滚目前仅支持 systemd 安装"
+    as_root test ! -L "$snapshot" || fail "回滚快照不能是符号链接"
+    if ! as_root test -x "${snapshot}/meridian" || ! as_root test -f "${snapshot}/version" \
+        || ! as_root test -f "${snapshot}/service" || ! as_root test -d "${snapshot}/data"; then
+        fail "没有完整的升级前快照"
+    fi
+    version=$(as_root cat "${snapshot}/version")
+    valid_version "$version" || fail "回滚版本无效"
+    if [ "$ASSUME_YES" != 1 ]; then
+        ask_yes_no "恢复到 ${version}？配置、账号和流量数据也将恢复到该次升级前。" 0 || return 0
+    fi
+    tmp_dir=$(mktemp -d); chmod 0700 "$tmp_dir"
+    UPDATE_TMP_DIR="$tmp_dir"
+    UPDATE_TRANSACTION=1
+    trap cleanup_update_transaction EXIT
+    trap abort_update_transaction INT TERM
+    if service_is_active; then UPDATE_WAS_ACTIVE=1; fi
+    as_root systemctl stop "$SERVICE_NAME"
+    create_backup_archive pre-rollback || fail "回滚前备份失败"
+    UPDATE_SNAPSHOT_DIR="${tmp_dir}/current-data"
+    snapshot_data_dir "$UPDATE_SNAPSHOT_DIR" || fail "回滚前数据快照失败"
+    UPDATE_SERVICE_SNAPSHOT="${tmp_dir}/current.service"
+    as_root cp -p -- "$SERVICE_FILE" "$UPDATE_SERVICE_SNAPSHOT"
+    as_root install -o root -g "$ROOT_GROUP" -m 0755 "$current_binary" "$PREVIOUS_BIN"
+    UPDATE_BINARY_CHANGED=1
+    as_root install -o root -g "$ROOT_GROUP" -m 0755 "${snapshot}/meridian" "${current_binary}.new"
+    as_root mv -f -- "${current_binary}.new" "$current_binary"
+    restore_data_snapshot "$snapshot" || fail "恢复数据失败"
+    UPDATE_SERVICE_CHANGED=1
+    as_root cp -p -- "${snapshot}/service" "$SERVICE_FILE"
+    as_root systemctl daemon-reload
+    as_root systemctl restart "$SERVICE_NAME"
+    wait_for_health 20 || fail "回滚版本健康检查失败"
+    if [ "$UPDATE_WAS_ACTIVE" != 1 ]; then as_root systemctl stop "$SERVICE_NAME"; fi
+    UPDATE_TRANSACTION=0; UPDATE_BINARY_CHANGED=0; UPDATE_SERVICE_CHANGED=0
+    UPDATE_SNAPSHOT_DIR=""; UPDATE_SERVICE_SNAPSHOT=""; UPDATE_TMP_DIR=""
+    trap - EXIT INT TERM
+    as_root rm -rf -- "$tmp_dir"
+    as_root mv -- "$snapshot" "${BACKUP_DIR}/rollback-restored-$(date +%Y%m%d-%H%M%S)-$$"
+    ok "已恢复到 ${version} 及该次升级前的数据；回滚前备份：$LAST_BACKUP_PATH"
+}
+
 do_update() {
     local current_binary="${INSTALL_DIR}/${BIN_NAME}" current_version latest_version should_stop_after=0 tmp_dir
     INITIAL_SETUP_TOKEN=""
@@ -2609,6 +2715,7 @@ do_update() {
     if ! snapshot_data_dir "$UPDATE_SNAPSHOT_DIR"; then
         fail "升级前数据快照失败，现有程序未被替换"
     fi
+    stage_rollback_snapshot "$current_version" "${tmp_dir}/rollback-ready" || fail "保存可回滚版本失败"
 
     prepare_data_and_config "$tmp_dir" || return 1
     if is_systemd; then
@@ -2625,6 +2732,7 @@ do_update() {
         as_root systemctl restart "$SERVICE_NAME"
         if ! wait_for_health 20; then
             warn "新版本健康检查失败，正在自动回滚..."
+            as_root systemctl stop "$SERVICE_NAME"
             restore_previous_binary || fail "回滚失败：缺少上一版本二进制，请手动恢复 ${LAST_BACKUP_PATH:-备份归档}"
             UPDATE_BINARY_CHANGED=0
             if ! restore_update_snapshot "$UPDATE_SNAPSHOT_DIR"; then
@@ -2651,6 +2759,7 @@ do_update() {
         warn "未检测到 systemd：已跳过自动健康检查，请手动加载 ${DATA_DIR}/.env 后启动"
     fi
 
+    publish_rollback_snapshot "${tmp_dir}/rollback-ready" || fail "保存回滚快照失败"
     UPDATE_TRANSACTION=0
     UPDATE_BINARY_CHANGED=0
     UPDATE_SERVICE_CHANGED=0
@@ -2905,6 +3014,7 @@ Meridian 一键安装工具
   install.sh install --wildcard '*.example.com' [--domain panel.example.com] [--email EMAIL] [--port PORT] [--dns-token-file PATH] [-y]
       安装时直接申请泛域名并启用原生 HTTPS；新安装默认面板域名 panel.example.com。
   install.sh update [-y]
+  install.sh rollback [-y]  # 程序和数据一起恢复到上次升级前
       更新到最新 Release，自动备份、健康检查并在失败时回滚。
   install.sh tls [--domain panel.example.com] [--wildcard '*.example.com'] [--email EMAIL] [--port PORT] [--dns-token-file PATH] [-y]
       Cloudflare DNS 验证申请泛域名证书，切换原生 HTTPS 并自动续期。
@@ -2925,6 +3035,7 @@ Meridian 一键安装工具
   --dns-token-file PATH  从文件读取 Cloudflare DNS Token，不在命令参数中传入密钥
   --no-domain      不配置或取消安装器管理的面板域名
   --local          仅用于 proxy；明确选择同一网络命名空间的回环反代，不适用于跨容器或远程代理
+  --channel NAME   仅用于 update；stable 正式版（默认）或 beta 已签名测试版
   -y, --yes        非交互确认；安装未指定域名时保留现有配置，首次安装则使用 IP
   --purge          卸载时删除数据目录；不会删除备份、Nginx、Certbot 或证书
 
@@ -2986,6 +3097,12 @@ run_cli() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
             -y|--yes) ASSUME_YES=1 ;;
+            --channel)
+                [ "$action" = update ] || fail "--channel 仅用于 update"
+                [ "$#" -ge 2 ] || fail "--channel 需要 stable 或 beta"
+                case "$2" in stable|beta) export MERIDIAN_UPDATE_CHANNEL="$2" ;; *) fail "无效更新通道" ;; esac
+                shift
+                ;;
             --local)
                 [ "$action" = proxy ] || fail "--local 仅用于 proxy"
                 [ "$TRUST_LOCAL_PROXY" = 0 ] || fail "--local 不能重复"
@@ -3053,12 +3170,13 @@ run_cli() {
         install) do_install ;;
         tls) do_tls ;;
         update) do_update ;;
+        rollback) do_rollback ;;
         password) do_password ;;
         proxy) do_proxy ;;
         uninstall) do_uninstall ;;
         help) usage ;;
         menu) main_menu ;;
-        *) fail "未知操作: $action（仅支持 install、update、tls、proxy、password、uninstall、help）" ;;
+        *) fail "未知操作: $action（仅支持 install、update、rollback、tls、proxy、password、uninstall、help）" ;;
     esac
 }
 

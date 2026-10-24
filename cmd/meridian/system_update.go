@@ -24,6 +24,7 @@ var stableVersionPattern = regexp.MustCompile(`^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]
 var comparableVersionPattern = regexp.MustCompile(`^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:[-+][0-9A-Za-z.-]+)?$`)
 
 type updateRelease struct {
+	Channel   string `json:"channel"`
 	Current   string `json:"current_version"`
 	Latest    string `json:"latest_version"`
 	URL       string `json:"release_url"`
@@ -33,11 +34,13 @@ type updateRelease struct {
 	Reason    string `json:"unsupported_reason,omitempty"`
 }
 type updateJob struct {
-	State      string `json:"state"`
-	Version    string `json:"version,omitempty"`
-	Message    string `json:"message"`
-	StartedAt  string `json:"started_at,omitempty"`
-	FinishedAt string `json:"finished_at,omitempty"`
+	Protocol        int    `json:"protocol,omitempty"`
+	RollbackVersion string `json:"rollback_version,omitempty"`
+	State           string `json:"state"`
+	Version         string `json:"version,omitempty"`
+	Message         string `json:"message"`
+	StartedAt       string `json:"started_at,omitempty"`
+	FinishedAt      string `json:"finished_at,omitempty"`
 }
 
 func versionNewer(candidate, current string) bool {
@@ -140,15 +143,13 @@ func (a *App) handleSystemUpdate(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, 405, "method not allowed")
 		return
 	}
-	var request struct {
-		Version string `json:"version"`
-	}
-	if decodeJSONBody(w, r, &request) != nil || !stableVersionPattern.MatchString(request.Version) {
-		a.jsonErr(w, 400, "请选择有效的正式版本")
+	var request systemUpdateRequest
+	if decodeJSONBody(w, r, &request) != nil || !request.normalize() {
+		a.jsonErr(w, 400, "请选择有效的版本和更新通道")
 		return
 	}
-	if !versionNewer(request.Version, appVersion) {
-		a.jsonErr(w, 409, "仅允许更新到更高的正式版本")
+	if request.Action == "update" && !channelVersionNewer(request.Version, appVersion) {
+		a.jsonErr(w, 409, "仅允许更新到更高版本；恢复上一版本请使用回滚")
 		return
 	}
 	body, _ := json.Marshal(request)
@@ -166,12 +167,23 @@ func (a *App) handleSystemUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
 	defer cancel()
-	release, err := fetchUpdateRelease(ctx, &http.Client{Timeout: 10 * time.Second}, releaseAPI, appVersion)
+	channel := r.URL.Query().Get("channel")
+	if channel == "" {
+		channel = "stable"
+	}
+	endpoint := releaseAPI
+	if channel == "beta" {
+		endpoint = "https://api.github.com/repos/snnabb/Meridian/releases?per_page=100"
+	}
+	release, err := fetchChannelRelease(ctx, &http.Client{Timeout: 10 * time.Second}, endpoint, appVersion, channel)
 	if err != nil {
 		a.jsonErr(w, 502, err.Error())
 		return
 	}
-	_, err = callUpdateAgent(ctx, http.MethodGet, nil)
+	status, err := callUpdateAgent(ctx, http.MethodGet, nil)
+	if err == nil && status.Protocol < 2 {
+		err = errors.New("请运行新版 install.sh install -y 更新本地更新服务")
+	}
 	release.Supported = err == nil
 	if err != nil {
 		release.Reason = err.Error()
@@ -180,10 +192,12 @@ func (a *App) handleSystemUpdateCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 type updateAgent struct {
-	mu        sync.Mutex
-	job       updateJob
-	run       func(string) error
-	stateFile string
+	mu              sync.Mutex
+	job             updateJob
+	run             func(string) error
+	runRequest      func(systemUpdateRequest) error
+	rollbackVersion func() string
+	stateFile       string
 }
 
 func (a *updateAgent) persistLocked() {
@@ -202,6 +216,10 @@ func (a *updateAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		a.mu.Lock()
 		job := a.job
+		job.Protocol = 2
+		if a.rollbackVersion != nil {
+			job.RollbackVersion = a.rollbackVersion()
+		}
 		a.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(job)
 		return
@@ -210,14 +228,17 @@ func (a *updateAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(405)
 		return
 	}
-	var request struct {
-		Version string `json:"version"`
-	}
+	var request systemUpdateRequest
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&request) != nil || !stableVersionPattern.MatchString(request.Version) {
+	if decoder.Decode(&request) != nil || !request.normalize() {
 		w.WriteHeader(400)
 		_ = json.NewEncoder(w).Encode(updateJob{Message: "无效更新版本"})
+		return
+	}
+	if request.Action == "rollback" && (a.rollbackVersion == nil || a.rollbackVersion() == "") {
+		w.WriteHeader(409)
+		_ = json.NewEncoder(w).Encode(updateJob{Message: "没有可用的升级前回滚快照"})
 		return
 	}
 	a.mu.Lock()
@@ -228,11 +249,21 @@ func (a *updateAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.job = updateJob{State: "running", Version: request.Version, StartedAt: time.Now().UTC().Format(time.RFC3339), Message: "正在下载、校验并更新；服务会短暂重启"}
+	if request.Action == "rollback" {
+		a.job.Message = "正在备份当前数据并恢复升级前快照；服务会短暂重启"
+	}
 	a.persistLocked()
 	job := a.job
 	a.mu.Unlock()
 	go func() {
-		err := a.run(request.Version)
+		var err error
+		if a.runRequest != nil {
+			err = a.runRequest(request)
+		} else if a.run != nil && request.Action == "update" {
+			err = a.run(request.Version)
+		} else {
+			err = errors.New("unsupported operation")
+		}
 		a.mu.Lock()
 		defer a.mu.Unlock()
 		a.job.FinishedAt = time.Now().UTC().Format(time.RFC3339)
@@ -242,6 +273,9 @@ func (a *updateAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} else {
 			a.job.State = "completed"
 			a.job.Message = "更新完成，健康检查通过"
+			if request.Action == "rollback" {
+				a.job.Message = "回滚完成，程序与数据已一起恢复，健康检查通过"
+			}
 		}
 		a.persistLocked()
 	}()
@@ -281,13 +315,28 @@ func runUpdateAgent(args []string) error {
 			agent.job.Message = "上次更新被中断，请检查当前版本与服务状态"
 		}
 	}
-	agent.run = func(version string) error {
+	agent.rollbackVersion = func() string {
+		data, err := os.ReadFile("/opt/meridian-backups/rollback-current/version")
+		if err != nil {
+			return ""
+		}
+		version := strings.TrimSpace(string(data))
+		if !channelVersionPattern.MatchString(version) {
+			return ""
+		}
+		return version
+	}
+	agent.runRequest = func(request systemUpdateRequest) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 		defer cancel()
 		// The path comes only from the root-owned systemd unit. HTTP input never
 		// controls the executable, options, repository, filesystem or shell text.
-		command := exec.CommandContext(ctx, "/bin/bash", installer, "update", "--yes") // #nosec G204 -- administrator-owned fixed installer; version is passed only as validated environment data.
-		command.Env = append(os.Environ(), "MERIDIAN_EXPECTED_UPDATE_VERSION="+version)
+		action := "update"
+		if request.Action == "rollback" {
+			action = "rollback"
+		}
+		command := exec.CommandContext(ctx, "/bin/bash", installer, action, "--yes") // #nosec G204 -- fixed installer and allowlisted action; validated version passed only as environment data.
+		command.Env = append(os.Environ(), "MERIDIAN_EXPECTED_UPDATE_VERSION="+request.Version, "MERIDIAN_UPDATE_CHANNEL="+request.Channel)
 		command.Cancel = func() error { return command.Process.Signal(os.Interrupt) }
 		command.WaitDelay = 90 * time.Second
 		command.Stdout = os.Stdout

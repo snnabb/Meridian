@@ -125,6 +125,8 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		imageCache:     imageCacheState,
 	}
 	inst.quota.inst = inst
+	inst.liveSite.Store(&site)
+	inst.totalRate = newSiteRateLimiter(int64(site.TotalSpeedLimit) * 125000)
 	installed := false
 	defer func() {
 		if !installed {
@@ -266,14 +268,14 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			var discoveryErr *dynamicProxyError
 			if errors.As(err, &discoveryErr) {
-				log.Printf("[%s] dynamic discovery denied: %s", site.Name, discoveryErr.reasonCode)
+				log.Printf("[%s] dynamic discovery denied: %s", inst.runtimeSite().Name, discoveryErr.reasonCode)
 				discoveryErr.writeResponse(w)
 				return
 			}
 			if isClientRequestCancellation(originalRequestContext(r.Context()), err) {
 				return
 			}
-			log.Printf("[%s] proxy error: %v", site.Name, err)
+			log.Printf("[%s] proxy error: %v", inst.runtimeSite().Name, err)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadGateway)
 			_, _ = w.Write([]byte(`{"error":"upstream unavailable"}`))
@@ -312,9 +314,6 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		})
 	}
 
-	// Speed limit in bytes/sec (field is in Mbps, 0 = unlimited)
-	speedLimitBytes := int64(site.SpeedLimit) * 125000 // Mbps -> bytes/sec
-
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestController, accepted := inst.beginHTTPRequest(w)
 		if !accepted {
@@ -327,7 +326,7 @@ func (pm *ProxyManager) StartSite(site Site) error {
 		normalizeEmbeddedDynamicCapabilityRequestPath(r.URL)
 		clientRequestContext := r.Context()
 		requestLogWriter := &requestLogResponseWriter{ResponseWriter: w}
-		requestLogEntry := newRequestLogEvent(site, r, inst.trustedProxies, policy)
+		requestLogEntry := newRequestLogEvent(*inst.runtimeSite(), r, inst.trustedProxies, policy)
 		defer func() {
 			requestLogEntry.StatusCode = requestLogWriter.StatusCode()
 			if errors.Is(clientRequestContext.Err(), context.Canceled) {
@@ -355,15 +354,20 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			requestCancel()
 		}()
 		r = r.WithContext(requestCtx)
+		w = &sitePacedResponseWriter{ResponseWriter: w, limiter: inst.totalRate, ctx: requestCtx}
+		// Per-connection limits apply to new requests; the aggregate bucket can
+		// change immediately without interrupting existing streams.
+		liveSite := inst.runtimeSite()
+		speedLimitBytes := int64(liveSite.SpeedLimit) * 125000
 		trafficMeter := newRequestTrafficMeter(inst)
 		defer trafficMeter.finish(time.Now())
 		r = r.WithContext(context.WithValue(r.Context(), requestTrafficMeterContextKey{}, trafficMeter))
 
-		if site.TrafficQuota > 0 {
+		if liveSite.TrafficQuota > 0 {
 			currentUsed, usageErr := pm.currentTrafficCycleUsage(inst, time.Now())
 			if usageErr != nil {
-				log.Printf("[%s] failed to calculate current traffic cycle usage: %v", site.Name, usageErr)
-			} else if currentUsed >= site.TrafficQuota {
+				log.Printf("[%s] failed to calculate current traffic cycle usage: %v", inst.runtimeSite().Name, usageErr)
+			} else if currentUsed >= liveSite.TrafficQuota {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
 				w.Write([]byte(`{"error":"traffic quota exceeded"}`))
@@ -603,9 +607,9 @@ func (pm *ProxyManager) StartSite(site Site) error {
 	upstreamLogTarget := redactUpstreamURL(target)
 	if server == nil {
 		if ingressUsesPath(site.IngressMode) {
-			log.Printf("[%s] shared-path proxy %s -> %s (UA: %s)", site.Name, site.PathPrefix, upstreamLogTarget, site.UAMode)
+			log.Printf("[%s] shared-path proxy %s -> %s (UA: %s)", inst.runtimeSite().Name, site.PathPrefix, upstreamLogTarget, site.UAMode)
 		} else {
-			log.Printf("[%s] shared-host proxy %s -> %s (UA: %s)", site.Name, site.PublicHost, upstreamLogTarget, site.UAMode)
+			log.Printf("[%s] shared-host proxy %s -> %s (UA: %s)", inst.runtimeSite().Name, site.PublicHost, upstreamLogTarget, site.UAMode)
 		}
 		return nil
 	}
@@ -617,13 +621,13 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			for h := range playbackHostsSet {
 				hosts = append(hosts, h)
 			}
-			log.Printf("[%s] proxy :%d -> %s (playback hosts: %s, mode: %s, UA: %s)", site.Name, site.ListenPort, upstreamLogTarget, strings.Join(hosts, ", "), site.PlaybackMode, site.UAMode)
+			log.Printf("[%s] proxy :%d -> %s (playback hosts: %s, mode: %s, UA: %s)", inst.runtimeSite().Name, site.ListenPort, upstreamLogTarget, strings.Join(hosts, ", "), site.PlaybackMode, site.UAMode)
 		} else {
 			protocol := "http"
 			if pm.siteTLSConfigSnapshot() != nil {
 				protocol = "https"
 			}
-			log.Printf("[%s] %s :%d -> %s (UA: %s)", site.Name, protocol, site.ListenPort, upstreamLogTarget, site.UAMode)
+			log.Printf("[%s] %s :%d -> %s (UA: %s)", inst.runtimeSite().Name, protocol, site.ListenPort, upstreamLogTarget, site.UAMode)
 		}
 		err := server.Serve(listener)
 		if inst.isAccepting() {
@@ -632,9 +636,9 @@ func (pm *ProxyManager) StartSite(site Site) error {
 			// the map. Record that state for API/runtime diagnostics.
 			inst.portServeFailed.Store(true)
 			if err != nil && err != http.ErrServerClosed {
-				log.Printf("[%s] server error: %v", site.Name, err)
+				log.Printf("[%s] server error: %v", inst.runtimeSite().Name, err)
 			} else {
-				log.Printf("[%s] server stopped unexpectedly", site.Name)
+				log.Printf("[%s] server stopped unexpectedly", inst.runtimeSite().Name)
 			}
 		}
 	}()

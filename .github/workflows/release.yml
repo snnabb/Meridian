@@ -30,8 +30,8 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
-          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Release tags must use exactly vMAJOR.MINOR.PATCH without a suffix." >&2
+          if ! [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-beta\.[1-9][0-9]*)?$ ]]; then
+            echo "Release tags must use vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-beta.N." >&2
             exit 1
           fi
           printf 'value=%s\n' "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
@@ -71,6 +71,8 @@ jobs:
           bash tests/dynamic_route_key_test.sh
           bash tests/upstream_header_key_test.sh
           bash tests/install_test.sh
+          shellcheck tests/install_rollback_test.sh
+          bash tests/install_rollback_test.sh
           bash tests/install_proxy_test.sh
           bash tests/install_tls_test.sh
 
@@ -176,6 +178,8 @@ jobs:
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.verify.outputs.release_tag }}
+          prerelease: ${{ contains(needs.verify.outputs.release_tag, '-beta.') }}
+          make_latest: ${{ contains(needs.verify.outputs.release_tag, '-beta.') && 'false' || 'true' }}
           files: |
             meridian-*
             SHA256SUMS
@@ -220,5 +224,5 @@ jobs:
           build-args: |
             VERSION=${{ env.RELEASE_TAG }}
           tags: |
-            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ contains(needs.verify.outputs.release_tag, '-beta.') && 'beta' || 'latest' }}
             ${{ env.IMAGE_NAME }}:${{ env.RELEASE_TAG }}

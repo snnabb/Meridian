@@ -121,8 +121,8 @@ test('passthrough payload clears the custom triplet', () => {
 
 test('new site form defaults UA mode to passthrough', () => {
   const source = fs.readFileSync(path.join(STATIC_JS, 'pages', 'sites.js'), 'utf8');
-  assert.match(source, /option value="passthrough" \$\{\(!isEdit \|\| site\.ua_mode === 'passthrough'\)/);
-  assert.match(source, /uaSelect\.value = isEdit && site\.ua_mode \? site\.ua_mode : 'passthrough'/);
+  assert.match(source, /option value="passthrough" \$\{\(!hasValues \|\| site\.ua_mode === 'passthrough'\)/);
+  assert.match(source, /uaSelect\.value = hasValues && site\.ua_mode \? site\.ua_mode : 'passthrough'/);
 });
 
 test('site management exposes latency tests and safe asset cache controls', () => {

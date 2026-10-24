@@ -34,7 +34,7 @@ node --test tests/*.test.js
 
 ## 测试版分支
 
-`beta` 按需从 `master` 创建，用于集中验证待发布改动，保留被整合 PR 的提交历史；整合完成并正式发布后可清理，下一轮再从最新主支创建。推送与目标为 `beta` 的 PR 都运行 CI 和 CodeQL；`beta` 推送还附带带提交号的 Linux x86-64 测试程序。Wiki 在该分支只构建和检查，正式文档站由 `master` 发布。安装器和面板更新继续使用正式 Release；测试程序下载见 [源码与测试版](docs/wiki/install-source.md)。
+`beta` 按需从 `master` 创建，用于集中验证待发布改动，保留被整合 PR 的提交历史；整合完成并正式发布后可清理，下一轮再从最新主支创建。推送与目标为 `beta` 的 PR 都运行 CI 和 CodeQL；`beta` 推送还附带带提交号的 Linux x86-64 测试程序。Wiki 在该分支只构建和检查，正式文档站由 `master` 发布。安装器和面板更新默认使用正式 Release；主动选择测试通道后可安装已签名的 `vX.Y.Z-beta.N` Release。分支测试程序不会自动进入更新通道，下载见 [源码与测试版](docs/wiki/install-source.md)。
 
 ## 版本发布后的同步验证
 

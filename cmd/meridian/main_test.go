@@ -5151,6 +5151,7 @@ func TestHandleSitesGETOverlaysLiveTrafficWithoutDBWrite(t *testing.T) {
 		t.Fatalf("decode /api/sites: %v", err)
 	}
 	expectedKeys := map[string]bool{
+		"total_speed_limit": true, "traffic_reset_at": true, "traffic_reset_day": true, "traffic_billing_mode": true,
 		"id": true, "sort_order": true, "name": true, "listen_port": true, "public_host": true, "path_prefix": true, "ingress_mode": true, "target_url": true,
 		"primary_line_name":   true,
 		"playback_target_url": true, "playback_mode": true, "main_video_stream_mode": true, "failover_targets": true, "failover_lines": true, "stream_hosts": true,
@@ -5268,7 +5269,7 @@ func TestSiteUpdateRestartsPreStoppedInstanceWhenRecordUpdateFails(t *testing.T)
 
 	// Same listen_port -> the update path pre-stops; the flush succeeds but the
 	// record update (which sets name) is aborted.
-	body := strings.NewReader(`{"name":"renamed","listen_port":` + jsonNumber(site.ListenPort) + `,"target_url":"http://127.0.0.1:8096","ua_mode":"infuse"}`)
+	body := strings.NewReader(`{"name":"renamed","listen_port":` + jsonNumber(site.ListenPort) + `,"target_url":"http://127.0.0.1:8096","ua_mode":"web"}`)
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPut, "/api/sites/"+jsonNumber64(site.ID), body)
 	app.handleSiteByID(rr, req)

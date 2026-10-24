@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func (a *App) handleUpstreamTest(w http.ResponseWriter, r *http.Request) {
@@ -62,17 +63,28 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Add running status
+		settings := a.db.currentSystemSettings()
+		resetAt := ""
+		if reset := trafficCycleReset(time.Now(), settings.TrafficResetDay); !reset.IsZero() {
+			resetAt = reset.Format(time.RFC3339)
+		}
 		type SiteWithStatus struct {
 			Site
-			Running        bool  `json:"running"`
-			CacheSizeBytes int64 `json:"cache_size_bytes"`
-			MonthlyTraffic int64 `json:"monthly_traffic"`
+			Running            bool   `json:"running"`
+			CacheSizeBytes     int64  `json:"cache_size_bytes"`
+			MonthlyTraffic     int64  `json:"monthly_traffic"`
+			TrafficResetDay    int    `json:"traffic_reset_day"`
+			TrafficResetAt     string `json:"traffic_reset_at"`
+			TrafficBillingMode string `json:"traffic_billing_mode"`
 		}
 		result := make([]SiteWithStatus, len(sites))
 		for i, s := range sites {
 			st := live[s.ID]
 			result[i] = SiteWithStatus{Site: s, Running: st.Running, CacheSizeBytes: cacheSizes[s.ID], MonthlyTraffic: st.MonthlyTraffic}
 			result[i].TrafficUsed = st.TrafficUsed
+			result[i].TrafficResetDay = settings.TrafficResetDay
+			result[i].TrafficResetAt = resetAt
+			result[i].TrafficBillingMode = settings.TrafficBillingMode
 		}
 		a.jsonOK(w, result)
 
@@ -113,6 +125,7 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			AssetCacheRules            string                `json:"asset_cache_rules"`
 			Quota                      int64                 `json:"traffic_quota"`
 			SpeedLimit                 int                   `json:"speed_limit"`
+			TotalSpeedLimit            int                   `json:"total_speed_limit"`
 		}
 		// Imports may contain up to 2 MB of CSV text, expanded by JSON escaping.
 		limit := int64(maxJSONBodyBytes)
@@ -124,6 +137,10 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := validateNewSiteAccounts(req.Accounts); err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := validateTotalSpeedLimit(req.TotalSpeedLimit); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -351,6 +368,7 @@ func (a *App) handleSites(w http.ResponseWriter, r *http.Request) {
 			AssetCacheRules:               assetCacheConfig.AssetCacheRules,
 			TrafficQuota:                  req.Quota,
 			SpeedLimit:                    req.SpeedLimit,
+			TotalSpeedLimit:               req.TotalSpeedLimit,
 		}
 		if dryRun, _ := r.Context().Value(siteCommandDryRunKey{}).(bool); dryRun {
 			a.jsonOK(w, candidate)
@@ -561,7 +579,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		result := diagnoseSite(site, a.pm)
 		a.jsonOK(w, result)
 
-	case action == "" && r.Method == "PUT":
+	case (action == "" && r.Method == "PUT") || (action == "preview" && r.Method == "POST"):
 		a.siteLifecycleMu.Lock()
 		defer a.siteLifecycleMu.Unlock()
 		oldSite, err := a.db.GetSite(id)
@@ -607,6 +625,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			AssetCacheRules            *string                `json:"asset_cache_rules"`
 			Quota                      *int64                 `json:"traffic_quota"`
 			SpeedLimit                 *int                   `json:"speed_limit"`
+			TotalSpeedLimit            *int                   `json:"total_speed_limit"`
 		}
 		if err := decodeJSONBody(w, r, &req); err != nil {
 			a.jsonErr(w, 400, "invalid request")
@@ -934,6 +953,13 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 		}
 		candidate.TrafficQuota = quota
 		candidate.SpeedLimit = speedLimit
+		if req.TotalSpeedLimit != nil {
+			candidate.TotalSpeedLimit = *req.TotalSpeedLimit
+		}
+		if err := validateTotalSpeedLimit(candidate.TotalSpeedLimit); err != nil {
+			a.jsonErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if err := validateSiteSettings(candidate.Name, candidate.ListenPort, candidate.TargetURL, candidate.PlaybackTargetURL, candidate.PlaybackMode, streamHostList, candidate.UAMode, candidate.CustomUserAgent, candidate.CustomClient, candidate.CustomVersion, candidate.TrafficQuota, candidate.SpeedLimit); err != nil {
 			a.jsonErr(w, http.StatusBadRequest, err.Error())
 			return
@@ -954,7 +980,11 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			a.jsonOK(w, candidate)
 			return
 		}
-		needsPreStop := oldSite.Enabled && ingressUsesPort(oldSite.IngressMode) && ingressUsesPort(candidate.IngressMode) && oldSite.ListenPort == candidate.ListenPort && a.pm.IsRunning(id)
+		if action == "preview" {
+			a.jsonOK(w, map[string]any{"restarts": oldSite.Enabled && !siteCanUpdateLive(*oldSite, candidate), "fingerprint": siteConfigurationFingerprint(*oldSite)})
+			return
+		}
+		needsPreStop := !siteCanUpdateLive(*oldSite, candidate) && oldSite.Enabled && ingressUsesPort(oldSite.IngressMode) && ingressUsesPort(candidate.IngressMode) && oldSite.ListenPort == candidate.ListenPort && a.pm.IsRunning(id)
 		if needsPreStop {
 			// Stop before replacing a listener on the same port. A post-close drain
 			// or final-checkpoint failure cannot restore that listener, so fail closed
@@ -1019,7 +1049,7 @@ func (a *App) handleSiteByID(w http.ResponseWriter, r *http.Request) {
 			a.jsonErr(w, 500, err.Error())
 			return
 		}
-		if site.Enabled {
+		if site.Enabled && !a.pm.UpdateSiteLive(*site) {
 			if err := a.pm.StartSite(*site); err != nil {
 				if rollbackErr := a.db.restoreSiteRecord(*oldSite); rollbackErr != nil {
 					a.jsonErr(w, 500, fmt.Sprintf("start updated site: %v; rollback update: %v", err, rollbackErr))

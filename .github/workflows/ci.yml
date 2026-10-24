@@ -67,6 +67,8 @@ jobs:
           bash tests/dynamic_route_key_test.sh
           bash tests/upstream_header_key_test.sh
           bash tests/install_test.sh
+          shellcheck tests/install_rollback_test.sh
+          bash tests/install_rollback_test.sh
           bash tests/install_proxy_test.sh
           bash tests/install_tls_test.sh
 

@@ -66,6 +66,24 @@ func trafficCycleStart(now time.Time, resetDay int) time.Time {
 	return time.Date(previousMonth.Year(), previousMonth.Month(), previousDay, 0, 0, 0, 0, time.Local)
 }
 
+// trafficCycleReset returns the next reset using the same server-local calendar
+// as enforcement. Adding a month to a clamped date would skip February/April.
+func trafficCycleReset(now time.Time, resetDay int) time.Time {
+	if resetDay == 0 {
+		return time.Time{}
+	}
+	if resetDay < 0 || resetDay > 31 {
+		resetDay = 1
+	}
+	start := trafficCycleStart(now, resetDay)
+	nextMonth := time.Date(start.Year(), start.Month()+1, 1, 0, 0, 0, 0, time.Local)
+	lastDay := time.Date(nextMonth.Year(), nextMonth.Month()+1, 0, 0, 0, 0, 0, time.Local).Day()
+	if resetDay > lastDay {
+		resetDay = lastDay
+	}
+	return time.Date(nextMonth.Year(), nextMonth.Month(), resetDay, 0, 0, 0, 0, time.Local)
+}
+
 func siteTrafficDirections(site Site) (int64, int64) {
 	if site.TrafficUsedIn == 0 && site.TrafficUsedOut == 0 && site.TrafficUsed > 0 {
 		return legacyTrafficDirections(site.TrafficUsed)

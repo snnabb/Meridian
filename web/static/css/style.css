@@ -1891,6 +1891,7 @@ tbody tr:hover {
 }
 .site-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 7px;
   margin-top: 22px;
   padding-top: 17px;

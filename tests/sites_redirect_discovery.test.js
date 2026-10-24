@@ -241,6 +241,7 @@ function loadModalHarness() {
         return { observations: [], dropped_observations: 0 };
       },
       createSite: async payload => { state.creates.push(clone(payload)); },
+      previewSite: async () => ({restarts: false, fingerprint: 'test'}),
       updateSite: async (siteId, payload) => { state.updates.push({ siteId, payload: clone(payload) }); },
     },
     Toast: {
@@ -834,8 +835,19 @@ test('client IP forwarding selector exposes only the three node-level modes', ()
     assert.match(source, new RegExp(`<option value="${value}"`));
   }
   assert.doesNotMatch(source, /client_ip_mode[^\n]*(inherit|global)|继承全局/i);
-  assert.match(source, /clientIPModeSelect\.value = isEdit[^\n]+: 'both'/);
+  assert.match(source, /clientIPModeSelect\.value = hasValues[^\n]+: 'both'/);
   assert.match(source, /client_ip_mode: clientIPModeSelect\.value/);
+});
+
+test('template draft fills policies and limits without editing an existing site', async () => {
+  const { sandbox, document, state } = loadModalHarness();
+  await sandbox.showSiteModal({name:'Draft', target_url:'https://origin.example', ingress_mode:'path', path_prefix:'draft', ua_mode:'passthrough', speed_limit:3, total_speed_limit:9, traffic_quota:2147483648, dynamic_discovery_enabled:false});
+  assert.equal(document.getElementById('m-name').value, 'Draft');
+  assert.equal(document.getElementById('m-speed').value, '3');
+  assert.equal(document.getElementById('m-total-speed').value, '9');
+  assert.equal(document.getElementById('m-quota').value, '2');
+  assert.equal(state.updates.length,0);
+  assert.equal(state.observationGets.length,0);
 });
 
 test('complete upstream URLs validate ports without losing signed queries', () => {

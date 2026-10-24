@@ -268,6 +268,11 @@ version_gt v1.5.6-rc1 v1.5.5 || { echo 'FAIL: v1.5.6-rc1 must be newer than v1.5
 version_gt v1.6.0-rc1 v1.5.10 || { echo 'FAIL: v1.6.0-rc1 must be newer than v1.5.10' >&2; exit 1; }
 version_gt v2.0.0-beta.1 v1.9.9 || { echo 'FAIL: v2.0.0-beta.1 must be newer than v1.9.9' >&2; exit 1; }
 version_gt v1.5.7 v1.5.6-rc1 || { echo 'FAIL: v1.5.7 must be newer than v1.5.6-rc1' >&2; exit 1; }
+version_gt v1.15.0 v1.15.0-beta.10 || { echo 'FAIL: stable must be newer than its beta' >&2; exit 1; }
+version_gt v1.15.0-beta.10 v1.15.0-beta.2 || { echo 'FAIL: beta numbers must compare numerically' >&2; exit 1; }
+if version_gt v1.15.0-beta.10 v1.15.0 || version_gt v1.15.0-beta.2 v1.15.0-beta.10; then
+    echo 'FAIL: beta downgrade must not compare as newer' >&2; exit 1
+fi
 if version_gt v1.5.6-rc1 v1.5.6; then
     echo 'FAIL: v1.5.6-rc1 must not compare as newer than v1.5.6' >&2
     exit 1
@@ -1436,10 +1441,10 @@ assert_dir "$BACKUP_DIR"
 
 help_text=$(usage)
 assert_contains <(printf '%s' "$help_text") '--port PORT'
-for command_name in install update tls password uninstall; do
+for command_name in install update rollback tls password uninstall; do
     printf '%s' "$help_text" | grep -q "install.sh ${command_name}"
 done
-for removed_command in status restart logs backup rollback; do
+for removed_command in status restart logs backup; do
     if printf '%s' "$help_text" | grep -Eq "install\.sh ${removed_command}([[:space:]]|$)"; then
         printf 'FAIL: removed public command remains in help: %s\n' "$removed_command" >&2
         exit 1
