@@ -144,7 +144,7 @@ function timezoneSelect(value, legacyOffset) {
   const numericOffset = Number(legacyOffset);
   const offset = Number.isFinite(numericOffset) ? Math.trunc(numericOffset) : 480;
   const options = COMMON_TIMEZONES.map(([name, label]) => `<option value="${name}" ${name === selected ? 'selected' : ''}>${label} · ${name}</option>`);
-  return `<label class="settings-field"><span>时区</span><div><select class="form-select" id="setting-schedule-timezone">${options.join('')}</select><input type="hidden" id="setting-schedule-timezone-offset" value="${offset}"></div><small>用于流量重置、日志时间和定时通知。</small></label>`;
+  return `<label class="settings-field"><span>时区</span><div><select class="form-select" id="setting-schedule-timezone">${options.join('')}</select><input type="hidden" id="setting-schedule-timezone-offset" value="${offset}"></div><small>用于日志时间和定时通知；流量重置按服务器时区计算。</small></label>`;
 }
 
 function settingsCheck(id, label, checked, help) {
