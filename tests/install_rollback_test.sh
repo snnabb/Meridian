@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2317,SC2329
 set -euo pipefail
+# Exercise real root-owned snapshots; systemctl below is fully mocked. GitHub
+# runners start unprivileged, while the deployment test host runs as root.
+if [ "$(id -u)" -ne 0 ]; then
+    exec sudo -n -- bash "$0" "$@"
+fi
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TEST_ROOT=$(mktemp -d)
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
