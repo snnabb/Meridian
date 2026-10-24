@@ -167,7 +167,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, target, primaryTarg
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(&tunnelWriter{dst: clientConn, counter: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut, meter: meter, bytesPerSec: speedLimitBytes, quota: inst.quota, start: time.Now()}, upstreamReader)
+		download := &sitePacedWriter{dst: clientConn, limiter: inst.totalRate, ctx: r.Context()}
+		_, _ = io.Copy(&tunnelWriter{dst: download, counter: &inst.bytesOut, cumulative: &inst.cumulativeBytesOut, meter: meter, bytesPerSec: speedLimitBytes, quota: inst.quota, start: time.Now()}, upstreamReader)
 		done <- struct{}{}
 	}()
 	// The first closed direction must tear down its counterpart, then both copy

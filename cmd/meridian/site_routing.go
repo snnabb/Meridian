@@ -581,6 +581,13 @@ func requestPublicHost(hostport string) string {
 	return normalized
 }
 
+func validateTotalSpeedLimit(limit int) error {
+	if limit < 0 || limit > maxSpeedLimitMbps {
+		return fmt.Errorf("total_speed_limit must be between 0 and %d Mbps", maxSpeedLimitMbps)
+	}
+	return nil
+}
+
 func validateSiteSettings(name string, listenPort int, targetURL, playbackTargetURL, playbackMode string, streamHosts []string, uaMode, customUserAgent, customClient, customVersion string, quota int64, speedLimit int) error {
 	name = strings.TrimSpace(name)
 	if name == "" || len(name) > 100 || strings.ContainsAny(name, "\r\n") {

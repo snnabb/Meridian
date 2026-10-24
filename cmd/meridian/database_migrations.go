@@ -120,8 +120,14 @@ func (d *DB) migrateOnce() error {
 		traffic_used_in BIGINT NOT NULL DEFAULT 0,
 		traffic_used_out BIGINT NOT NULL DEFAULT 0,
 		speed_limit INTEGER DEFAULT 0,
+		total_speed_limit INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS site_templates (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL UNIQUE,
+		config TEXT NOT NULL
 	);
 	CREATE TABLE IF NOT EXISTS site_accounts (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -308,6 +314,7 @@ func (d *DB) migrateOnce() error {
 		sql    string
 	}{
 		{"playback_target_url", "ALTER TABLE sites ADD COLUMN playback_target_url TEXT NOT NULL DEFAULT ''"},
+		{"total_speed_limit", "ALTER TABLE sites ADD COLUMN total_speed_limit INTEGER NOT NULL DEFAULT 0"},
 		{"playback_mode", "ALTER TABLE sites ADD COLUMN playback_mode TEXT NOT NULL DEFAULT 'direct'"},
 		{"main_video_stream_mode", "ALTER TABLE sites ADD COLUMN main_video_stream_mode TEXT NOT NULL DEFAULT 'proxy'"},
 		{"primary_line_name", "ALTER TABLE sites ADD COLUMN primary_line_name TEXT NOT NULL DEFAULT '主线路'"},

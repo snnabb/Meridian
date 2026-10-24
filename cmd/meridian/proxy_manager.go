@@ -17,6 +17,8 @@ import (
 
 type ProxyInstance struct {
 	Site      Site
+	liveSite  atomic.Pointer[Site]
+	totalRate *siteRateLimiter
 	handler   http.Handler
 	server    *http.Server
 	listener  net.Listener

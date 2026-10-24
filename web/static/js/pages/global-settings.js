@@ -144,7 +144,7 @@ function timezoneSelect(value, legacyOffset) {
   const numericOffset = Number(legacyOffset);
   const offset = Number.isFinite(numericOffset) ? Math.trunc(numericOffset) : 480;
   const options = COMMON_TIMEZONES.map(([name, label]) => `<option value="${name}" ${name === selected ? 'selected' : ''}>${label} · ${name}</option>`);
-  return `<label class="settings-field"><span>时区</span><div><select class="form-select" id="setting-schedule-timezone">${options.join('')}</select><input type="hidden" id="setting-schedule-timezone-offset" value="${offset}"></div><small>用于流量重置、日志时间和定时通知。</small></label>`;
+  return `<label class="settings-field"><span>时区</span><div><select class="form-select" id="setting-schedule-timezone">${options.join('')}</select><input type="hidden" id="setting-schedule-timezone-offset" value="${offset}"></div><small>用于日志时间和定时通知；流量重置按服务器时区计算。</small></label>`;
 }
 
 function settingsCheck(id, label, checked, help) {
@@ -373,9 +373,13 @@ function renderUpdateSettings() {
   return `<section class="settings-panel" id="system-update-panel">
     <header><h2>版本更新</h2></header>
     <p class="settings-panel-help">更新前自动备份，启动失败时回滚。</p>
+    <label class="form-group">更新通道<select class="form-select" id="update-channel"><option value="stable">正式版（推荐）</option><option value="beta">测试版</option></select></label>
+    <p class="form-help">测试通道仅提供已打包并签名的测试版本。切回正式通道不会直接降级；可等待更新的正式版，或恢复升级前快照。</p>
     <div id="update-summary" class="form-help" role="status"></div>
     <div class="settings-save-bar"><button type="button" class="telegram-btn" id="update-check">检查更新</button><button type="button" class="telegram-btn primary" id="update-install" hidden>更新并重启</button></div>
     <details id="update-notes" hidden><summary>版本说明</summary><pre class="update-release-notes"></pre><a target="_blank" rel="noopener noreferrer">在 GitHub 查看发布内容</a></details>
+    <div class="settings-save-bar"><button type="button" class="telegram-btn" id="update-rollback" hidden>恢复升级前版本和数据</button></div>
+    <p class="form-help">回滚会恢复程序、配置、账号和流量数据到上次升级前；回滚前另存当前数据备份。Docker 部署请使用固定镜像版本并配套恢复备份。</p>
   </section>`;
 }
 
@@ -384,17 +388,20 @@ function bindUpdateSettings(page) {
   if (!panel) return;
   const check = panel.querySelector('#update-check'), install = panel.querySelector('#update-install');
   const summary = panel.querySelector('#update-summary'), notes = panel.querySelector('#update-notes');
+  const channel = panel.querySelector('#update-channel'), rollback = panel.querySelector('#update-rollback');
+  try { channel.value = localStorage.getItem('meridian-update-channel') === 'beta' ? 'beta' : 'stable'; } catch (_) {}
+  channel.onchange = () => { release = null; install.hidden = true; notes.hidden = true; summary.textContent = '通道已切换，请重新检查更新。'; try { localStorage.setItem('meridian-update-channel', channel.value); } catch (_) {} };
   let release = null, polling = false;
   const poll = async () => {
     if (polling) return;
-    polling = true; check.disabled = true; install.disabled = true;
+    polling = true; check.disabled = true; install.disabled = true; channel.disabled = true; rollback.disabled = true;
     const deadline = Date.now() + 32 * 60 * 1000;
     while (panel.isConnected && Router.current === 'global-settings' && globalSettingsSection === 'updates' && Date.now() < deadline) {
       try {
         const status = await API.systemUpdateStatus();
         summary.textContent = status.message;
         if (status.state !== 'running') {
-          polling = false; check.disabled = false;
+          polling = false; check.disabled = false; channel.disabled = false; rollback.disabled = false;
           if (status.state === 'completed') { Toast.success('更新完成'); window.location.reload(); }
           else if (status.state === 'failed') { Toast.error(status.message); install.hidden = true; }
           return;
@@ -403,13 +410,15 @@ function bindUpdateSettings(page) {
       await new Promise(resolve => setTimeout(resolve, 2000));
     }
     polling = false;
-    if (panel.isConnected) { summary.textContent = '等待超时，请刷新查看服务状态。'; check.disabled = false; }
+    if (panel.isConnected) { summary.textContent = '等待超时，请刷新查看服务状态。'; check.disabled = false; channel.disabled = false; rollback.disabled = false; }
   };
   check.onclick = async () => {
     if (check.disabled) return;
     check.disabled = true; check.textContent = '检查中…'; install.hidden = true;
     try {
-      release = await API.checkSystemUpdate();
+      const selectedChannel = channel.value;
+      release = await API.checkSystemUpdate(selectedChannel);
+      if (channel.value !== selectedChannel) { release = null; return; }
       if (!panel.isConnected) return;
       summary.textContent = `当前 ${release.current_version} · 最新 ${release.latest_version}。${release.update_available ? '有新版本可用。' : '当前无需更新。'}${release.update_supported ? '' : release.unsupported_reason || ''}`;
       install.hidden = !(release.update_available && release.update_supported);
@@ -423,12 +432,20 @@ function bindUpdateSettings(page) {
   install.onclick = async () => {
     if (!release || install.disabled || !window.confirm(`更新到 ${release.latest_version}？面板与站点会短暂重启，现有配置会保留。`)) return;
     install.disabled = true; check.disabled = true;
-    try { await API.startSystemUpdate(release.latest_version); await poll(); }
+    try { await API.startSystemUpdate(release.latest_version, channel.value); await poll(); }
     catch (error) { summary.textContent = error.message; install.disabled = false; check.disabled = false; }
   };
   API.systemUpdateStatus().then(status => {
     if (!panel.isConnected) return;
+    rollback.hidden = !(status.protocol >= 2 && status.rollback_version);
+    if (status.rollback_version) rollback.textContent = '恢复到 ' + status.rollback_version + ' 及升级前数据';
     if (status.state === 'running') { summary.textContent = status.message; poll(); }
     else if (status.state === 'failed') summary.textContent = status.message;
   }).catch(() => {});
+  rollback.onclick = async () => {
+    if (rollback.disabled || !window.confirm('恢复升级前版本和数据？升级后新增的配置、账号和流量记录会被替换；系统会先备份当前数据。')) return;
+    rollback.disabled = true; check.disabled = true;
+    try { await API.rollbackSystemUpdate(); await poll(); }
+    catch (error) { summary.textContent = error.message; rollback.disabled = false; check.disabled = false; }
+  };
 }

@@ -65,7 +65,7 @@ func (reservation trafficQuotaReservation) settle(actual int64) {
 }
 
 func (q *trafficQuotaState) reserve(outbound bool, requested int64, now time.Time) (int64, trafficQuotaReservation, error) {
-	if q == nil || q.inst == nil || q.pm == nil || q.pm.database == nil || q.inst.Site.TrafficQuota <= 0 || requested <= 0 {
+	if q == nil || q.inst == nil || q.pm == nil || q.pm.database == nil || requested <= 0 {
 		return requested, trafficQuotaReservation{}, nil
 	}
 	settings := q.pm.database.currentSystemSettings()
@@ -85,15 +85,21 @@ func (q *trafficQuotaState) reserve(outbound bool, requested int64, now time.Tim
 		reservation := trafficQuotaReservation{state: q, generation: q.generation, reserved: requested}
 		return requested, reservation, nil
 	}
-	remaining := q.inst.Site.TrafficQuota - q.usage
-	if remaining <= 0 {
+	limit := q.inst.runtimeSite().TrafficQuota
+	remaining := limit - q.usage
+	if limit > 0 && remaining <= 0 {
 		return 0, trafficQuotaReservation{}, errTrafficQuotaExceeded
 	}
 	allowed := requested
-	if allowed > remaining {
+	if limit > 0 && allowed > remaining {
 		allowed = remaining
 	}
-	q.usage += allowed
+	const maxUsage = int64(^uint64(0) >> 1)
+	if q.usage > maxUsage-allowed {
+		q.usage = maxUsage
+	} else {
+		q.usage += allowed
+	}
 	reservation := trafficQuotaReservation{state: q, generation: q.generation, reserved: allowed, outbound: outbound, charged: true}
 	if allowed < requested {
 		return allowed, reservation, errTrafficQuotaExceeded

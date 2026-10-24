@@ -260,6 +260,8 @@ func main() {
 	mux.HandleFunc("/api/backup/restore", cors(app.authMiddleware(app.handleBackupRestore)))
 	mux.HandleFunc("/api/sites", cors(app.authMiddleware(app.handleSites)))
 	mux.HandleFunc("/api/sites/reorder", cors(app.authMiddleware(app.handleSiteReorder)))
+	mux.HandleFunc("/api/sites/bulk", cors(app.authMiddleware(app.handleSiteBulk)))
+	mux.HandleFunc("/api/site-templates", cors(app.authMiddleware(app.handleSiteTemplates)))
 	mux.HandleFunc("/api/site-data/export", cors(app.authMiddleware(app.handleSiteDataExport)))
 	mux.HandleFunc("/api/site-data/import", cors(app.authMiddleware(app.handleSiteDataImport)))
 	mux.HandleFunc("/api/site-data/parse-message", cors(app.authMiddleware(app.handleSiteMessageParse)))

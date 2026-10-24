@@ -2,6 +2,18 @@
 let siteSortingCleanup = null;
 let sitesLoadGeneration = 0;
 let siteToolMenuCleanup = null;
+function siteQuotaSummary(site) {
+  const used = Math.max(0, Number(site.monthly_traffic) || 0);
+  const quota = Math.max(0, Number(site.traffic_quota) || 0);
+  return {
+    used,
+    remaining: quota > 0 ? Math.max(0, quota - used) : null,
+    percent: quota > 0 ? Math.min(100, used / quota * 100) : 0,
+    reset: Number(site.traffic_reset_day) === 0 ? '不自动重置' :
+      (site.traffic_reset_at ? new Date(site.traffic_reset_at).toLocaleString('zh-CN', { hour12: false }) : '—'),
+    billing: site.traffic_billing_mode === 'outbound' ? '仅出站' : '双向流量',
+  };
+}
 function normalizeAccountRenewalDays(value) {
   const text = String(value ?? '').trim();
   if (!/^\d+$/.test(text)) return 0;
@@ -54,6 +66,8 @@ function renderSites() {
         </select>
         <button class="btn-ghost btn-test-all" id="btn-test-all-sites"><span aria-hidden="true">⌁</span> 全部测速</button>
         <button class="btn-ghost" id="btn-account-reminder-history">提醒记录</button>
+        <button class="btn-ghost" id="btn-site-templates">配置模板</button>
+        <button class="btn-ghost" id="btn-sites-bulk">批量操作</button>
         <div class="toolbar-info" id="sites-count"></div>
       </div>
       <div class="site-account-reminders" id="site-account-reminders" hidden></div>
@@ -64,6 +78,8 @@ function renderSites() {
     document.getElementById('btn-add-site').onclick = () => showSiteModal();
     document.getElementById('btn-test-all-sites').onclick = testAllSitesLatency;
     document.getElementById('btn-account-reminder-history').onclick = showAccountReminderRecords;
+    document.getElementById('btn-site-templates').onclick = showSiteTemplates;
+    document.getElementById('btn-sites-bulk').onclick = showSiteBulk;
     document.getElementById('sites-search').addEventListener('input', event => filterSiteCards(event.target.value));
     document.getElementById('account-lifecycle-filter').addEventListener('change', () => loadSiteAccountReminders());
     document.querySelectorAll('[data-site-import-format]').forEach(button => {
@@ -133,6 +149,8 @@ async function loadSites() {
 	const [sites, capabilities] = await Promise.all([API.listSites(), API.ingressCapabilities()]);
 	if (generation !== sitesLoadGeneration || Router.current !== 'sites') return;
 	siteIngressCapabilities = normalizeSiteCapabilities(capabilities);
+    siteWorkflowSites = sites;
+    siteSelection = new Set([...siteSelection].filter(id => sites.some(s => s.id === id)));
     document.getElementById('sites-count').innerHTML = `共 <strong>${sites.length}</strong> 个站点`;
     loadSiteAccountReminders();
 
@@ -145,7 +163,8 @@ async function loadSites() {
     }
 
 	grid.innerHTML = sites.map((s, i) => {
-      const pct = s.traffic_quota > 0 ? (s.traffic_used / s.traffic_quota * 100).toFixed(1) : 0;
+      const quota = siteQuotaSummary(s);
+      const pct = quota.percent;
       const pctClass = pct > 85 ? 'danger' : pct > 50 ? 'warn' : 'normal';
 		const upstreamHeaderCount = Array.isArray(s.upstream_headers) ? s.upstream_headers.length : 0;
 		const accessAddress = siteAccessAddress(s, siteIngressCapabilities);
@@ -154,6 +173,7 @@ async function loadSites() {
       <div class="site-card" data-site-id="${s.id}" data-site-search="${esc(`${s.name} ${s.target_url} ${s.public_host || ''}`.toLowerCase())}">
         <div class="site-top">
           <div class="site-heading">
+            <input type="checkbox" data-site-select="${s.id}" aria-label="选择 ${esc(s.name)}" ${siteSelection.has(s.id) ? 'checked' : ''}>
             <button type="button" class="site-drag-handle" data-site-drag-handle aria-label="拖拽调整 ${esc(s.name)} 的顺序" title="拖拽调整顺序">
               <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="7" cy="5" r="1.25"></circle><circle cx="13" cy="5" r="1.25"></circle><circle cx="7" cy="10" r="1.25"></circle><circle cx="13" cy="10" r="1.25"></circle><circle cx="7" cy="15" r="1.25"></circle><circle cx="13" cy="15" r="1.25"></circle></svg>
             </button>
@@ -185,8 +205,8 @@ async function loadSites() {
           ${s.traffic_quota > 0 ? `
           <div class="progress-wrap">
             <div class="progress-labels">
-              <span>已用 ${formatBytes(s.traffic_used)}</span>
-              <span>${formatBytes(s.traffic_quota)}</span>
+              <span>本周期 ${formatBytes(quota.used)} / ${formatBytes(s.traffic_quota)}</span>
+              <span>剩余 ${formatBytes(quota.remaining)}</span>
             </div>
             <div class="progress-track">
               <div class="progress-fill ${pctClass}" style="width:${Math.min(pct, 100)}%"></div>
@@ -194,15 +214,20 @@ async function loadSites() {
           </div>
           ` : `
           <div class="site-row">
-            <span class="site-row-label">已用流量</span>
-            <span>${formatBytes(s.traffic_used)}</span>
+            <span class="site-row-label">本周期流量</span>
+            <span>${formatBytes(quota.used)} · 不限额</span>
           </div>
           `}
+          <div class="site-row"><span class="site-row-label">下次重置</span><span title="按服务器计费时区重置，时间以当前浏览器时区显示">${esc(quota.reset)}</span></div>
+          <div class="site-row"><span class="site-row-label">累计流量</span><span>${formatBytes(s.traffic_used)} · ${esc(quota.billing)}</span></div>
+          ${s.total_speed_limit > 0 ? `<div class="site-row"><span class="site-row-label">总下载限速</span><span>${s.total_speed_limit} Mbps</span></div>` : ''}
         </div>
         <div class="site-actions">
           <button class="btn-ghost site-action-test" data-site-action="latency" data-site-id="${s.id}">测速</button>
           <button class="btn-ghost" data-site-action="toggle" data-site-id="${s.id}" ${normalizedIngressMode(s) === 'unset' ? 'disabled title="请先编辑并配置入口"' : ''}>${normalizedIngressMode(s) === 'unset' ? '待配置' : (s.enabled ? '停用' : '启用')}</button>
           <button class="btn-ghost" data-site-action="edit" data-site-id="${s.id}">编辑</button>
+          <button class="btn-ghost" data-site-action="duplicate" data-site-id="${s.id}">复制</button>
+          <button class="btn-ghost" data-site-action="template" data-site-id="${s.id}">存为模板</button>
           <button class="btn-ghost danger" data-site-action="delete" data-site-id="${s.id}">删除</button>
         </div>
       </div>`;
@@ -219,9 +244,15 @@ async function loadSites() {
 		if (button.dataset.siteAction === 'copy') copySiteAccessAddress(button);
 		if (button.dataset.siteAction === 'toggle') toggleSiteAction(id);
         if (button.dataset.siteAction === 'edit') showSiteModal(site);
+        if (button.dataset.siteAction === 'duplicate') showSiteModal(siteDraft(site));
+        if (button.dataset.siteAction === 'template') saveSiteTemplate(site);
         if (button.dataset.siteAction === 'delete') deleteSiteAction(id, site.name);
       });
     });
+    grid.querySelectorAll('[data-site-select]').forEach(input => {
+      input.onchange = () => { const id = Number(input.dataset.siteSelect); if (input.checked) siteSelection.add(id); else siteSelection.delete(id); updateSiteSelectionCount(); };
+    });
+    updateSiteSelectionCount();
     setupSiteSorting(grid);
     filterSiteCards(searchQuery);
   } catch (e) {
@@ -1392,7 +1423,8 @@ function normalizedTargetAuthority(value) {
 function showPanelCertificateModal() { Router.navigate('settings-tls'); }
 
 async function showSiteModal(site) {
-  const isEdit = !!site;
+  const isEdit = !!site?.id;
+  const hasValues = !!site;
   const title = isEdit ? '编辑站点' : '添加站点';
 	let siteCapabilities;
 	let dynamicCapabilities;
@@ -1412,7 +1444,7 @@ async function showSiteModal(site) {
 	const domainPrefixAvailable = siteCapabilities.domain_prefix_available === true;
 	const canUseHostIngress = canUseDomainPrefix(siteCapabilities, site);
 	const domainPrefixExample = siteAccessAddress({ ingress_mode: 'host', public_host: `前缀.${siteCapabilities.route_domain || 'example.com'}` }, siteCapabilities);
-	const dynamicPolicy = normalizeDynamicSitePolicy(isEdit ? site : {
+	const dynamicPolicy = normalizeDynamicSitePolicy(hasValues ? site : {
 		dynamic_discovery_enabled: Boolean(dynamicCapabilities && dynamicCapabilities.available),
 		dynamic_profile: 'compatible',
 		dynamic_domain_rules: [],
@@ -1421,7 +1453,7 @@ async function showSiteModal(site) {
 	let dynamicRules = [...dynamicPolicy.dynamic_domain_rules];
 	let modalAccounts = Array.isArray(existingAccounts) ? existingAccounts.map(account => ({ ...account })) : [];
 	let nextDraftAccountID = -1;
-  const primaryTarget = splitUpstreamTargetAddress(isEdit ? site.target_url : '', 'http');
+  const primaryTarget = splitUpstreamTargetAddress(hasValues ? site.target_url : '', 'http');
   document.getElementById('modal-title').textContent = title;
   document.getElementById('modal-body').innerHTML = `
     <div class="site-modal-tabs" id="site-modal-tabs" role="tablist">
@@ -1432,7 +1464,7 @@ async function showSiteModal(site) {
     <div class="site-modal-panel active" id="site-panel-basic" role="tabpanel" aria-labelledby="site-tab-basic">
       <div class="form-group">
         <label for="m-name">站点名称</label>
-        <input type="text" class="form-input" id="m-name" value="${isEdit ? esc(site.name) : ''}" placeholder="如：Emby-US-01" maxlength="100" required>
+        <input type="text" class="form-input" id="m-name" value="${hasValues ? esc(site.name) : ''}" placeholder="如：Emby-US-01" maxlength="100" required>
       </div>
 	${!isEdit ? `<details class="form-group site-form-wide site-launch-import" id="m-launch-import">
 	  <summary>从开号信息填充</summary>
@@ -1454,18 +1486,18 @@ async function showSiteModal(site) {
 	</div>
 	<div class="form-group" id="m-port-group">
 	  <label id="m-port-label" for="m-port">监听端口</label>
-	  <input type="number" class="form-input" id="m-port" value="${isEdit && ['port', 'both'].includes(normalizedIngressMode(site)) ? site.listen_port : ''}" placeholder="如：8001" min="1" max="65535" step="1" inputmode="numeric">
+	  <input type="number" class="form-input" id="m-port" value="${hasValues && ['port', 'both'].includes(normalizedIngressMode(site)) ? site.listen_port : ''}" placeholder="如：8001" min="1" max="65535" step="1" inputmode="numeric">
 	  <div class="form-help" id="m-port-help"></div>
 	</div>
 	<div class="form-group" id="m-public-host-group">
 	  <label for="m-route-prefix">域名前缀</label>
-	  <input type="text" class="form-input" id="m-route-prefix" value="${isEdit ? esc(routePrefixForSite(site, siteCapabilities.route_domain)) : ''}" placeholder="如：123" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="63">
-	  <input type="hidden" id="m-public-host" value="${isEdit ? esc(site.public_host || '') : ''}">
+	  <input type="text" class="form-input" id="m-route-prefix" value="${hasValues ? esc(routePrefixForSite(site, siteCapabilities.route_domain)) : ''}" placeholder="如：123" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="63">
+	  <input type="hidden" id="m-public-host" value="${hasValues ? esc(site.public_host || '') : ''}">
 	  <div class="form-help">访问地址为 ${esc(domainPrefixExample)}。复用此入口端口，不会另外开放站点端口；请将对应域名解析到服务器。</div>
 	</div>
 	<div class="form-group" id="m-path-prefix-group" hidden>
 	  <label for="m-path-prefix">路径前缀</label>
-	  <input type="text" class="form-input" id="m-path-prefix" value="${isEdit ? esc(String(site.path_prefix || '').replace(/^\//, '')) : ''}" placeholder="如：emby" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="64">
+	  <input type="text" class="form-input" id="m-path-prefix" value="${hasValues ? esc(String(site.path_prefix || '').replace(/^\//, '')) : ''}" placeholder="如：emby" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="64">
 	</div>
       <div class="form-group site-form-wide site-upstream-main" id="m-upstream-lines">
         <label>主地址</label>
@@ -1476,7 +1508,7 @@ async function showSiteModal(site) {
           <span class="upstream-line-latency" hidden></span>
         </div>
         <div class="form-help">粘贴完整链接可自动识别协议与端口。</div>
-        <details class="site-failover-options" ${isEdit && site.failover_lines?.length ? 'open' : ''}>
+        <details class="site-failover-options" ${hasValues && site.failover_lines?.length ? 'open' : ''}>
           <summary>备用地址（可选）</summary>
           <div id="m-failover-lines"></div>
           <button type="button" class="btn-ghost" id="m-add-failover-line">添加备用地址</button>
@@ -1515,7 +1547,7 @@ async function showSiteModal(site) {
       </div>
 		<div class="form-group site-form-wide playback-targets-group" id="m-manual-playback">
 		  <label for="m-playback-target">播放回源地址</label>
-		  <input type="text" class="form-input" id="m-playback-target" value="${isEdit ? esc(site.playback_target_url || '') : ''}" placeholder="如：playback.example.com 或 https://playback.example.com:443" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="2048">
+		  <input type="text" class="form-input" id="m-playback-target" value="${hasValues ? esc(site.playback_target_url || '') : ''}" placeholder="如：playback.example.com 或 https://playback.example.com:443" inputmode="url" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="2048">
 		  <div class="form-help">留空使用主地址；未写协议时，443 端口使用 HTTPS，其余使用 HTTP。</div>
 		  <div class="stream-hosts-wrap" style="margin-top: 14px;">
 		    <div class="stream-hosts-head" style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
@@ -1548,7 +1580,7 @@ async function showSiteModal(site) {
 		</details>
     </div>
     <div class="site-modal-panel" id="site-panel-advanced" role="tabpanel" aria-labelledby="site-tab-advanced">
-			<details class="form-group site-form-wide site-header-options" id="m-header-options" ${isEdit && site.upstream_headers?.length ? 'open' : ''}>
+			<details class="form-group site-form-wide site-header-options" id="m-header-options" ${hasValues && site.upstream_headers?.length ? 'open' : ''}>
           <summary>自定义请求头</summary>
           <div class="site-header-options-body">
 		  <div id="m-upstream-headers"></div>
@@ -1561,10 +1593,10 @@ async function showSiteModal(site) {
     <div class="form-group">
       <label for="m-ua">UA 模式</label>
       <select class="form-select modal-select" id="m-ua">
-        <option value="passthrough" ${(!isEdit || site.ua_mode === 'passthrough') ? 'selected' : ''}>透传（保留客户端身份）</option>
-        <option value="infuse" ${isEdit && site.ua_mode === 'infuse' ? 'selected' : ''}>Infuse</option>
-        <option value="web" ${isEdit && site.ua_mode === 'web' ? 'selected' : ''}>Web</option>
-        <option value="client" ${isEdit && site.ua_mode === 'client' ? 'selected' : ''}>客户端</option>
+        <option value="passthrough" ${(!hasValues || site.ua_mode === 'passthrough') ? 'selected' : ''}>透传（保留客户端身份）</option>
+        <option value="infuse" ${hasValues && site.ua_mode === 'infuse' ? 'selected' : ''}>Infuse</option>
+        <option value="web" ${hasValues && site.ua_mode === 'web' ? 'selected' : ''}>Web</option>
+        <option value="client" ${hasValues && site.ua_mode === 'client' ? 'selected' : ''}>客户端</option>
         <option value="custom">自定义客户端</option>
       </select>
     </div>
@@ -1578,9 +1610,9 @@ async function showSiteModal(site) {
     <div class="form-group">
       <label for="m-client-ip-mode">真实客户端 IP 透传</label>
       <select class="form-select modal-select" id="m-client-ip-mode">
-        <option value="both" ${!isEdit || !site.client_ip_mode || site.client_ip_mode === 'both' ? 'selected' : ''}>透传 X-Real-IP 和 X-Forwarded-For（推荐）</option>
-        <option value="real_ip" ${isEdit && site.client_ip_mode === 'real_ip' ? 'selected' : ''}>仅保留 X-Real-IP</option>
-        <option value="none" ${isEdit && site.client_ip_mode === 'none' ? 'selected' : ''}>强制不透传（慎用）</option>
+        <option value="both" ${!hasValues || !site.client_ip_mode || site.client_ip_mode === 'both' ? 'selected' : ''}>透传 X-Real-IP 和 X-Forwarded-For（推荐）</option>
+        <option value="real_ip" ${hasValues && site.client_ip_mode === 'real_ip' ? 'selected' : ''}>仅保留 X-Real-IP</option>
+        <option value="none" ${hasValues && site.client_ip_mode === 'none' ? 'selected' : ''}>强制不透传（慎用）</option>
       </select>
     </div>
     <section class="form-group cache-limit-group" data-cache-panel aria-labelledby="m-cache-panel-title">
@@ -1590,34 +1622,39 @@ async function showSiteModal(site) {
           <p>媒体流和私有响应不缓存。</p>
         </div>
         <select class="form-select modal-select" id="m-asset-cache" aria-label="缓存图片与静态资源">
-          <option value="off" ${!isEdit || !site.asset_cache_enabled ? 'selected' : ''}>关闭</option>
-          <option value="on" ${isEdit && site.asset_cache_enabled ? 'selected' : ''}>开启</option>
+          <option value="off" ${!hasValues || !site.asset_cache_enabled ? 'selected' : ''}>关闭</option>
+          <option value="on" ${hasValues && site.asset_cache_enabled ? 'selected' : ''}>开启</option>
         </select>
       </div>
       <div class="site-cache-options" id="m-cache-options" hidden>
         <details class="site-cache-rules-group" id="m-cache-rules-group">
           <summary>自定义缓存规则（可选）</summary>
           <div class="site-cache-rules-body">
-            <textarea class="form-input" id="m-cache-rules" rows="3" maxlength="4096" spellcheck="false">${esc(isEdit ? (site.asset_cache_rules || '*/file/*\n*/emby/Items/*/Images/*') : '*/file/*\n*/emby/Items/*/Images/*')}</textarea>
+            <textarea class="form-input" id="m-cache-rules" rows="3" maxlength="4096" spellcheck="false">${esc(hasValues ? (site.asset_cache_rules || '*/file/*\n*/emby/Items/*/Images/*') : '*/file/*\n*/emby/Items/*/Images/*')}</textarea>
             <div class="form-help">仅在需要覆盖默认的图片和静态资源路径时修改；每行一条，支持 * 通配。</div>
           </div>
         </details>
         <div class="cache-limit-grid">
           <label for="m-cache-ttl">缓存时间（小时）</label>
-          <input type="number" class="form-input" id="m-cache-ttl" min="1" max="720" step="1" inputmode="numeric" required value="${isEdit ? Math.max(1, Math.round((site.asset_cache_ttl_sec || 86400) / 3600)) : 24}">
+          <input type="number" class="form-input" id="m-cache-ttl" min="1" max="720" step="1" inputmode="numeric" required value="${hasValues ? Math.max(1, Math.round((site.asset_cache_ttl_sec || 86400) / 3600)) : 24}">
           <label for="m-cache-max">容量上限（MB）</label>
-          <input type="number" class="form-input" id="m-cache-max" min="1" max="20480" step="1" inputmode="numeric" required value="${isEdit ? Math.max(1, Math.round((site.asset_cache_max_bytes || 536870912) / 1048576)) : 512}">
+          <input type="number" class="form-input" id="m-cache-max" min="1" max="20480" step="1" inputmode="numeric" required value="${hasValues ? Math.max(1, Math.round((site.asset_cache_max_bytes || 536870912) / 1048576)) : 512}">
         </div>
       </div>
     </section>
     <div class="form-group">
       <label for="m-quota">流量额度 (GB, 0=不限)</label>
-      <input type="number" class="form-input" id="m-quota" value="${isEdit ? Math.round((site.traffic_quota || 0) / 1073741824) : 0}" placeholder="0" min="0" max="8589934591" step="1" inputmode="numeric" required>
+      <input type="number" class="form-input" id="m-quota" value="${hasValues ? Math.round((site.traffic_quota || 0) / 1073741824) : 0}" placeholder="0" min="0" max="8589934591" step="1" inputmode="numeric" required>
     </div>
     <div class="form-group">
       <label for="m-speed">单连接限速 (Mbps, 0=不限)</label>
-      <input type="number" class="form-input" id="m-speed" value="${isEdit ? (site.speed_limit || 0) : 0}" placeholder="0" min="0" max="1000000" step="1" inputmode="numeric" required>
-      <div class="form-help">限制单个连接的下行速度，上传不受影响。</div>
+      <input type="number" class="form-input" id="m-speed" value="${hasValues ? (site.speed_limit || 0) : 0}" placeholder="0" min="0" max="1000000" step="1" inputmode="numeric" required>
+      <div class="form-help">限制单个连接的下行速度，修改后对新请求生效，上传不受影响。</div>
+      </div>
+      <div class="form-group">
+        <label for="m-total-speed">站点总下载限速 (Mbps, 0=不限)</label>
+        <input type="number" class="form-input" id="m-total-speed" value="${hasValues ? (site.total_speed_limit || 0) : 0}" min="0" max="1000000" step="1" inputmode="numeric" required>
+        <div class="form-help">所有连接共享，修改立即生效。仅限制经本站代理的下载流量；直连和跳转到上游的播放不计入。</div>
       </div>
       </div>
     </div>
@@ -1908,9 +1945,9 @@ async function showSiteModal(site) {
   document.getElementById('m-account-reset')?.addEventListener('click', resetModalAccountForm);
   renderModalAccounts();
 	const failoverLinesContainer = document.getElementById('m-failover-lines');
-	let failoverLines = isEdit && Array.isArray(site.failover_lines)
+	let failoverLines = hasValues && Array.isArray(site.failover_lines)
 		? site.failover_lines.map(line => ({name: line.name || '', url: line.url || '', enabled: line.enabled !== false}))
-		: (isEdit && Array.isArray(site.failover_targets) ? site.failover_targets.map((url, index) => ({name:`备用 ${index+1}`,url,enabled:true})) : []);
+		: (hasValues && Array.isArray(site.failover_targets) ? site.failover_targets.map((url, index) => ({name:`备用 ${index+1}`,url,enabled:true})) : []);
 	function lineActionIcon(kind) {
 		if (kind === 'up') return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m18 15-6-6-6 6"/></svg>';
 		if (kind === 'down') return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>';
@@ -2009,7 +2046,7 @@ async function showSiteModal(site) {
 	const portLabel = document.getElementById('m-port-label');
 	const portHelp = document.getElementById('m-port-help');
 	const ingressWarning = document.getElementById('m-ingress-warning');
-	ingressSelect.value = isEdit ? normalizedIngressMode(site) : defaultIngressMode(siteCapabilities);
+	ingressSelect.value = hasValues ? normalizedIngressMode(site) : defaultIngressMode(siteCapabilities);
 	function updateIngressFields() {
 		const state = ingressFormState(ingressSelect.value);
 		publicHostGroup.hidden = !state.showPublicHost;
@@ -2080,10 +2117,10 @@ async function showSiteModal(site) {
     document.getElementById('m-custom-client'),
     document.getElementById('m-custom-version'),
   ];
-  const initialUAState = customUAFormState(isEdit ? site.ua_mode : 'passthrough', site);
-  uaSelect.value = isEdit && site.ua_mode ? site.ua_mode : 'passthrough';
-  clientIPModeSelect.value = isEdit && ['both', 'real_ip', 'none'].includes(site.client_ip_mode) ? site.client_ip_mode : 'both';
-  playbackRoutingSelect.value = isEdit ? sitePlaybackRoutingMode(site) : dynamicCapabilities.available ? 'auto' : 'manual';
+  const initialUAState = customUAFormState(hasValues ? site.ua_mode : 'passthrough', site);
+  uaSelect.value = hasValues && site.ua_mode ? site.ua_mode : 'passthrough';
+  clientIPModeSelect.value = hasValues && ['both', 'real_ip', 'none'].includes(site.client_ip_mode) ? site.client_ip_mode : 'both';
+  playbackRoutingSelect.value = hasValues ? sitePlaybackRoutingMode(site) : dynamicCapabilities.available ? 'auto' : 'manual';
   customUAInputs[0].value = initialUAState.customUserAgent;
   customUAInputs[1].value = initialUAState.customClient;
   customUAInputs[2].value = initialUAState.customVersion;
@@ -2184,7 +2221,7 @@ async function showSiteModal(site) {
   }
 
   const upstreamHeadersContainer = document.getElementById('m-upstream-headers');
-  let upstreamHeaders = isEdit && Array.isArray(site.upstream_headers) && site.upstream_headers.length
+  let upstreamHeaders = hasValues && Array.isArray(site.upstream_headers) && site.upstream_headers.length
     ? site.upstream_headers.map(header => ({ name: header.name || '', value: '', configured: !!header.configured }))
     : [{ name: '', value: '', configured: false }];
 
@@ -2221,7 +2258,7 @@ async function showSiteModal(site) {
     if (inputs.length) inputs[inputs.length - 1].focus();
   };
 
-  let configuredStreamHosts = isEdit ? normalizeStreamHosts(site.stream_hosts) : [];
+  let configuredStreamHosts = hasValues ? normalizeStreamHosts(site.stream_hosts) : [];
   const playbackTargetInput = document.getElementById('m-playback-target');
   function renderStreamHostRows() {
     const container = document.getElementById('m-stream-hosts-list');
@@ -2331,7 +2368,7 @@ async function showSiteModal(site) {
 		const data = {
 	      name: document.getElementById('m-name').value.trim(),
 	      target_url: primaryURL,
-		      primary_line_name: isEdit ? site.primary_line_name || '主线路' : '主线路',
+		      primary_line_name: hasValues ? site.primary_line_name || '主线路' : '主线路',
 		      failover_lines: failoverLines.map((line, index) => ({
 		        name: String(line.name || '').trim() || `线路${index + 2}`,
 		        url: normalizeSiteUpstreamAddress(line.url),
@@ -2354,6 +2391,12 @@ async function showSiteModal(site) {
       asset_cache_rules: document.getElementById('m-cache-rules').value.trim(),
       traffic_quota: Number(document.getElementById('m-quota').value) * 1073741824,
       speed_limit: Number(document.getElementById('m-speed').value),
+      total_speed_limit: Number(document.getElementById('m-total-speed').value),
+      ...(!isEdit && hasValues ? {
+        ping_cache_enabled: !!site.ping_cache_enabled,
+        image_cache_enabled: !!site.image_cache_enabled,
+        progress_coalescing_enabled: !!site.progress_coalescing_enabled,
+      } : {}),
     };
 
 		const listenPortRequired = ingressFormState(data.ingress_mode).requireListenPort;
@@ -2407,7 +2450,9 @@ async function showSiteModal(site) {
     submitButton.setAttribute('aria-busy', 'true');
     try {
       if (isEdit) {
-        await API.updateSite(site.id, data);
+        const impact = await API.previewSite(site.id, data);
+        if (impact.restarts && !window.confirm('本次修改需要重启此站点，正在播放的连接可能断开。继续保存？')) return;
+        await API.updateSite(site.id, data, impact.fingerprint);
         Toast.success('站点已更新');
       } else {
         const pendingAccounts = modalAccounts.filter(account => Number(account.id) < 0 || !account.id);
