@@ -21,6 +21,20 @@ function loadAPIClient() {
   return sandbox;
 }
 
+test('update calls ignore obsolete beta arguments and send only the stable version', async () => {
+  const sandbox = loadAPIClient();
+  const calls = [];
+  sandbox.fetch = async (url, options) => {
+    calls.push({url, options});
+    return {status:200, ok:true, json:async () => ({})};
+  };
+  await vm.runInContext('API.checkSystemUpdate("beta")', sandbox);
+  await vm.runInContext('API.startSystemUpdate("v1.15.0", "beta")', sandbox);
+  assert.equal(calls[0].url, '/api/system/update/check');
+  assert.deepEqual(JSON.parse(calls[1].options.body), {version:'v1.15.0'});
+});
+
+
 test('named timezone formatting handles DST while retaining offset compatibility', () => {
   const sandbox = loadAPIClient();
   sandbox.meridianSetTimezoneName('America/New_York');

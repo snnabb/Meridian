@@ -21,3 +21,10 @@ test('bulk limits distinguish unchanged fields from explicit unlimited and rejec
  for (const raw of ['-1','1.5','1e3','NaN','1000001']) assert.throws(() => sandbox.siteBulkPayload([1], 'limits', {speed_limit:raw}));
  assert.throws(() => sandbox.siteBulkPayload([1], 'limits', {}));
 });
+test('bulk accepts 1 through 500 sites and rejects empty or oversized selections', () => {
+ assert.throws(() => sandbox.siteBulkPayload([], 'enable', {}));
+ assert.throws(() => sandbox.siteBulkPayload(null, 'enable', {}));
+ assert.equal(sandbox.siteBulkPayload([1], 'enable', {}).site_ids.length, 1);
+ assert.equal(sandbox.siteBulkPayload(Array.from({length:500}, (_,i) => i+1), 'enable', {}).site_ids.length, 500);
+ assert.throws(() => sandbox.siteBulkPayload(Array.from({length:501}, (_,i) => i+1), 'enable', {}));
+});

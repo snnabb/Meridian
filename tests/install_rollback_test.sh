@@ -40,6 +40,21 @@ for unsafe_path in "${DATA_DIR}/../outside.db" "${DATA_DIR}/linked.db"; do
     if stage_rollback_snapshot v1.14.2 "${TEST_ROOT}/unsafe-ready"; then
         echo 'FAIL: database outside the paired snapshot was accepted'; exit 1
     fi
+    # Real update entrypoint must reject this before download or service stop.
+    if (
+        ensure_cli_dependencies() { :; }
+        validate_existing_secret_configuration() { :; }
+        validate_panel_endpoint_consistency() { :; }
+        migrate_managed_nginx_redaction() { :; }
+        resolve_latest_version() { printf 'v1.15.0\n'; }
+        download_release_binary() { touch "${TEST_ROOT}/download-called"; return 1; }
+        do_update
+    ) >"${TEST_ROOT}/preflight.log" 2>&1; then
+        echo 'FAIL: update accepted unsupported rollback database'; exit 1
+    fi
+    grep -Fq '未停止服务或替换程序' "${TEST_ROOT}/preflight.log"
+    [ ! -e "${TEST_ROOT}/service-calls" ]
+    [ ! -e "${TEST_ROOT}/download-called" ]
 done
 rm "${DATA_DIR}/linked.db"
 printf 'DB_PATH=%s/meridian.db\n' "$DATA_DIR" > "${DATA_DIR}/.env"

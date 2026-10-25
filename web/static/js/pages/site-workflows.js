@@ -17,7 +17,7 @@ function updateSiteSelectionCount() {
 }
 function saveSiteTemplate(site) {
   document.getElementById('modal-title').textContent = '保存配置模板';
-  document.getElementById('modal-body').innerHTML = '<p>保存此站点的身份、缓存、播放策略和额度限速。模板不包含回源地址、入口、账号、请求头或动态域名规则。</p><label class="form-group">模板名称<input class="form-input" id="template-name" maxlength="100"></label>';
+  document.getElementById('modal-body').innerHTML = '<p>保存此站点的身份、缓存、播放策略和额度限速。模板不包含回源地址、入口、账号、请求头或动态域名规则。</p><p class="form-help">模板随整机备份保存；站点 JSON/CSV 导出不包含模板。</p><label class="form-group">模板名称<input class="form-input" id="template-name" maxlength="100"></label>';
   document.getElementById('template-name').value = site.name;
   document.getElementById('modal-footer').innerHTML = '<button class="btn-modal secondary" id="template-cancel">取消</button><button class="btn-modal primary" id="template-save">保存</button>';
   document.getElementById('template-cancel').onclick = closeModal;
@@ -35,7 +35,7 @@ async function showSiteTemplates() {
   try {
     const templates = await API.request('GET', '/api/site-templates');
     document.getElementById('modal-title').textContent = '配置模板';
-    document.getElementById('modal-body').innerHTML = '<p>从站点卡片选择“存为模板”。应用后填写新站点的回源地址和入口，再确认创建。</p>' +
+    document.getElementById('modal-body').innerHTML = '<p>从站点卡片选择“存为模板”。应用后填写新站点的回源地址和入口，再确认创建。</p><p class="form-help">模板随整机备份保存；站点 JSON/CSV 导出不包含模板。</p>' +
       (templates.length ? templates.map(t => '<div class="site-import-item"><strong>' + esc(t.name) + '</strong> <button class="btn-ghost" data-template-use="' + t.id + '">用此模板添加</button><button class="btn-ghost danger" data-template-delete="' + t.id + '">删除</button></div>').join('') : '<p>还没有模板。</p>');
     document.getElementById('modal-footer').innerHTML = '<button class="btn-modal secondary" id="template-close">关闭</button>';
     document.getElementById('template-close').onclick = closeModal;
@@ -57,6 +57,7 @@ async function showSiteTemplates() {
   } catch (error) { Toast.error(error.message); }
 }
 function siteBulkPayload(ids, action, fields) {
+  if (!Array.isArray(ids) || ids.length < 1 || ids.length > 500) throw new Error('每次请选择 1–500 个站点。');
   const payload = {site_ids: ids, action};
   if (action === 'limits') {
     for (const [key, multiplier] of [['traffic_quota', 1073741824], ['speed_limit', 1], ['total_speed_limit', 1]]) {
@@ -73,7 +74,7 @@ function siteBulkPayload(ids, action, fields) {
 function showSiteBulk() {
   const ids = [...siteSelection];
   document.getElementById('modal-title').textContent = '批量操作';
-  document.getElementById('modal-body').innerHTML = '<p>已选 ' + ids.length + ' 个站点。停用会断开这些站点的播放连接；额度和限速可运行中修改。</p>' +
+  document.getElementById('modal-body').innerHTML = '<p>已选 ' + ids.length + ' 个站点，每次支持 1–500 个。停用会断开这些站点的播放连接；收紧额度可能中断超额连接。</p><p class="form-help">逐站点执行，失败不会撤销已成功的修改。请按逐项结果检查失败项，调整后仅重试失败项。单连接限速对新请求生效，总下载限速对现有下载生效。</p>' +
     '<button class="btn-ghost" id="bulk-all">选择当前筛选结果</button> <button class="btn-ghost" id="bulk-clear">清空选择</button>' +
     '<label class="form-group">操作<select class="form-select" id="bulk-action"><option value="limits">修改额度和限速</option><option value="enable">启用</option><option value="disable">停用</option></select></label>' +
     '<div id="bulk-limits"><p class="form-help">留空保持原值，填 0 取消限制。</p>' +

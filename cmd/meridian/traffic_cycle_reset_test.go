@@ -5,6 +5,46 @@ import (
 	"time"
 )
 
+func TestBillingCalendarPreservesLegacyBoundaryAcrossPanelTimezones(t *testing.T) {
+	previous := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = previous })
+	app := newTestApp(t)
+	site, err := app.db.CreateSite("timezone-boundary", freePort(t), "http://127.0.0.1:8096", "", "direct", "[]", "infuse", 1000, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// November in Shanghai, but still October on the UTC server. Changing
+	// panel display/schedule timezone must not move the existing quota cycle.
+	sample := time.Date(2026, time.October, 31, 17, 0, 0, 0, time.UTC)
+	if err := app.db.addTrafficWithRequestsAt(site.ID, 100, 200, 1, sample); err != nil {
+		t.Fatal(err)
+	}
+	before := time.Date(2026, time.October, 31, 23, 0, 0, 0, time.UTC)
+	boundary := time.Date(2026, time.November, 1, 0, 0, 0, 0, time.UTC)
+	inst := &ProxyInstance{Site: *site}
+	for _, zone := range []string{"Asia/Shanghai", "UTC", "America/New_York"} {
+		settings := app.db.currentSystemSettings()
+		settings.ScheduleTimezoneName = zone
+		settings.TrafficResetDay = 1
+		if err := app.db.saveSystemSettings(settings); err != nil {
+			t.Fatal(err)
+		}
+		if got := trafficCycleReset(before, settings.TrafficResetDay); !got.Equal(boundary) {
+			t.Fatalf("%s: reset = %s, want %s", zone, got, boundary)
+		}
+		for _, row := range []struct {
+			now  time.Time
+			want int64
+		}{{before, 300}, {boundary, 0}} {
+			got, err := app.pm.currentTrafficCycleUsage(inst, row.now)
+			if err != nil || got != row.want {
+				t.Fatalf("%s at %s: usage = %d, %v; want %d", zone, row.now, got, err, row.want)
+			}
+		}
+	}
+}
+
 func TestTrafficCycleResetUsesBillingCalendar(t *testing.T) {
 	previous := time.Local
 	time.Local = time.FixedZone("billing", 8*60*60)

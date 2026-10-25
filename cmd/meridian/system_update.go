@@ -24,7 +24,6 @@ var stableVersionPattern = regexp.MustCompile(`^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]
 var comparableVersionPattern = regexp.MustCompile(`^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:[-+][0-9A-Za-z.-]+)?$`)
 
 type updateRelease struct {
-	Channel   string `json:"channel"`
 	Current   string `json:"current_version"`
 	Latest    string `json:"latest_version"`
 	URL       string `json:"release_url"`
@@ -101,6 +100,30 @@ func updaterSocketPath() string {
 	}
 	return ""
 }
+
+// A version marker alone is not a usable paired snapshot. Only advertise a
+// complete snapshot with ordinary files, matching the installer's scope.
+func rollbackSnapshotVersion(directory string) string {
+	for _, name := range []string{"", "data", "meridian", "service", "version"} {
+		info, err := os.Lstat(filepath.Join(directory, name))
+		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+			return ""
+		}
+		if name == "" || name == "data" {
+			if !info.IsDir() {
+				return ""
+			}
+		} else if !info.Mode().IsRegular() || info.Size() == 0 {
+			return ""
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(directory, "version"))
+	version := strings.TrimSpace(string(data))
+	if err != nil || !strings.HasPrefix(version, "v") || !comparableVersionPattern.MatchString(version) {
+		return ""
+	}
+	return version
+}
 func callUpdateAgent(ctx context.Context, method string, body io.Reader) (updateJob, error) {
 	if !filepath.IsAbs(updaterSocketPath()) {
 		return updateJob{}, errors.New("当前安装未启用面板更新；标准 systemd 部署可运行新版 install.sh install -y 启用")
@@ -145,14 +168,20 @@ func (a *App) handleSystemUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	var request systemUpdateRequest
 	if decodeJSONBody(w, r, &request) != nil || !request.normalize() {
-		a.jsonErr(w, 400, "请选择有效的版本和更新通道")
+		a.jsonErr(w, 400, "仅支持正式版更新或恢复升级前快照")
 		return
 	}
-	if request.Action == "update" && !channelVersionNewer(request.Version, appVersion) {
+	if request.Action == "update" && !versionNewer(request.Version, appVersion) {
 		a.jsonErr(w, 409, "仅允许更新到更高版本；恢复上一版本请使用回滚")
 		return
 	}
-	body, _ := json.Marshal(request)
+	// Protocol 1 accepts only version. Keep stable updates working with the
+	// v1.14.2 agent; protocol 2 is needed only for explicit snapshot restore.
+	payload := map[string]string{"version": request.Version}
+	if request.Action == "rollback" {
+		payload = map[string]string{"action": "rollback"}
+	}
+	body, _ := json.Marshal(payload)
 	job, err := callUpdateAgent(r.Context(), http.MethodPost, strings.NewReader(string(body)))
 	if err != nil {
 		a.jsonErr(w, 409, err.Error())
@@ -165,25 +194,19 @@ func (a *App) handleSystemUpdateCheck(w http.ResponseWriter, r *http.Request) {
 		a.jsonErr(w, 405, "method not allowed")
 		return
 	}
+	channel := r.URL.Query().Get("channel")
+	if channel != "" && channel != "stable" {
+		a.jsonErr(w, 400, "仅提供正式版更新")
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
 	defer cancel()
-	channel := r.URL.Query().Get("channel")
-	if channel == "" {
-		channel = "stable"
-	}
-	endpoint := releaseAPI
-	if channel == "beta" {
-		endpoint = "https://api.github.com/repos/snnabb/Meridian/releases?per_page=100"
-	}
-	release, err := fetchChannelRelease(ctx, &http.Client{Timeout: 10 * time.Second}, endpoint, appVersion, channel)
+	release, err := fetchUpdateRelease(ctx, &http.Client{Timeout: 10 * time.Second}, releaseAPI, appVersion)
 	if err != nil {
 		a.jsonErr(w, 502, err.Error())
 		return
 	}
-	status, err := callUpdateAgent(ctx, http.MethodGet, nil)
-	if err == nil && status.Protocol < 2 {
-		err = errors.New("请运行新版 install.sh install -y 更新本地更新服务")
-	}
+	_, err = callUpdateAgent(ctx, http.MethodGet, nil)
 	release.Supported = err == nil
 	if err != nil {
 		release.Reason = err.Error()
@@ -316,15 +339,7 @@ func runUpdateAgent(args []string) error {
 		}
 	}
 	agent.rollbackVersion = func() string {
-		data, err := os.ReadFile("/opt/meridian-backups/rollback-current/version")
-		if err != nil {
-			return ""
-		}
-		version := strings.TrimSpace(string(data))
-		if !channelVersionPattern.MatchString(version) {
-			return ""
-		}
-		return version
+		return rollbackSnapshotVersion("/opt/meridian-backups/rollback-current")
 	}
 	agent.runRequest = func(request systemUpdateRequest) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
@@ -336,7 +351,7 @@ func runUpdateAgent(args []string) error {
 			action = "rollback"
 		}
 		command := exec.CommandContext(ctx, "/bin/bash", installer, action, "--yes") // #nosec G204 -- fixed installer and allowlisted action; validated version passed only as environment data.
-		command.Env = append(os.Environ(), "MERIDIAN_EXPECTED_UPDATE_VERSION="+request.Version, "MERIDIAN_UPDATE_CHANNEL="+request.Channel)
+		command.Env = append(os.Environ(), "MERIDIAN_EXPECTED_UPDATE_VERSION="+request.Version)
 		command.Cancel = func() error { return command.Process.Signal(os.Interrupt) }
 		command.WaitDelay = 90 * time.Second
 		command.Stdout = os.Stdout

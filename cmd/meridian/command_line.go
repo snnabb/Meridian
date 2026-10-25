@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
@@ -40,22 +39,6 @@ func runCommandLine(args []string, input io.Reader, output io.Writer) (bool, err
 		return true, runHealthcheckCommand()
 	case "update-agent":
 		return true, runUpdateAgent(args[1:])
-	case "update-version":
-		if len(args) != 2 || !validUpdateChannel(args[1]) {
-			return true, errors.New("usage: update-version stable|beta")
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		endpoint := releaseAPI
-		if args[1] == "beta" {
-			endpoint = "https://api.github.com/repos/snnabb/Meridian/releases?per_page=100"
-		}
-		release, err := fetchChannelRelease(ctx, &http.Client{Timeout: 12 * time.Second}, endpoint, appVersion, args[1])
-		if err != nil {
-			return true, err
-		}
-		_, err = fmt.Fprintln(output, release.Latest)
-		return true, err
 	case "tls":
 		return true, runTLSCommand(args[1:], input, output)
 	case "admin":

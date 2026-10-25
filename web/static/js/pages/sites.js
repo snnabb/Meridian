@@ -1654,7 +1654,7 @@ async function showSiteModal(site) {
       <div class="form-group">
         <label for="m-total-speed">站点总下载限速 (Mbps, 0=不限)</label>
         <input type="number" class="form-input" id="m-total-speed" value="${hasValues ? (site.total_speed_limit || 0) : 0}" min="0" max="1000000" step="1" inputmode="numeric" required>
-        <div class="form-help">所有连接共享，修改立即生效。仅限制经本站代理的下载流量；直连和跳转到上游的播放不计入。</div>
+        <div class="form-help">所有连接共享，修改立即影响正在进行的下载。仅限制经本站代理的下载，上传、直连和跳转到上游的媒体不计入；允许约 32 KiB 短时突发，不保证客户端间公平分配。</div>
       </div>
       </div>
     </div>

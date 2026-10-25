@@ -213,9 +213,9 @@ const API = {
   checkPanelSettings(data) { return this.request('POST', '/api/panel-settings/check', data); },
   requestPanelCertificate(data) { return this.request('POST', '/api/panel-certificate/issue', data); },
   importPanelCertificate(data) { return this.request('POST', '/api/panel-certificate/import', data); },
-  checkSystemUpdate(channel = 'stable') { return this.request('GET', '/api/system/update/check?channel=' + encodeURIComponent(channel)); },
+  checkSystemUpdate() { return this.request('GET', '/api/system/update/check'); },
   systemUpdateStatus() { return this.request('GET', '/api/system/update'); },
-  startSystemUpdate(version, channel = 'stable') { return this.request('POST', '/api/system/update', {version, channel}); },
+  startSystemUpdate(version) { return this.request('POST', '/api/system/update', {version}); },
   rollbackSystemUpdate() { return this.request('POST', '/api/system/update', {action: 'rollback'}); },
   restartSystem() { return this.request('POST', '/api/system/restart', {}); },
   async exportBackup(password, includeTLS) {

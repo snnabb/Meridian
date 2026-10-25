@@ -31,6 +31,29 @@ export MERIDIAN_ASSUME_YES=1
 # The path is computed so this test works from an arbitrary checkout.
 # shellcheck disable=SC1091
 source "${REPO_ROOT}/install.sh"
+
+# The public updater resolves only stable releases, even with stale beta
+# preferences or a malformed /latest response. No network or mutation here.
+(
+    get_latest_version() { printf '%s\n' "$fixture_version"; }
+    fixture_version=v1.15.0
+    unset MERIDIAN_UPDATE_CHANNEL
+    [ "$(resolve_latest_version)" = v1.15.0 ]
+    for fixture_version in v1.15.0-beta.1 v01.15.0 v1.15.0+build; do
+        if (resolve_latest_version) >"${TEST_ROOT}/stable-reject.log" 2>&1; then
+            echo 'FAIL: non-stable release was accepted'; exit 1
+        fi
+    done
+    fixture_version=v1.15.0
+    export MERIDIAN_UPDATE_CHANNEL=beta
+    if (resolve_latest_version) >"${TEST_ROOT}/stable-reject.log" 2>&1; then
+        echo 'FAIL: beta environment selector was accepted'; exit 1
+    fi
+)
+if bash "${REPO_ROOT}/install.sh" update --channel beta >"${TEST_ROOT}/channel-reject.log" 2>&1; then
+    echo 'FAIL: removed channel option was accepted'; exit 1
+fi
+grep -Fq '不再提供更新通道选项' "${TEST_ROOT}/channel-reject.log"
 # Domain workflow fixtures do not contact public DNS; the entry probe and its
 # failure modes are exercised by install_tls_test.sh.
 check_panel_https_entry() { return 0; }

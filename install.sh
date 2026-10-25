@@ -159,6 +159,10 @@ valid_version() {
     [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
 }
 
+valid_stable_version() {
+    [[ "$1" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+}
+
 valid_port() {
     local port="${1:-}" normalized LC_ALL=C
     [[ "$port" =~ ^[0-9]+$ ]] || return 1
@@ -180,7 +184,7 @@ normalize_port() {
 
 version_gt() {
     # Returns 0 (true) when $1 (vA.B.C[-suffix]) is newer than $2. The numeric
-    # major.minor.patch triple decides first. Official beta.N releases sort
+    # major.minor.patch triple decides first. Historical beta.N versions sort
     # below the matching stable release, with numeric beta ordering. Other
     # local suffixes retain the legacy base-version comparison.
     # shellcheck disable=SC2016
@@ -421,7 +425,6 @@ ensure_cosign() {
 verify_release_signature() {
     local version="$1" checksum_file="$2" bundle_file="$3" identity
     if ! download "https://github.com/${REPO}/releases/download/${version}/SHA256SUMS.bundle" "$bundle_file" 2>/dev/null; then
-        [[ "$version" != *-beta.* ]] || fail "测试版本缺少 Sigstore 签名清单；已停止安装"
         warn "该 Release 没有 Sigstore 签名清单，继续执行兼容的 SHA-256 校验"
         return 0
     fi
@@ -512,19 +515,11 @@ resolve_latest_version() {
     local version
     case "${MERIDIAN_UPDATE_CHANNEL:-stable}" in
         stable) ;;
-        beta)
-            local helper="${INSTALL_DIR}/${BIN_NAME}"
-            if ! "$helper" --version --features 2>/dev/null | grep -x panel-updater-v2 >/dev/null; then
-                fail "请先升级到支持测试通道的正式版"
-            fi
-            "$helper" update-version beta
-            return
-            ;;
-        *) fail "更新通道只能是 stable 或 beta" ;;
+        *) fail "仅支持正式版更新，请移除 MERIDIAN_UPDATE_CHANNEL 设置" ;;
     esac
     info "获取最新 Release..." >&2
     version=$(get_latest_version) || true
-    valid_version "$version" || fail "无法获取有效的最新 Release 版本: ${version:-<empty>}"
+    valid_stable_version "$version" || fail "无法获取有效的正式 Release 版本: ${version:-<empty>}"
     printf '%s\n' "$version"
 }
 
@@ -2566,9 +2561,7 @@ do_install() {
     print_setup_token_notice || return 1
 }
 
-stage_rollback_snapshot() {
-    local version="$1" staging="$2"
-    valid_version "$version" || return 1
+validate_rollback_database() {
     local db_path component
     db_path=$(read_env_value DB_PATH)
     db_path="${db_path:-meridian.db}"
@@ -2583,6 +2576,12 @@ stage_rollback_snapshot() {
         as_root test ! -L "$component" || { warn "回滚不支持符号链接形式的数据库路径"; return 1; }
         component=$(dirname -- "$component")
     done
+}
+
+stage_rollback_snapshot() {
+    local version="$1" staging="$2"
+    valid_version "$version" || return 1
+    validate_rollback_database || return 1
     as_root install -d -o root -g "$ROOT_GROUP" -m 0700 "$staging"
     as_root cp -a -- "${UPDATE_SNAPSHOT_DIR}/data" "${staging}/data" || return 1
     as_root install -o root -g "$ROOT_GROUP" -m 0755 "${INSTALL_DIR}/${BIN_NAME}" "${staging}/meridian" || return 1
@@ -2684,6 +2683,10 @@ do_update() {
     if valid_version "$current_version" && version_gt "$current_version" "$latest_version"; then
         fail "已安装版本 ${current_version} 高于最新 Release ${latest_version}；拒绝降级"
     fi
+
+    # Reject unsupported snapshot layouts before downloading or stopping the
+    # running service. Validate again when the actual snapshot is staged.
+    validate_rollback_database || fail "数据库路径不支持配套回滚，未停止服务或替换程序"
 
     tmp_dir=$(mktemp -d)
     chmod 0700 "$tmp_dir"
@@ -3035,7 +3038,6 @@ Meridian 一键安装工具
   --dns-token-file PATH  从文件读取 Cloudflare DNS Token，不在命令参数中传入密钥
   --no-domain      不配置或取消安装器管理的面板域名
   --local          仅用于 proxy；明确选择同一网络命名空间的回环反代，不适用于跨容器或远程代理
-  --channel NAME   仅用于 update；stable 正式版（默认）或 beta 已签名测试版
   -y, --yes        非交互确认；安装未指定域名时保留现有配置，首次安装则使用 IP
   --purge          卸载时删除数据目录；不会删除备份、Nginx、Certbot 或证书
 
@@ -3098,10 +3100,7 @@ run_cli() {
         case "$1" in
             -y|--yes) ASSUME_YES=1 ;;
             --channel)
-                [ "$action" = update ] || fail "--channel 仅用于 update"
-                [ "$#" -ge 2 ] || fail "--channel 需要 stable 或 beta"
-                case "$2" in stable|beta) export MERIDIAN_UPDATE_CHANNEL="$2" ;; *) fail "无效更新通道" ;; esac
-                shift
+                fail "不再提供更新通道选项，请使用 update 获取正式版"
                 ;;
             --local)
                 [ "$action" = proxy ] || fail "--local 仅用于 proxy"
