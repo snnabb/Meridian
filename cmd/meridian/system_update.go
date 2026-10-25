@@ -117,7 +117,12 @@ func rollbackSnapshotVersion(directory string) string {
 			return ""
 		}
 	}
-	data, err := os.ReadFile(filepath.Join(directory, "version"))
+	root, err := os.OpenRoot(directory)
+	if err != nil {
+		return ""
+	}
+	defer root.Close()
+	data, err := root.ReadFile("version")
 	version := strings.TrimSpace(string(data))
 	if err != nil || !strings.HasPrefix(version, "v") || !comparableVersionPattern.MatchString(version) {
 		return ""
